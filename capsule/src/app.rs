@@ -1579,6 +1579,21 @@ fn scan_free_columns(state: &AppState, tr: &RECT, bits: *const c_void, tw: i32, 
     (seg.1 - seg.0 >= PIN_NEED).then_some(seg)
 }
 
+/// 三环窗口当前左缘（屏幕坐标）。用于定位滞回：任务栏透明时像素判定会随壁纸噪声抖动，
+/// 若每次都吸附到空段左缘，三环会来回跑；以当前位置为首选即可保持稳定。
+fn rings_current_x(state: &AppState) -> Option<i32> {
+    if state.pin_hidden {
+        return None;
+    }
+    let r = state.rings.as_ref()?;
+    let mut rc = RECT::default();
+    unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+    (rc.right > rc.left).then_some(rc.left)
+}
+
+/// 位置微调死区：与当前位置差异小于该值就不动，避免像素噪声造成的持续微移。
+const PIN_DEADZONE: i32 = 8;
+
 /// 任务栏上可放置胶囊的连续空段 [x0, x1)，结果缓存 `SEG_CACHE`。
 /// 用像素扫描找视觉空段；失败时回退到托盘左侧的空档。
 /// 扫描要抓整条任务栏位图，开销不小，不宜每 500ms 都做一遍。
@@ -1664,7 +1679,15 @@ fn sync_taskbar_state(state: &mut AppState) {
             if horizontal {
                 if let Some((x0, x1)) = taskbar_free_segment(state) {
                     fits = true;
-                    let ax = pin_fit(x0, x1, state.config.capsule.taskbar_x);
+                    // 定位优先级：用户拖动位置 > 当前位置（滞回，防透明任务栏下空段判定抖动导致乱跑）> 空段左缘
+                    let cur = rings_current_x(state);
+                    let prefer = state.config.capsule.taskbar_x.or(cur);
+                    let mut ax = pin_fit(x0, x1, prefer);
+                    if let Some(cx) = cur {
+                        if (ax - cx).abs() < PIN_DEADZONE {
+                            ax = cx; // 差异极小：保持原位，不做微调
+                        }
+                    }
                     // 三环高与任务栏等高，纵向铺满任务栏条
                     let y = tr.top + (tb_h - capsule_view::RINGS_H as i32) / 2;
                     // 任务栏在屏幕下半部时面板向上展开，避免展开后跑出屏幕
