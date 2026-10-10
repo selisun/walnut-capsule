@@ -137,6 +137,9 @@ pub struct NetIf {
     pub rx_bytes_per_sec: Option<u64>,
     #[serde(default)]
     pub tx_bytes_per_sec: Option<u64>,
+    /// 网卡协商速率（Mbps）；0/缺失表示未知，网络环退化为只画轨道
+    #[serde(default)]
+    pub speed_mbps: Option<u32>,
 }
 
 /// 连接状态，供 UI 显示。

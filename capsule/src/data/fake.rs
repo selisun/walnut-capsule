@@ -100,6 +100,7 @@ impl DataSource for FakeSource {
                     name: "eth0".into(),
                     rx_bytes_per_sec: Some((burst(60.0e6, 6.5, 0.20, 0.5)) as u64),
                     tx_bytes_per_sec: Some((burst(10.0e6, 7.5, 0.14, 3.5)) as u64),
+                    speed_mbps: Some(1000),
                 }]),
             };
             {

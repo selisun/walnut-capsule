@@ -54,7 +54,8 @@ type GPU struct {
 }
 
 type NetIf struct {
-	Name  string `json:"interface"`
-	RxBPS uint64 `json:"rx_bytes_per_sec"`
-	TxBPS uint64 `json:"tx_bytes_per_sec"`
+	Name      string `json:"interface"`
+	RxBPS     uint64 `json:"rx_bytes_per_sec"`
+	TxBPS     uint64 `json:"tx_bytes_per_sec"`
+	SpeedMbps int    `json:"speed_mbps"` // 协商速率（Mbps），0 表示未知（网卡 down 或读不到）
 }

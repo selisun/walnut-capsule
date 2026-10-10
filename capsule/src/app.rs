@@ -241,6 +241,11 @@ pub fn run(config: Config) {
         seg: None,
         seg_rect: None,
         seg_at: None,
+        pin_avoid_cand: None,
+        pin_avoid_hits: 0,
+        pin_avoid_x: None,
+        pin_check_at: None,
+        net_peak: (0, 0),
     };
 
     let raw = Box::into_raw(Box::new(state));
@@ -330,6 +335,15 @@ struct AppState {
     /// 缓存对应的任务栏矩形（变化时立即失效重算）
     seg_rect: Option<(i32, i32, i32, i32)>,
     seg_at: Option<Instant>,
+    /// 遮挡兜底：上次观察到的候选空位（列左缘）与连续命中次数
+    pin_avoid_cand: Option<i32>,
+    pin_avoid_hits: u8,
+    /// 遮挡兜底最终搬到的位置（内存态，不写配置；不再拥挤时回到用户位置）
+    pin_avoid_x: Option<i32>,
+    /// 遮挡检查的节流时刻（与像素扫描同量级的开销）
+    pin_check_at: Option<Instant>,
+    /// 网络环兜底刻度（会话峰值 rx/tx，字节/秒）：网卡协商速率读不到时（WiFi 等）用它做满环基准
+    net_peak: (u64, u64),
 }
 
 /// 任务栏内的三环子窗口：归属任务栏（owner = Shell_TrayWnd），常驻其上方。
@@ -656,6 +670,7 @@ fn rings_paint(state: &mut AppState, force: bool) {
     }
     r.last_seq = seq;
     let frame_data = state.shared.read().unwrap().grab();
+    let frame = frame_data.as_frame();
     let (w, h) = (capsule_view::RINGS_W, capsule_view::RINGS_H);
     // 整块铺一层 alpha=1 的近乎透明底：分层窗口只有 alpha>0 的像素才响应鼠标，
     // 否则只有细环与文字可点、点环之间/环内的空处会穿透到任务栏，感觉"点不动"。
@@ -668,7 +683,12 @@ fn rings_paint(state: &mut AppState, force: bool) {
         tiny_skia::Transform::identity(),
         None,
     );
-    capsule_view::draw_rings(&mut r.pix, &frame_data.as_frame(), state.font.as_ref());
+    // 协商速率读不到时（WiFi 网卡无 sysfs speed）网络环改用会话峰值做满环基准，
+    // 峰值按帧缓慢衰减，避免历史尖峰长期钉住刻度
+    let (rx, tx) = capsule_view::net_io_sum(frame.snap);
+    let decay = |p: u64, v: u64| (p * 99 / 100).max(v);
+    state.net_peak = (decay(state.net_peak.0, rx), decay(state.net_peak.1, tx));
+    capsule_view::draw_rings(&mut r.pix, &frame, state.font.as_ref(), state.net_peak);
     let opacity = state.config.capsule.opacity.clamp(0.05, 1.0);
     blit_and_present(
         r.hwnd,
@@ -1466,14 +1486,19 @@ const CONTENT_DEV: i32 = 30;
 /// 托盘左侧留白：托盘溢出按钮（^）等不在 TrayNotifyWnd 内，需额外让位。
 const TRAY_MARGIN: i32 = 48;
 
-/// 任务栏条带像素扫描找“视觉空段”。
+/// 抓一次任务栏条带位图，逐列判定“是否为空”（列内 RGB 极差之和 ≤ CONTENT_DEV）。
 /// Win11 任务栏右侧的按钮/小组件由 XAML 合成、拿不到子窗口、UIA 也枚举不出元素，
-/// 因此直接看像素：空白列颜色均匀，有内容的列色差大。
-/// 返回 [任务栏左缘, 托盘左缘) 内能放下三环的最大连续空段。
-fn pixels_free_segment(state: &AppState, tr: &RECT) -> Option<(i32, i32)> {
+/// 因此直接看像素。返回 [任务栏左缘, 托盘左缘 - TRAY_MARGIN) 范围内每列的空闲标志；
+/// 不排除自身窗口——落位时把自身覆盖列视为空，判断遮挡时只看窗口之外的列。
+fn taskbar_free_columns(tr: &RECT) -> Option<Vec<bool>> {
     let tw = tr.right - tr.left;
     let th = tr.bottom - tr.top;
     if tw <= 8 || th <= 8 {
+        return None;
+    }
+    // 只在托盘左侧搜索，并留出托盘溢出按钮（^）的余量
+    let w = (taskbar_tray_left(tr) - tr.left - TRAY_MARGIN).clamp(0, tw) as usize;
+    if w == 0 {
         return None;
     }
     let mem = unsafe { CreateCompatibleDC(HDC(null_mut())) };
@@ -1499,7 +1524,7 @@ fn pixels_free_segment(state: &AppState, tr: &RECT) -> Option<(i32, i32)> {
     let mut bits: *mut c_void = null_mut();
     let bmp = unsafe { CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE(null_mut()), 0) }
         .unwrap_or_default();
-    let seg = if bmp.0.is_null() || bits.is_null() {
+    let cols = if bmp.0.is_null() || bits.is_null() {
         None
     } else {
         unsafe {
@@ -1507,7 +1532,7 @@ fn pixels_free_segment(state: &AppState, tr: &RECT) -> Option<(i32, i32)> {
             let screen = GetDC(HWND(null_mut()));
             let ok = BitBlt(mem, 0, 0, tw, th, screen, tr.left, tr.top, SRCCOPY).is_ok();
             let _ = ReleaseDC(HWND(null_mut()), screen);
-            let out = if ok { scan_free_columns(state, tr, bits, tw, th) } else { None };
+            let out = if ok { Some(scan_columns(bits, tw, th, w)) } else { None };
             let _ = SelectObject(mem, old);
             out
         }
@@ -1518,18 +1543,13 @@ fn pixels_free_segment(state: &AppState, tr: &RECT) -> Option<(i32, i32)> {
         }
         let _ = DeleteDC(mem);
     }
-    seg
+    cols
 }
 
-/// 逐列判定“是否为空”，取最大连续空段。自身三环窗口覆盖的列按空处理（它本来就在空段里）。
-fn scan_free_columns(state: &AppState, tr: &RECT, bits: *const c_void, tw: i32, th: i32) -> Option<(i32, i32)> {
+/// 逐列判定“是否为空”：列内在任务栏高度方向上的 RGB 极差之和 ≤ CONTENT_DEV 视为空列。
+fn scan_columns(bits: *const c_void, tw: i32, th: i32, w: usize) -> Vec<bool> {
     let stride = tw as usize * 4;
     let data = unsafe { std::slice::from_raw_parts(bits as *const u8, stride * th as usize) };
-    // 只在托盘左侧搜索，并留出托盘溢出按钮（^）的余量
-    let w = (taskbar_tray_left(tr) - tr.left - TRAY_MARGIN).clamp(0, tw) as usize;
-    if w == 0 {
-        return None;
-    }
     let mut free = vec![false; w];
     let y0 = 4usize;
     let y1 = (th as usize).saturating_sub(4);
@@ -1550,23 +1570,17 @@ fn scan_free_columns(state: &AppState, tr: &RECT, bits: *const c_void, tw: i32, 
         }
         *f = (hi[0] - lo[0]) + (hi[1] - lo[1]) + (hi[2] - lo[2]) <= CONTENT_DEV;
     }
-    // 自身窗口覆盖的列不参与判定
-    if let Some(r) = state.rings.as_ref() {
-        let mut rc = RECT::default();
-        unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
-        let l = (rc.left - tr.left).clamp(0, w as i32) as usize;
-        let rr = (rc.right - tr.left).clamp(0, w as i32) as usize;
-        if l < rr {
-            free[l..rr].fill(true);
-        }
-    }
-    // 最大连续空段
+    free
+}
+
+/// 最长连续空闲列区间 [s, e)。
+fn longest_free_run(free: &[bool]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     let mut i = 0;
-    while i < w {
+    while i < free.len() {
         if free[i] {
             let s = i;
-            while i < w && free[i] {
+            while i < free.len() && free[i] {
                 i += 1;
             }
             if best.is_none_or(|(bs, be)| i - s > be - bs) {
@@ -1576,9 +1590,40 @@ fn scan_free_columns(state: &AppState, tr: &RECT, bits: *const c_void, tw: i32, 
             i += 1;
         }
     }
-    let (s, e) = best?;
-    let seg = (tr.left + s as i32, tr.left + e as i32);
-    (seg.1 - seg.0 >= PIN_NEED).then_some(seg)
+    best
+}
+
+/// 给定左缘 x 处（宽 CAPSULE_W）是否被任务栏内容挤住：只看该区间左右两侧紧邻的窄带
+/// （三环窗口自身像素看不到其下方内容，故不采自身范围）；两侧都有内容才算被挤住。
+fn crowded_at(free: &[bool], cur: i32, tr_left: i32) -> bool {
+    const BAND: i32 = 16;
+    let n = free.len() as i32;
+    let probe = |a: i32, b: i32| -> Option<bool> {
+        if b - a < 8 {
+            return None; // 窄带太窄，判不了
+        }
+        Some(free[a as usize..b as usize].iter().any(|f| !*f))
+    };
+    let l = (cur - tr_left).clamp(0, n);
+    let r = (cur - tr_left + CAPSULE_W as i32).clamp(0, n);
+    matches!(
+        (probe((l - BAND).max(0), l), probe(r, (r + BAND).min(n))),
+        (Some(true), Some(true))
+    )
+}
+
+/// 在空闲列中找一个与 base 位置不重叠、宽度足够的空位左缘（屏幕坐标）。
+fn avoid_candidate(free: &[bool], base: i32, tr_left: i32) -> Option<i32> {
+    let (s, e) = longest_free_run(free)?;
+    let (seg0, seg1) = (tr_left + s as i32, tr_left + e as i32);
+    if seg1 - seg0 < PIN_NEED {
+        return None;
+    }
+    // 与用户位置重叠就不算候选，否则会原地打转
+    if seg0 < base + CAPSULE_W as i32 && base < seg1 {
+        return None;
+    }
+    Some(seg0 + PIN_GAP)
 }
 
 /// 三环窗口当前左缘（屏幕坐标）。用于定位滞回：任务栏透明时像素判定会随壁纸噪声抖动，
@@ -1619,8 +1664,24 @@ fn taskbar_free_segment(state: &mut AppState) -> Option<(i32, i32)> {
 }
 
 fn taskbar_free_segment_uncached(state: &mut AppState, tr: &RECT) -> Option<(i32, i32)> {
-    if let Some(seg) = pixels_free_segment(state, tr) {
-        return Some(seg);
+    if let Some(mut free) = taskbar_free_columns(tr) {
+        // 首次落位：把三环自身覆盖的列视为空（它本来就该待在空段里）
+        if let Some(r) = state.rings.as_ref() {
+            let mut rc = RECT::default();
+            unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+            let n = free.len() as i32;
+            let l = (rc.left - tr.left).clamp(0, n) as usize;
+            let rr = (rc.right - tr.left).clamp(0, n) as usize;
+            if l < rr {
+                free[l..rr].fill(true);
+            }
+        }
+        if let Some((s, e)) = longest_free_run(&free) {
+            let seg = (tr.left + s as i32, tr.left + e as i32);
+            if seg.1 - seg.0 >= PIN_NEED {
+                return Some(seg);
+            }
+        }
     }
     // 兜底：紧靠托盘左侧（任务按钮与托盘之间通常为空）
     let right = taskbar_tray_left(tr);
@@ -1696,15 +1757,55 @@ fn sync_taskbar_state(state: &mut AppState) {
                 if let Some((sx0, sx1)) = taskbar_span(&tr) {
                     fits = true;
                     let cur = rings_current_x(state);
-                    let prefer = match state.config.capsule.taskbar_x.or(cur) {
+                    // 用户位置：拖动保存的位置优先，没有就用当前位置
+                    let base = state.config.capsule.taskbar_x.or(cur);
+                    // 遮挡兜底：只在“用户位置被任务栏内容挤住”时才搬，且连续两次判定一致才生效。
+                    // 透明任务栏下像素判定会被壁纸带偏，连续确认 + 必须存在不重叠的空位，可挡掉误判。
+                    if let Some(bx) = base {
+                        if state.pin_check_at.is_none_or(|t| t.elapsed() >= SEG_CACHE) {
+                            state.pin_check_at = Some(Instant::now());
+                            if let Some(free) = taskbar_free_columns(&tr) {
+                                if crowded_at(&free, bx, tr.left) {
+                                    if state.pin_avoid_x.is_none() {
+                                        match avoid_candidate(&free, bx, tr.left) {
+                                            Some(cx) => {
+                                                let same = state
+                                                    .pin_avoid_cand
+                                                    .is_some_and(|p| (p - cx).abs() <= PIN_DEADZONE);
+                                                state.pin_avoid_hits =
+                                                    if same { state.pin_avoid_hits.saturating_add(1) } else { 1 };
+                                                state.pin_avoid_cand = Some(cx);
+                                                if state.pin_avoid_hits >= 2 {
+                                                    state.pin_avoid_x = Some(cx);
+                                                    state.pin_avoid_hits = 0;
+                                                }
+                                            }
+                                            None => {
+                                                state.pin_avoid_cand = None;
+                                                state.pin_avoid_hits = 0;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // 不再拥挤：撤销兜底，回到用户位置
+                                    state.pin_avoid_cand = None;
+                                    state.pin_avoid_hits = 0;
+                                    state.pin_avoid_x = None;
+                                }
+                            }
+                        }
+                    }
+                    let prefer = match state.pin_avoid_x.or(base) {
                         Some(px) => Some(px),
                         // 首次落位：取扫描空段的左缘（扫描结果不可信时会走兜底）
                         None => taskbar_free_segment(state).map(|(fx0, _)| fx0 + PIN_GAP),
                     };
                     let mut ax = pin_fit(sx0, sx1, prefer);
-                    if let Some(cx) = cur {
-                        if (ax - cx).abs() < PIN_DEADZONE {
-                            ax = cx; // 差异极小：保持原位，不做微调
+                    if state.pin_avoid_x.is_none() {
+                        if let Some(cx) = cur {
+                            if (ax - cx).abs() < PIN_DEADZONE {
+                                ax = cx; // 差异极小：保持原位，不做微调
+                            }
                         }
                     }
                     // 三环高与任务栏等高，纵向铺满任务栏条

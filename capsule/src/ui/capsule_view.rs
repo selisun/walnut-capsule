@@ -9,7 +9,7 @@ use crate::data::{ConnStatus, Disk, Frame, Snapshot, WM_APP_PANEL};
 use crate::fmt;
 use crate::font::Font;
 use std::collections::{HashMap, VecDeque};
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -175,6 +175,9 @@ pub struct CapsuleView {
     taskbar_h: i32,
     /// 鼠标悬停态：圆环描边加亮
     hovered: bool,
+    /// 网络环兜底刻度（会话峰值 rx/tx，字节/秒）：网卡协商速率读不到时（WiFi 等）
+    /// 用峰值做满环基准，按帧缓慢衰减，避免历史尖峰长期钉住刻度
+    net_peak: (u64, u64),
 }
 
 /// 卡片正文。
@@ -279,6 +282,7 @@ impl CapsuleView {
             gear_pos: (0.0, 0.0),
             taskbar_h: 0,
             hovered: false,
+            net_peak: (0, 0),
         }
     }
 
@@ -293,7 +297,7 @@ impl CapsuleView {
     }
 
     /// 收起态分发：固定到任务栏画透明三圆环，未固定画药丸胶囊。
-    fn render_collapsed(&self, px: &mut Pixmap, frame: &Frame, font: Option<&Font>) {
+    fn render_collapsed(&mut self, px: &mut Pixmap, frame: &Frame, font: Option<&Font>) {
         if frame.pinned {
             self.render_rings(px, frame, font);
         } else {
@@ -334,8 +338,12 @@ impl CapsuleView {
         draw_pill_cell(px, font, self.icons.net.as_ref(), x2, cy1, Some(("DL", DL_PURPLE)), &fmt::rate(nr), FG);
     }
 
-    fn render_rings(&self, px: &mut Pixmap, frame: &Frame, font: Option<&Font>) {
-        draw_rings(px, frame, font);
+    fn render_rings(&mut self, px: &mut Pixmap, frame: &Frame, font: Option<&Font>) {
+        // 协商速率读不到时（WiFi 网卡没有 sysfs speed）网络环改用会话峰值做满环基准
+        let (rx, tx) = net_io_sum(frame.snap);
+        let decay = |p: u64, v: u64| (p * 99 / 100).max(v);
+        self.net_peak = (decay(self.net_peak.0, rx), decay(self.net_peak.1, tx));
+        draw_rings(px, frame, font, self.net_peak);
     }
 
     fn render_expanded(
@@ -1134,6 +1142,51 @@ fn draw_ring(px: &mut Pixmap, cx: f32, cy: f32, r: f32, width: f32, pct: Option<
     }
 }
 
+/// 上下半环：上半＝通道一（如上行）、下半＝通道二（如下行），各自按百分比填充。
+/// pct 为 None 表示未知（只画轨道）；两半都从左侧水平点起、绕向另一侧。
+#[allow(clippy::too_many_arguments)]
+fn draw_ring_split(
+    px: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    width: f32,
+    upper: Option<f32>,
+    upper_c: (u8, u8, u8, u8),
+    lower: Option<f32>,
+    lower_c: (u8, u8, u8, u8),
+) {
+    let mut stroke = |path: &Path, col: (u8, u8, u8, u8), width: f32| {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(col.0, col.1, col.2, col.3);
+        paint.anti_alias = true;
+        let s = Stroke { width, line_cap: LineCap::Round, ..Default::default() };
+        px.stroke_path(path, &paint, &s, Transform::identity(), None);
+    };
+    // 轨道：整圈
+    if let Some(p) = arc_path(cx, cy, r, -PI / 2.0, -PI / 2.0 + TAU) {
+        stroke(&p, TRACK, width);
+    }
+    // 上半环：左侧水平点 → 顶部 → 右侧（角度 PI → 2PI 递增）
+    if let Some(v) = upper {
+        let v = (v / 100.0).clamp(0.0, 1.0);
+        if v > 0.005 {
+            if let Some(p) = arc_path(cx, cy, r, PI, PI + PI * v) {
+                stroke(&p, upper_c, width);
+            }
+        }
+    }
+    // 下半环：左侧水平点 → 底部 → 右侧（角度 PI−PI·v → PI 递增）
+    if let Some(v) = lower {
+        let v = (v / 100.0).clamp(0.0, 1.0);
+        if v > 0.005 {
+            if let Some(p) = arc_path(cx, cy, r, PI - PI * v, PI) {
+                stroke(&p, lower_c, width);
+            }
+        }
+    }
+}
+
 /// 使用率分级颜色：<60% 绿、60~85% 橙、≥85% 红。
 fn usage_color(v: f32) -> (u8, u8, u8, u8) {
     if v < 60.0 {
@@ -1570,7 +1623,7 @@ fn disk_io_sum(s: &Snapshot) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
-fn net_io_sum(s: &Snapshot) -> (u64, u64) {
+pub(crate) fn net_io_sum(s: &Snapshot) -> (u64, u64) {
     s.network
         .as_ref()
         .map(|v| {
@@ -1579,6 +1632,25 @@ fn net_io_sum(s: &Snapshot) -> (u64, u64) {
             })
         })
         .unwrap_or((0, 0))
+}
+
+/// 网络环两个百分比（上行、下行）：优先以网卡**协商速率**为分母；
+/// 协商速率读不到时（WiFi 网卡无 sysfs speed、网卡 down）退化为以会话峰值为基准的相对刻度。
+fn net_ring_pct(s: &Snapshot, peak: (u64, u64)) -> (Option<f32>, Option<f32>) {
+    let (rx, tx) = net_io_sum(s);
+    let speed = s
+        .network
+        .as_deref()
+        .and_then(|v| v.iter().find_map(|n| n.speed_mbps.filter(|v| *v > 0)));
+    let Some(speed) = speed else {
+        // 未知协商速率：相对峰值（峰值恒 ≥ 当前值，结果落在 0~100）
+        let rel = |v: u64, p: u64| Some(((v as f64 / p.max(1) as f64) * 100.0).clamp(0.0, 100.0) as f32);
+        return (rel(tx, peak.1), rel(rx, peak.0));
+    };
+    // 协商速率是 Mbps（10^6 bit/s），换算成字节/秒作为满环基准
+    let cap_bytes = speed as f64 * 1_000_000.0 / 8.0;
+    let pct = |v: u64| Some(((v as f64 / cap_bytes) * 100.0).clamp(0.0, 100.0) as f32);
+    (pct(tx), pct(rx))
 }
 
 /// 药丸胶囊单元格：图标（可选，随行中线垂直居中）+ 彩色前缀（可选，其后留一个字符间距）
@@ -1627,7 +1699,7 @@ pub(crate) const RINGS_H: u32 = 48;
 
 /// 三圆环收起态：透明背景 + 横向三环（CPU / 内存 / 网络），数值与标注都收在环内。
 /// 由任务栏内的子窗口直接调用，不依赖 View 实例。
-pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>) {
+pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>, net_peak: (u64, u64)) {
     let Some(font) = font else { return };
     // 环内数值各自用分级色，标注用灰色（深色任务栏换浅灰）
     let dim = if frame.pinned && !frame.taskbar_light {
@@ -1662,8 +1734,20 @@ pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>) {
     let mem_text = mem_pct.map_or_else(|| "--%".into(), |v| format!("{:.0}%", v.round()));
     draw_ring_inner(px, font, RING_CX[1], RING_CY, &mem_text, color(mem_color.0, mem_color.1, mem_color.2, mem_color.3), "内存", dim);
 
-    // 网络环：环内上行（橙）/ 下行（紫）两行速率
-    draw_ring(px, RING_CX[2], RING_CY, RING_R, RING_STROKE, None, ACCENT);
+    // 网络环：上半＝上行（橙）、下半＝下行（紫）。分母优先取网卡协商速率，
+    // 读不到时退化为会话峰值相对刻度；环内两行小字始终显示实时速率
+    let (ul_pct, dl_pct) = net_ring_pct(s, net_peak);
+    draw_ring_split(
+        px,
+        RING_CX[2],
+        RING_CY,
+        RING_R,
+        RING_STROKE,
+        ul_pct,
+        TX_LINE,
+        dl_pct,
+        DL_PURPLE,
+    );
     draw_net_inner(px, font, RING_CX[2], RING_CY, &format!("UL {}", fmt::rate(nw)), &format!("DL {}", fmt::rate(nr)));
 }
 

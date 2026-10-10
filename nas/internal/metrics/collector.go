@@ -33,7 +33,7 @@ func NewCollector() *Collector {
 		mem:      newMemSampler(proc),
 		disk:     newDiskSampler(proc, sys, root),
 		gpu:      newGPUSampler(),
-		net:      newNetSampler(proc),
+		net:      newNetSampler(proc, sys),
 		hostname: readHostname(proc),
 	}
 }

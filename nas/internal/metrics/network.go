@@ -17,6 +17,7 @@ import (
 //     取累计收发流量最大的那块物理网卡。
 type netSampler struct {
 	proc string
+	sys  string
 
 	// target 为手动指定的网卡名（空串表示自动选择）。
 	// 可由管理页在运行时改写，用独立锁保护。
@@ -32,13 +33,32 @@ type netSampler struct {
 
 type netCounter struct{ rx, tx uint64 }
 
-func newNetSampler(proc string) *netSampler {
+func newNetSampler(proc, sys string) *netSampler {
 	return &netSampler{
 		proc:   proc,
+		sys:    sys,
 		target: getenvOr("NET_IFACE", ""),
 		prev:   map[string]netCounter{},
 		seen:   map[string]netCounter{},
 	}
+}
+
+// linkSpeedMbps 读取网卡协商速率（Mbps）：/sys/class/net/<iface>/speed。
+// 网卡 down、虚拟设备或驱动未导出时读到负值/错误，一律返回 0（未知），
+// 客户端据此退化为不画进度弧（只留轨道）。
+func linkSpeedMbps(sys, name string) int {
+	if sys == "" || name == "" {
+		return 0
+	}
+	b, err := os.ReadFile(filepath.Join(sys, "class", "net", name, "speed"))
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 func (s *netSampler) snapshot() []NetIf {
@@ -147,6 +167,8 @@ func (s *netSampler) sample() {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 协商速率：供客户端计算网络环百分比（读不到则为 0，客户端只画轨道）
+	speed := linkSpeedMbps(s.sys, target)
 	var out []NetIf
 	if c, ok := cur[target]; ok {
 		if !s.prevAt.IsZero() {
@@ -155,16 +177,17 @@ func (s *netSampler) sample() {
 				p, ok := s.prev[target]
 				if ok && c.rx >= p.rx && c.tx >= p.tx {
 					out = append(out, NetIf{
-						Name:  target,
-						RxBPS: uint64(float64(c.rx-p.rx) / dt),
-						TxBPS: uint64(float64(c.tx-p.tx) / dt),
+						Name:      target,
+						RxBPS:     uint64(float64(c.rx-p.rx) / dt),
+						TxBPS:     uint64(float64(c.tx-p.tx) / dt),
+						SpeedMbps: speed,
 					})
 				} else {
-					out = append(out, NetIf{Name: target})
+					out = append(out, NetIf{Name: target, SpeedMbps: speed})
 				}
 			}
 		} else {
-			out = append(out, NetIf{Name: target})
+			out = append(out, NetIf{Name: target, SpeedMbps: speed})
 		}
 	}
 	s.ifaces = out
