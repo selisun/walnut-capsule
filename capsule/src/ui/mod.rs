@@ -1,10 +1,7 @@
-//! 视图层。View trait 当前实现 CapsuleView，其余形态预留。
+//! 视图层。View trait 当前实现 CapsuleView。
+//! （早期预留的 bar_view / ring_view 空壳已删除，形态统一由 capsule_view 承载。）
 
 pub mod capsule_view;
-
-// 预留形态（留口，暂未实现）：
-// pub mod bar_view;
-// pub mod ring_view;
 
 use crate::data::Frame;
 use crate::font::Font;
