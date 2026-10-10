@@ -1,0 +1,7 @@
+#!/bin/bash
+# 卸载前回调：停止服务进程。var 目录（含 token）由系统保留，不在此删除。
+
+CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
+"${CMD_DIR}/main" stop 2>/dev/null || true
+
+exit 0

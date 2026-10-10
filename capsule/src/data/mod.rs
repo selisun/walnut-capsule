@@ -15,6 +15,8 @@ use std::thread::JoinHandle;
 
 /// 数据更新时向 UI 线程投递的消息（wndproc 触发重绘）。
 pub const WM_APP_DATA: u32 = 0x8000 + 1; // WM_APP + 1
+/// 后台面板构建线程完成一帧时投递的消息（UI 取结果并重绘）。
+pub const WM_APP_PANEL: u32 = 0x8000 + 3; // WM_APP + 3（+2 为托盘回调）
 
 /// 一次全量/增量快照。WS 增量推送缺失的分区为 None，不覆盖旧值。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -22,11 +24,16 @@ pub struct Snapshot {
     #[serde(default)]
     pub timestamp: i64,
     #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
     pub cpu: Option<Cpu>,
     #[serde(default)]
     pub memory: Option<Memory>,
     #[serde(default)]
     pub disks: Option<Vec<Disk>>,
+    /// 逻辑卷（仅用于按总量匹配归属到物理盘，不单独展示）
+    #[serde(default)]
+    pub volumes: Option<Vec<Volume>>,
     #[serde(default)]
     pub gpus: Option<Vec<Gpu>>,
     #[serde(default)]
@@ -39,6 +46,9 @@ impl Snapshot {
         if inc.timestamp != 0 {
             self.timestamp = inc.timestamp;
         }
+        if inc.hostname.is_some() {
+            self.hostname = inc.hostname.clone();
+        }
         if inc.cpu.is_some() {
             self.cpu = inc.cpu.clone();
         }
@@ -47,6 +57,9 @@ impl Snapshot {
         }
         if inc.disks.is_some() {
             self.disks = inc.disks.clone();
+        }
+        if inc.volumes.is_some() {
+            self.volumes = inc.volumes.clone();
         }
         if inc.gpus.is_some() {
             self.gpus = inc.gpus.clone();
@@ -80,13 +93,24 @@ pub struct Disk {
     #[serde(default)]
     pub device: String,
     #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub temp: Option<i64>,
-    #[serde(default)]
     pub read_bytes_per_sec: Option<u64>,
     #[serde(default)]
     pub write_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+}
+
+/// 逻辑存储卷（fnOS /volN 等）：只关心容量与用量。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Volume {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,12 +140,14 @@ pub struct NetIf {
 }
 
 /// 连接状态，供 UI 显示。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnStatus {
     Connecting,
     Online,
     /// 断线，n 秒后重连
     Reconnect(u64),
+    /// 令牌错误 or 403，需重新设置
+    AuthFailed,
 }
 
 /// 订阅详细程度：收起只订 5 项，展开订全量。
@@ -134,16 +160,28 @@ pub enum Detail {
 /// UI → 数据源 命令。
 pub enum SourceCmd {
     SetDetail(Detail),
-    /// 更换 NAS 地址（"host:port"），立即重连。
-    SetTarget(String),
+    /// 更换 NAS 地址与配对令牌（"host:port", token），立即重连。
+    SetTarget(String, String),
     Shutdown,
 }
 
 /// UI 与数据源共享的状态。
 pub struct SharedState {
     pub conn: ConnStatus,
-    pub snap: Snapshot,
+    /// 快照整体 Arc 化：WS 线程写时 clone-modify-swap（写锁临界区极短），
+    /// UI 线程渲染前只 clone Arc，全程不持锁，杜绝锁竞争造成的帧尖峰。
+    pub snap: Arc<Snapshot>,
     pub has_data: bool,
+    /// 磨砂模式：UI 背景更透，露出系统模糊。
+    pub frost: bool,
+    /// 当前连接的 NAS 地址（用户配置的 host，用于展开态顶栏显示）。
+    pub nas_host: String,
+    /// 是否固定在任务栏（透明融入任务栏，不画卡片底）。
+    pub pinned: bool,
+    /// 任务栏是否为浅色主题（决定固定在任务栏时的文字配色）。
+    pub taskbar_light: bool,
+    /// 固定在任务栏且任务栏位于屏幕下方时为 true：展开面板向上生长（顶栏贴窗口底部）。
+    pub expand_up: bool,
     seq: AtomicU64,
 }
 
@@ -151,9 +189,65 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             conn: ConnStatus::Connecting,
-            snap: Snapshot::default(),
+            snap: Arc::new(Snapshot::default()),
             has_data: false,
+            frost: false,
+            nas_host: String::new(),
+            pinned: false,
+            taskbar_light: true,
+            expand_up: false,
             seq: AtomicU64::new(0),
+        }
+    }
+}
+
+/// 一帧渲染所需数据的轻量视图：持锁期间只拷贝 Arc 指针与少量小字段，
+/// 渲染在锁外进行。
+pub struct Frame<'a> {
+    /// 快照的 Arc 指针引用（供视图把构建任务派发到后台线程）
+    pub arc: &'a Arc<Snapshot>,
+    pub snap: &'a Snapshot,
+    /// 数据版本号：仅在快照/连接状态变化时递增，视图据此复用整帧缓存。
+    pub seq: u64,
+    pub has_data: bool,
+    pub frost: bool,
+    pub conn: &'a ConnStatus,
+    /// 当前连接的 NAS 地址（host）。
+    pub nas_host: &'a str,
+    /// 是否固定在任务栏（透明融合）。
+    pub pinned: bool,
+    /// 任务栏是否浅色主题。
+    pub taskbar_light: bool,
+    /// 展开面板是否向上生长（顶栏位于窗口底部）。
+    pub expand_up: bool,
+}
+
+/// 锁外持有的一帧数据：Arc 快照指针 + 少量小字段拷贝。
+pub struct OwnedFrame {
+    pub snap: Arc<Snapshot>,
+    pub seq: u64,
+    pub conn: ConnStatus,
+    pub has_data: bool,
+    pub frost: bool,
+    pub nas_host: String,
+    pub pinned: bool,
+    pub taskbar_light: bool,
+    pub expand_up: bool,
+}
+
+impl OwnedFrame {
+    pub fn as_frame(&self) -> Frame<'_> {
+        Frame {
+            arc: &self.snap,
+            snap: &self.snap,
+            seq: self.seq,
+            has_data: self.has_data,
+            frost: self.frost,
+            conn: &self.conn,
+            nas_host: &self.nas_host,
+            pinned: self.pinned,
+            taskbar_light: self.taskbar_light,
+            expand_up: self.expand_up,
         }
     }
 }
@@ -165,6 +259,20 @@ impl SharedState {
     pub fn bump_seq(&self) {
         self.seq.fetch_add(1, Ordering::Relaxed);
     }
+    /// 极短临界区：只 clone Arc 指针与小字段，立刻放锁，渲染在锁外。
+    pub fn grab(&self) -> OwnedFrame {
+        OwnedFrame {
+            snap: self.snap.clone(),
+            seq: self.seq(),
+            conn: self.conn.clone(),
+            has_data: self.has_data,
+            frost: self.frost,
+            nas_host: self.nas_host.clone(),
+            pinned: self.pinned,
+            taskbar_light: self.taskbar_light,
+            expand_up: self.expand_up,
+        }
+    }
 }
 
 /// 数据源启动上下文。
@@ -175,6 +283,8 @@ pub struct SourceCtx {
     pub cmd_rx: Receiver<SourceCmd>,
     /// 初始 NAS 地址 "host:port"。
     pub target: String,
+    /// 初始配对令牌。
+    pub token: String,
 }
 
 /// 数据源接口。实现者阻塞运行在自己的线程里，直到 Shutdown。

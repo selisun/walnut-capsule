@@ -1,0 +1,27 @@
+[
+  {
+    "stepTitle": "数据处理",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "请选择应用数据的处理方式。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_delete_data",
+        "label": "保留数据可在重新安装后继续使用原配对令牌，无需重新配对。",
+        "initValue": "false",
+        "options": [
+          {
+            "label": "保留数据（推荐）",
+            "value": "false"
+          },
+          {
+            "label": "完全卸载，删除配对令牌与设置（不可恢复）",
+            "value": "true"
+          }
+        ]
+      }
+    ]
+  }
+]

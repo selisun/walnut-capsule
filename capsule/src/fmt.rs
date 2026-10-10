@@ -23,8 +23,3 @@ pub fn bytes(b: u64) -> String {
         format!("{}K", b >> 10)
     }
 }
-
-/// 百分比 → "23%"
-pub fn pct(v: f64) -> String {
-    format!("{:.0}%", v)
-}

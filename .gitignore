@@ -31,6 +31,15 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
+# ── 构建产物 / 成品包 ──────────────
+hetaocapsule/app/hetao-nas
+hetaocapsule/hetaocapsule.fpk
+hetaocapsule/app/ui/download/
+capsule/installer/output/
+
+# ── 早期容器方案遗留 ───────────────
+nas/deploy/
+
 # ── 日志 / 临时 ────────────────────
 *.log
 *.tmp

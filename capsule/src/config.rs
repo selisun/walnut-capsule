@@ -18,18 +18,39 @@ pub struct NasConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// 配对令牌：与服务端 CAPSULE_TOKEN / 启动日志中的令牌一致
+    #[serde(default)]
+    pub token: String,
     /// 数据源：ws（连 NAS）| fake（模拟数据）
     #[serde(default = "default_source")]
     pub source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapsuleConfig {
     /// 窗口左上角；None 表示自动（右上角）。
     #[serde(default)]
     pub x: Option<i32>,
     #[serde(default)]
     pub y: Option<i32>,
+    /// 胶囊整体不透明度 0.30..1.00
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    /// 磨砂背景（系统合成器 Acrylic）
+    #[serde(default)]
+    pub frost: bool,
+    /// 固定在任务栏（显示在任务栏上，位置锁定、始终浮于任务栏之上）
+    #[serde(default)]
+    pub taskbar_pin: bool,
+    /// 固定在任务栏时用户拖动选择的左边缘 x（屏幕坐标）；None 表示自动选取空位
+    #[serde(default)]
+    pub taskbar_x: Option<i32>,
+}
+
+impl Default for CapsuleConfig {
+    fn default() -> Self {
+        Self { x: None, y: None, opacity: 1.0, frost: false, taskbar_pin: false, taskbar_x: None }
+    }
 }
 
 impl Default for NasConfig {
@@ -37,6 +58,7 @@ impl Default for NasConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            token: String::new(),
             source: default_source(),
         }
     }
@@ -53,10 +75,18 @@ fn default_port() -> u16 {
 fn default_source() -> String {
     "ws".to_string()
 }
+fn default_opacity() -> f32 {
+    1.0
+}
 
 impl NasConfig {
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+    /// 是否尚未配置：令牌为空，或地址仍是占位默认值。
+    /// 注意：端口 8765 是正常默认端口，不能作为“未配置”的判据（否则每次启动都弹设置窗）。
+    pub fn needs_setup(&self) -> bool {
+        self.token.trim().is_empty() || self.host == default_host()
     }
     /// 解析 "host" 或 "host:port"。
     pub fn set_addr(&mut self, s: &str) -> bool {

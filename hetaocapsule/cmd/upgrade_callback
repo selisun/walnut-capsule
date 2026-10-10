@@ -1,0 +1,7 @@
+#!/bin/bash
+# 更新后回调：以 package 用户身份运行。仅确保二进制具备可执行位。
+
+BIN="${TRIM_APPDEST}/hetao-nas"
+chmod 0755 "${BIN}" 2>/dev/null || true
+
+exit 0

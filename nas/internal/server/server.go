@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -15,12 +16,14 @@ import (
 
 type Server struct {
 	col      *metrics.Collector
+	tok      *TokenStore
 	upgrader websocket.Upgrader
 }
 
-func New(col *metrics.Collector) *Server {
+func New(col *metrics.Collector, tok *TokenStore) *Server {
 	return &Server{
-		col: col,
+		col:   col,
+		tok:   tok,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 4096,
@@ -31,10 +34,36 @@ func New(col *metrics.Collector) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/metrics", s.handleMetrics)
+	// 对外 API 一律要求配对令牌：不允许任何免鉴权访问（含健康检查）。
+	mux.HandleFunc("/health", s.auth(s.handleHealth))
+	mux.HandleFunc("/metrics", s.auth(s.handleMetrics))
 	mux.HandleFunc("/ws", s.handleWS)
 	return mux
+}
+
+// auth 要求配对令牌：Authorization: Bearer <token> 或 ?token=<token>。
+// 令牌仅在局域网链路使用，常量时间比较避免时序侧信道。
+func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.validToken(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="hetao-nas"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) validToken(r *http.Request) bool {
+	token := s.tok.Get()
+	if token == "" {
+		return false // 未配置令牌一律拒绝（正常不会发生，main 保证令牌非空）
+	}
+	provided := r.URL.Query().Get("token")
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		provided = strings.TrimPrefix(h, "Bearer ")
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -112,6 +141,14 @@ func metricPrefix(key string) (string, bool) {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	// WS 子协议难以携带标准鉴权头，统一用 ?token=<配对令牌>；
+	// 校验失败直接 401，不升级、不暴露任何内部状态。
+	// 注意：令牌为空时也必须拒绝（否则空 token 与空明文相等会误判为通过）。
+	token := s.tok.Get()
+	if token == "" || subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(token)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
@@ -165,7 +202,7 @@ func (s *Server) wsWritePump(conn *websocket.Conn, sub *subscription, done <-cha
 
 // buildPayload 按订阅前缀裁剪快照；prefixes 为 nil 时返回全量。
 func buildPayload(snap *metrics.Snapshot, prefixes map[string]bool) map[string]any {
-	out := map[string]any{"timestamp": snap.Timestamp}
+	out := map[string]any{"timestamp": snap.Timestamp, "hostname": snap.Hostname}
 	full := prefixes == nil
 	if full || prefixes["cpu"] {
 		out["cpu"] = snap.CPU
@@ -178,6 +215,7 @@ func buildPayload(snap *metrics.Snapshot, prefixes map[string]bool) map[string]a
 	}
 	if full || prefixes["disk"] {
 		out["disks"] = snap.Disks
+		out["volumes"] = snap.Volumes
 	}
 	if full || prefixes["net"] {
 		out["network"] = snap.Network

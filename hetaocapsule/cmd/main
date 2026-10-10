@@ -1,0 +1,64 @@
+#!/bin/bash
+# 核桃胶囊原生服务生命周期管理（非 Docker，直接运行在 fnOS 宿主机）。
+# 运行身份：privilege 声明的 package 用户（非 root）。
+# 配对令牌由程序自身持久化到 ${TRIM_PKGVAR}/token，此处无需处理。
+
+# fnOS 启动环境不含 PATH，Go 的 exec 需能定位 /usr/sbin 下的系统工具。显式补全。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+BIN="${TRIM_APPDEST}/hetao-nas"
+PID_FILE="${TRIM_PKGVAR}/hetao-nas.pid"
+LOG_FILE="${TRIM_PKGVAR}/hetao-nas.log"
+
+read_pid() {
+    if [ -f "${PID_FILE}" ]; then
+        tr -d '[:space:]' < "${PID_FILE}"
+    fi
+}
+
+case $1 in
+start)
+    mkdir -p "${TRIM_PKGVAR}"
+    pid="$(read_pid)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        exit 0  # 已在运行，幂等
+    fi
+    rm -f "${PID_FILE}"
+    # 原生环境不设 HOST_*：程序默认读宿主机 /proc、/sys，hostname 取宿主机。
+    # program 自行在 ${TRIM_APPDEST}/app.sock 上提供网关管理页。
+    nohup "${BIN}" >> "${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+    sleep 1
+    newpid="$(read_pid)"
+    if [ -n "$newpid" ] && kill -0 "$newpid" 2>/dev/null; then
+        exit 0
+    fi
+    rm -f "${PID_FILE}"
+    exit 1
+    ;;
+stop)
+    pid="$(read_pid)"
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null
+        i=0
+        while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            i=$((i + 1))
+        done
+        kill -9 "$pid" 2>/dev/null
+        rm -f "${PID_FILE}"
+    fi
+    rm -f "${TRIM_APPDEST}/app.sock"
+    exit 0
+    ;;
+status)
+    pid="$(read_pid)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    exit 1
+    ;;
+esac

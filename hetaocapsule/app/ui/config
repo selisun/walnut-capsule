@@ -1,0 +1,15 @@
+{
+    ".url": {
+        "hetaocapsule.Application": {
+            "title": "核桃胶囊",
+            "desc": "NAS 状态监控",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/hetaocapsule",
+            "gatewaySocket": "app.sock",
+            "url": "/app/hetaocapsule/",
+            "allUsers": false
+        }
+    }
+}

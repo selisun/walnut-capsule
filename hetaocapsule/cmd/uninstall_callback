@@ -1,0 +1,12 @@
+#!/bin/bash
+# 卸载后回调：按卸载向导（wizard/uninstall）的选择决定是否删除应用数据。
+# 飞牛默认卸载会保留 var 目录；选择“完全卸载”时清空其内容。
+# var 内含配对令牌（token）、网卡选择（iface）与运行日志，删除后重装需重新配对。
+
+if [ "$wizard_delete_data" = "true" ]; then
+    if [ -n "${TRIM_PKGVAR}" ] && [ -d "${TRIM_PKGVAR}" ]; then
+        find "${TRIM_PKGVAR}" -mindepth 1 -delete 2>/dev/null || true
+    fi
+fi
+
+exit 0

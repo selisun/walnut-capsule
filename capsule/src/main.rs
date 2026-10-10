@@ -10,6 +10,7 @@ mod config;
 mod data;
 mod fmt;
 mod font;
+mod icons;
 mod ui;
 
 use std::env;

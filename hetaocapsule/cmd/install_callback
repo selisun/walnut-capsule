@@ -1,0 +1,11 @@
+#!/bin/bash
+# 安装后回调：以 package 用户身份运行（fnOS 不会以 root 执行此脚本）。
+#
+# 注意：磁盘 SMART 温度需要 CAP_SYS_RAWIO（root），与本应用"非 root 上架"要求冲突，
+# 因此本应用不采集磁盘温度（客户端显示 --°C）；CPU 温度经 hwmon 非 root 可读，正常采集。
+# 这里仅确保二进制具备可执行位。
+
+BIN="${TRIM_APPDEST}/hetao-nas"
+chmod 0755 "${BIN}" 2>/dev/null || true
+
+exit 0
