@@ -97,7 +97,26 @@ func stripPrefix(prefix string, h http.Handler) http.Handler {
 func (a *admin) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(indexHTML))
+	html := indexHTML
+	// 品牌图标 URL 带上版本参数：图标自身可长期缓存，升级后 URL 变化即可自动取新图
+	// （否则浏览器会按 max-age 继续用旧图标，表现为“换了图标但管理页没变”）
+	if v := iconVersion(a.Version); v != "" {
+		html = strings.Replace(html, `src="api/icon"`, `src="api/icon?v=`+v+`"`, 1)
+	}
+	_, _ = w.Write([]byte(html))
+}
+
+// iconVersion 只保留 URL 安全字符，避免把环境变量值直接拼进 HTML/URL。
+func iconVersion(v string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= '0' && r <= '9', r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z',
+			r == '.', r == '-', r == '_':
+			return r
+		default:
+			return -1
+		}
+	}, v)
 }
 
 func (a *admin) handleState(w http.ResponseWriter, _ *http.Request) {
@@ -209,7 +228,8 @@ func (a *admin) handleIcon(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	// URL 带版本参数（见 handleIndex），同一版本内可长期缓存
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	_, _ = w.Write(b)
 }
 
