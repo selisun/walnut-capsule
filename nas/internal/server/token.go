@@ -12,19 +12,29 @@ import (
 type TokenStore struct {
 	mu   sync.RWMutex
 	v    string
-	file string // 持久化路径；为空则仅内存
+	file string        // 持久化路径；为空则仅内存
+	ch   chan struct{} // 每次重置关闭并替换：用于让已建立的会话（如 WS）立即失效
 }
 
 // NewTokenStore 构造令牌存储：initial 非空则优先（如 NET_IFACE 式的显式注入）；
 // 否则从 file 读取已持久化的令牌，保证重启/升级后令牌不变。
 func NewTokenStore(initial, file string) *TokenStore {
-	t := &TokenStore{v: initial, file: file}
+	t := &TokenStore{v: initial, file: file, ch: make(chan struct{})}
 	if t.v == "" && file != "" {
 		if b, err := os.ReadFile(file); err == nil {
 			t.v = strings.TrimSpace(string(b))
 		}
 	}
 	return t
+}
+
+// Changed 返回令牌变更通知通道：令牌重置时该通道被关闭。
+// 已建立的会话（WebSocket 只在握手时校验令牌）应据此立即断开，
+// 否则旧令牌重置后仍能继续收到推送。
+func (t *TokenStore) Changed() <-chan struct{} {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.ch
 }
 
 func (t *TokenStore) Get() string {
@@ -51,6 +61,8 @@ func (t *TokenStore) Reset() (string, error) {
 	t.mu.Lock()
 	t.v = v
 	file := t.file
+	close(t.ch)                // 通知已建立的会话：旧令牌立即失效
+	t.ch = make(chan struct{}) // 新令牌对应新通道
 	t.mu.Unlock()
 	if file != "" {
 		if err := os.WriteFile(file, []byte(v), 0600); err != nil {

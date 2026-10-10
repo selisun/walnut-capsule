@@ -181,9 +181,19 @@ func (s *Server) wsWritePump(conn *websocket.Conn, sub *subscription, done <-cha
 	_, interval := sub.get()
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// 令牌重置时立即断开本连接：WS 只在握手时校验令牌，不主动踢会一直收推送。
+	// 客户端随后重连会拿到 401，进入“令牌错误”并停止重连。
+	tokenChanged := s.tok.Changed()
 	for {
 		select {
 		case <-done:
+			return
+		case <-tokenChanged:
+			log.Printf("ws: 令牌已重置，断开旧会话")
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "token rotated"),
+				time.Now().Add(time.Second))
+			_ = conn.Close() // 让阻塞在 ReadJSON 的 readPump 立即返回
 			return
 		case <-sub.changed:
 			_, interval = sub.get()
