@@ -92,7 +92,6 @@ nas/            NAS 采集服务（Go）
   internal/metrics/   各类指标采集
   internal/server/    WebSocket、/metrics、管理页、令牌
 hetaocapsule/   飞牛 fpk 应用包源码（manifest、cmd、wizard、config）
-HANDOFF.md      交接文档：版本策略、铁律、形态规格、构建打包流程、已知陷阱
 ```
 
 ## 从源码构建
@@ -107,7 +106,7 @@ cd nas
 $env:GOOS="linux"; $env:GOARCH="amd64"; $env:CGO_ENABLED="0"
 go build -trimpath -ldflags "-s -w" -o ../hetaocapsule/app/hetao-nas .
 
-# fpk 必须在 NAS 上用官方 fnpack 打包（详见 HANDOFF.md 第七节）
+# fpk 必须在 NAS 上用官方 fnpack 打包（勿手工 tar.gz，会缺 checksum 字段）
 fnpack build -d /tmp/hetaocapsule
 ```
 

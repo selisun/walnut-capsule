@@ -31,6 +31,9 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
+# ── 私有文档（不入库）──────────────
+HANDOFF.md
+
 # ── 设计素材（不入库）──────────────
 logo.png
 
