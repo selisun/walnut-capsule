@@ -1,5 +1,4 @@
 <div align="center">
-  <img src="logo.png" alt="核桃胶囊" width="120">
   <h1>核桃胶囊 · Walnut Capsule</h1>
   <p>把 NAS 的运行状态，变成桌面右上角一颗胶囊。</p>
   <p>

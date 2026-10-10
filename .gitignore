@@ -31,6 +31,9 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
+# ── 设计素材（不入库）──────────────
+logo.png
+
 # ── 构建产物 / 成品包 ──────────────
 hetaocapsule/app/hetao-nas
 hetaocapsule/hetaocapsule.fpk
