@@ -37,6 +37,11 @@ HANDOFF.md
 # ── 设计素材（不入库）──────────────
 logo.png
 
+# ── 早期容器方案遗留（不入库，现行走 fpk 原生安装）──
+nas/Dockerfile
+nas/docker-compose.yml
+nas/.dockerignore
+
 # ── 构建产物 / 成品包 ──────────────
 hetaocapsule/app/hetao-nas
 hetaocapsule/hetaocapsule.fpk
