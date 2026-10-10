@@ -692,9 +692,10 @@ fn ring_anchor_y() -> i32 {
     }
 }
 
-/// 三环窗口拖动跟手：横向限制在任务栏可用空段内。
+/// 三环窗口拖动跟手：在整个任务栏范围内移动（不再限制在扫描出的空段里）。
 fn rings_drag_move(state: &mut AppState) {
-    let Some((x0, x1)) = taskbar_free_segment(state) else { return };
+    let Some(tr) = taskbar_rect() else { return };
+    let Some((x0, x1)) = taskbar_span(&tr) else { return };
     let Some(grab) = state.rings.as_ref().map(|r| r.drag_grab) else { return };
     let mut pt = POINT::default();
     unsafe { let _ = GetCursorPos(&mut pt); }
@@ -705,7 +706,8 @@ fn rings_drag_move(state: &mut AppState) {
 
 /// 三环窗口拖动松手：记住选定位置。
 fn rings_drag_commit(state: &mut AppState) {
-    let Some((x0, x1)) = taskbar_free_segment(state) else { return };
+    let Some(tr) = taskbar_rect() else { return };
+    let Some((x0, x1)) = taskbar_span(&tr) else { return };
     let Some(r) = state.rings.as_ref() else { return };
     let mut wr = RECT::default();
     unsafe { let _ = GetWindowRect(r.hwnd, &mut wr); }
@@ -1626,6 +1628,17 @@ fn taskbar_free_segment_uncached(state: &mut AppState, tr: &RECT) -> Option<(i32
     (right - left >= CAPSULE_W as i32).then_some((left, right))
 }
 
+/// 三环可放置的横向范围 [x0, x1)：整条任务栏（任务栏左缘 → 托盘左缘）。
+/// 位置交给用户拖动决定，不再被像素扫描出的“空段”限制；扫描只用于首次落位。
+fn taskbar_span(tr: &RECT) -> Option<(i32, i32)> {
+    let x0 = tr.left + PIN_GAP;
+    let x1 = taskbar_tray_left(tr) - PIN_GAP - TRAY_MARGIN_EDGE;
+    (x1 - x0 >= CAPSULE_W as i32).then_some((x0, x1))
+}
+
+/// 任务栏右端托盘区前的让位（托盘溢出按钮 ^ 等不在 TrayNotifyWnd 内）。
+const TRAY_MARGIN_EDGE: i32 = 8;
+
 /// 在可用段 [x0, x1) 内为宽度 CAPSULE_W 的胶囊选一个合法左缘。
 /// `prefer_x` 为用户拖动选定的左缘（None 表示取最左可用位置）。
 fn pin_fit(x0: i32, x1: i32, prefer_x: Option<i32>) -> i32 {
@@ -1677,12 +1690,18 @@ fn sync_taskbar_state(state: &mut AppState) {
             let horizontal = (tr.right - tr.left) >= tb_h;
             let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
             if horizontal {
-                if let Some((x0, x1)) = taskbar_free_segment(state) {
+                // 位置策略：整条任务栏都是可用范围（拖动可放任意处）；
+                // 优先级 = 用户拖动保存的位置 > 当前位置 > 首次用像素扫描挑一个空位。
+                // 一旦有了位置就不再重算，避免透明任务栏下"任务栏后面内容变化"把三环带跑。
+                if let Some((sx0, sx1)) = taskbar_span(&tr) {
                     fits = true;
-                    // 定位优先级：用户拖动位置 > 当前位置（滞回，防透明任务栏下空段判定抖动导致乱跑）> 空段左缘
                     let cur = rings_current_x(state);
-                    let prefer = state.config.capsule.taskbar_x.or(cur);
-                    let mut ax = pin_fit(x0, x1, prefer);
+                    let prefer = match state.config.capsule.taskbar_x.or(cur) {
+                        Some(px) => Some(px),
+                        // 首次落位：取扫描空段的左缘（扫描结果不可信时会走兜底）
+                        None => taskbar_free_segment(state).map(|(fx0, _)| fx0 + PIN_GAP),
+                    };
+                    let mut ax = pin_fit(sx0, sx1, prefer);
                     if let Some(cx) = cur {
                         if (ax - cx).abs() < PIN_DEADZONE {
                             ax = cx; // 差异极小：保持原位，不做微调
