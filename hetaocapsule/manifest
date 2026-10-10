@@ -1,5 +1,5 @@
 appname=hetaocapsule
-version=0.1.13
+version=0.1.14
 display_name=核桃胶囊
 desc=<p>核桃胶囊是一款轻量 NAS 状态监控应用：在电脑桌面以悬浮胶囊实时显示 NAS 的 CPU、内存、网络速率、硬盘读写与存储卷用量。</p><p>应用内置管理页，可查看并复制配对令牌、选择监控网卡、查看运行日志，并直接下载 Windows 电脑客户端。数据仅在局域网内传输，不监听公网、不收集任何用户数据。</p>
 platform=x86
@@ -10,8 +10,10 @@ service_port=8765
 desktop_uidir=ui
 desktop_applaunchname=hetaocapsule.Application
 checkport=false
+# 本应用不使用用户文件/目录授权功能，隐藏设置页里无意义的“授权目录”项
+disable_authorization_path=true
 # 桌面管理页走飞牛统一网关（/app/hetaocapsule），需 1.1.3100+
 # 注意：appname 不能含点（如 com.hetao.capsule），否则 appcenter 不解析 gateway 字段导致桌面图标 404
 os_min_version=1.1.3100
 ctl_stop=true
-changelog=电脑客户端“固定在任务栏”形态优化：三环常驻任务栏、展开面板与三环居中弹出；新增亚克力磨砂背景与窗口圆角；展开/收起动效对齐 Fluent 曲线更顺滑；修复收起后桌面残留灰色面板的问题。管理页顶栏新增应用自身 CPU / 内存占用显示
+changelog=安全与管理页优化：管理接口（配对令牌、网卡设置、运行日志）改为校验飞牛网关注入的管理员身份，非管理员无权访问；管理页配对令牌默认打码，点“显示/复制”才向管理员接口获取完整值；启动日志不再输出明文令牌；隐藏无用的“授权目录”设置项

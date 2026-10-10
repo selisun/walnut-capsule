@@ -22,8 +22,8 @@ type Server struct {
 
 func New(col *metrics.Collector, tok *TokenStore) *Server {
 	return &Server{
-		col:   col,
-		tok:   tok,
+		col: col,
+		tok: tok,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 4096,

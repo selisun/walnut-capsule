@@ -87,9 +87,10 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
 <p class="hint">在电脑客户端的设置中填入本令牌，即可连接查看监控数据。</p>
 <div class="token-row">
   <code id="token">—</code>
+  <button id="showBtn" class="ghost small">显示</button>
   <button id="copyBtn">复制</button>
 </div>
-<p class="hint small">复制后粘贴到电脑客户端“设置 NAS 连接”的配对令牌一栏。</p>
+<p class="hint small">令牌默认打码，点“显示/复制”需当前用户为管理员。复制后粘贴到电脑客户端“设置 NAS 连接”的配对令牌一栏。</p>
 </section>
 
 <section class="card">
@@ -148,16 +149,31 @@ function fmtBytes(n){
   if (n >= 1024) return (n/1024).toFixed(0) + ' KB';
   return n + ' B';
 }
-function setToken(tok){
-  document.getElementById('token').textContent = tok;
+// 令牌默认只显示打码值；完整值由管理员点“显示/复制”时向 /api/token 获取。
+var tokenPlain = '';
+function setTokenMasked(m){
+  tokenPlain = '';
+  document.getElementById('token').textContent = m || '—';
 }
+function setTokenPlain(t){
+  tokenPlain = t || '';
+  document.getElementById('token').textContent = tokenPlain || '—';
+}
+function ensureTokenPlain(){
+  if (tokenPlain) return Promise.resolve(tokenPlain);
+  return fetch(api('/api/token')).then(function(r){ if (!r.ok) throw 0; return r.json(); })
+    .then(function(o){ setTokenPlain(o.token); return tokenPlain; });
+}
+document.getElementById('showBtn').onclick = function(){
+  ensureTokenPlain().then(function(){ toast('已显示'); }, function(){ toast('需要管理员权限'); });
+};
 function loadState(){
   fetch(api('/api/state')).then(function(r){ return r.json(); }).then(function(s){
     document.getElementById('stHost').textContent = s.hostname || '—';
     document.getElementById('stVer').textContent = s.version || '—';
     document.getElementById('stUp').textContent = fmtDur(s.uptime_sec || 0);
     document.getElementById('stPort').textContent = s.service_port || '—';
-    setToken(s.token);
+    setTokenMasked(s.token_masked);
     var sel = document.getElementById('ifaceSel');
     sel.innerHTML = '';
     var optAuto = document.createElement('option');
@@ -196,28 +212,28 @@ function loadUsage(){
   }).catch(function(){ setBadge(false); });
 }
 document.getElementById('copyBtn').onclick = function(){
-  var tok = document.getElementById('token').textContent;
-  if (navigator.clipboard) {
-    navigator.clipboard.writeText(tok).then(function(){ toast('已复制'); }, function(){ toast('复制失败，请手动选择'); });
-  } else {
+  ensureTokenPlain().then(function(tok){
+    if (navigator.clipboard) {
+      return navigator.clipboard.writeText(tok).then(function(){ toast('已复制'); }, function(){ toast('复制失败，请手动选择'); });
+    }
     var r = document.createRange(); r.selectNodeContents(document.getElementById('token'));
     var sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
     try { document.execCommand('copy'); toast('已复制'); } catch(e){ toast('请手动复制'); }
-  }
+  }).catch(function(){ toast('需要管理员权限'); });
 };
 document.getElementById('saveIface').onclick = function(){
   var name = document.getElementById('ifaceSel').value;
   fetch(api('/api/iface'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:name})})
     .then(function(r){ if(!r.ok) throw 0; return r.json(); })
     .then(function(){ toast('已保存'); loadState(); })
-    .catch(function(){ toast('保存失败'); });
+    .catch(function(){ toast('保存失败（需要管理员权限）'); });
 };
 document.getElementById('resetBtn').onclick = function(){
   if (!confirm('确定重置配对令牌？所有客户端需用新令牌重新配对。')) return;
   fetch(api('/api/token/reset'), {method:'POST'})
     .then(function(r){ if(!r.ok) throw 0; return r.json(); })
-    .then(function(s){ setToken(s.token); toast('已重置，请更新客户端'); })
-    .catch(function(){ toast('重置失败'); });
+    .then(function(s){ setTokenPlain(s.token); toast('已重置，请更新客户端'); })
+    .catch(function(){ toast('重置失败（需要管理员权限）'); });
 };
 document.getElementById('logBtn').onclick = function(){
   fetch(api('/api/logs?lines=300')).then(function(r){ return r.text(); }).then(function(t){

@@ -21,7 +21,7 @@ const appName = "hetaocapsule"
 
 // appVersion 仅作 TRIM_APPVER 缺失时的兜底显示，正常由 fpk 注入。
 // 需与 hetaocapsule/manifest 的 version 保持一致。
-const appVersion = "0.1.13"
+const appVersion = "0.1.14"
 
 // clientVersion 电脑端安装器版本，需与 capsule/installer/hetao-capsule.iss 的 AppVer 一致。
 // 版本策略：客户端与 fpk 各自独立计数——客户端每改一次递增；fpk 有改动也递增。
@@ -44,7 +44,7 @@ func main() {
 	}
 	tok := server.NewTokenStore(os.Getenv("CAPSULE_TOKEN"), tokenFile)
 	tok.Ensure()
-	log.Printf("配对令牌（在客户端设置中填入）：%s", tok.Get())
+	log.Printf("配对令牌已就绪：%s（完整值请在本应用管理页点「显示」查看/复制）", server.MaskToken(tok.Get()))
 
 	col := metrics.NewCollector()
 

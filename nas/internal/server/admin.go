@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,7 +14,8 @@ import (
 )
 
 // AdminDeps 管理页依赖。管理页只挂在飞牛统一网关的 unix socket 上，
-// 由网关校验飞牛登录态，因此自身不再做令牌鉴权（局域网 TCP 端口不暴露本页面）。
+// 登录态由网关校验；管理类接口再由 requireAdmin 校验网关转发的管理员身份，
+// 只读接口不回显任何密钥（局域网 TCP 端口不暴露本页面）。
 type AdminDeps struct {
 	Col      *metrics.Collector
 	Tok      *TokenStore
@@ -40,12 +42,40 @@ func NewAdmin(prefix string, d AdminDeps) http.Handler {
 	mux.HandleFunc("/", a.handleIndex)
 	mux.HandleFunc("/api/state", a.handleState)
 	mux.HandleFunc("/api/usage", a.handleUsage)
-	mux.HandleFunc("/api/iface", a.handleIface)
-	mux.HandleFunc("/api/token/reset", a.handleTokenReset)
-	mux.HandleFunc("/api/logs", a.handleLogs)
+	// 管理类接口要求飞牛网关注入的管理员身份（X-Trim-Isadmin）。
+	// 网关只负责登录态与业务权限的区分交给应用（见文档「管理接口需要管理员身份」）。
+	mux.HandleFunc("/api/iface", requireAdmin(a.handleIface))
+	mux.HandleFunc("/api/token", requireAdmin(a.handleTokenPlain))
+	mux.HandleFunc("/api/token/reset", requireAdmin(a.handleTokenReset))
+	mux.HandleFunc("/api/logs", requireAdmin(a.handleLogs))
 	mux.HandleFunc("/api/icon", a.handleIcon)
 	mux.HandleFunc("/api/download", a.handleDownload)
 	return stripPrefix(prefix, mux)
+}
+
+// requireAdmin 校验网关转发的管理员身份；非管理员一律 403。
+// 只读展示类接口（/、/api/state、/api/usage、图标与安装包）不在此列，且都不含密钥。
+func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Trim-Isadmin")), "true") {
+			next(w, r)
+			return
+		}
+		log.Printf("admin required denied: path=%s isadmin=%q uid=%q",
+			r.URL.Path, r.Header.Get("X-Trim-Isadmin"), r.Header.Get("X-Trim-Userid"))
+		http.Error(w, "forbidden: admin required", http.StatusForbidden)
+	}
+}
+
+// MaskToken 只保留令牌前 4 位，其余打码。用于日志与管理页默认展示，避免明文密钥外泄。
+func MaskToken(v string) string {
+	if v == "" {
+		return ""
+	}
+	if len(v) <= 4 {
+		return "••••"
+	}
+	return v[:4] + "••••••••"
 }
 
 func stripPrefix(prefix string, h http.Handler) http.Handler {
@@ -75,7 +105,7 @@ func (a *admin) handleState(w http.ResponseWriter, _ *http.Request) {
 		"hostname":         a.Hostname,
 		"version":          a.Version,
 		"uptime_sec":       int64(time.Since(a.Start).Seconds()),
-		"token":            a.Tok.Get(),
+		"token_masked":     MaskToken(a.Tok.Get()),    // 完整令牌只经管理员接口 /api/token 下发
 		"iface":            a.Col.NetIface(),          // 手动指定（空=自动）
 		"iface_effective":  a.Col.NetIfaceEffective(), // 实际生效
 		"ifaces":           a.Col.NetIfaces(),
@@ -85,6 +115,11 @@ func (a *admin) handleState(w http.ResponseWriter, _ *http.Request) {
 		"client_sha256":    a.ClientSHA256,
 		"client_available": a.ClientSize > 0,
 	})
+}
+
+// handleTokenPlain 返回完整配对令牌，供管理页「显示/复制」（仅管理员可访问）。
+func (a *admin) handleTokenPlain(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"token": a.Tok.Get()})
 }
 
 // handleUsage 返回本应用进程自身的 CPU 与内存占用，供管理页顶栏展示。
