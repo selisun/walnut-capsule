@@ -7,7 +7,7 @@
 //!     移动距离 < 4px 视为点击，触发展开/收起；
 //!   - 展开时 SetActiveWindow 以接收 Esc / WM_KILLFOCUS（点击外部收起）。
 
-use crate::config::Config;
+use crate::config::{CardVis, Config};
 use crate::data::*;
 use crate::font::Font;
 use crate::ui::capsule_view::{self, CapsuleView};
@@ -17,6 +17,7 @@ use std::io::Write;
 use std::os::raw::c_void;
 use std::ptr::null_mut;
 use std::sync::mpsc::channel;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -187,7 +188,13 @@ pub fn run(config: Config) {
     unsafe { let _ = RegisterClassW(&wc_rings); }
 
     let shared = Arc::new(RwLock::new(SharedState::default()));
-    shared.write().unwrap().nas_host = config.nas.host.clone();
+    {
+        // 启动即把卡片开关同步给渲染侧（UI 线程与面板构建线程共用这一份）
+        let mut sh = shared.write().unwrap();
+        sh.nas_host = config.nas.host.clone();
+        sh.dark = config.capsule.theme_dark();
+        sh.cards = config.capsule.cards;
+    }
     let (cmd_tx, cmd_rx) = channel::<SourceCmd>();
 
     let hwnd = create_window(instance, (initial_w(&config), CAPSULE_H));
@@ -197,12 +204,6 @@ pub fn run(config: Config) {
     set_initial_pos(hwnd, &config);
 
     tray_init(hwnd, app_icons().1);
-
-    // 磨砂配置启动生效
-    if config.capsule.frost {
-        shared.write().unwrap().frost = true;
-        unsafe { apply_frost(hwnd, true); }
-    }
 
     let view = Box::new(CapsuleView::new(Arc::new(std::sync::atomic::AtomicIsize::new(
         hwnd.0 as isize,
@@ -233,6 +234,8 @@ pub fn run(config: Config) {
         drag_moved: false,
         config,
         settings_hwnd: HWND(null_mut()),
+        settings_orig: None,
+        settings_font: HFONT(null_mut()),
         last_seq: 0,
         pin_anchor: None,
         pin_hidden: false,
@@ -254,13 +257,15 @@ pub fn run(config: Config) {
     // 首次运行或配置不完整：自动打开设置窗，避免用户看到空白胶囊不知所措。
     // fake 模式用于演示，不弹窗。
     if source_kind != "fake" && unsafe { (*raw).config.nas.needs_setup() } {
-        unsafe { open_settings(&mut *raw); }
+        unsafe { open_settings(&mut *raw, SettingsAnchor::Panel); }
     }
 
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
     }
+    // 启动即按配置位置/方向偏好定好形态：贴左右边缘或显式选了竖向就摆成细长条
+    apply_layout(unsafe { &mut *raw }, true);
     paint_frame(unsafe { &mut *raw }, true);
 
     // 启动时若已开启“固定在任务栏”，立即归位并开始保持置顶
@@ -321,6 +326,10 @@ struct AppState {
     drag_moved: bool,
     config: Config,
     settings_hwnd: HWND,
+    /// 设置窗打开时的 (主题, 透明度) 快照：即时预览靠它"取消/关窗"时还原
+    settings_orig: Option<(String, f32)>,
+    /// 设置窗子控件用的系统 UI 字体（窗口销毁时释放）
+    settings_font: HFONT,
     last_seq: u64,
     /// 固定在任务栏时的锚点：(收起态左上角 x, 顶边 y, 是否向上展开)
     pin_anchor: Option<(i32, i32, bool)>,
@@ -819,7 +828,7 @@ unsafe extern "system" fn rings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
 fn create_window(instance: HMODULE, size: (u32, u32)) -> HWND {
     let ex_style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW;
     let style = WS_POPUP;
-    unsafe {
+    let hwnd = unsafe {
         CreateWindowExW(
             ex_style,
             class_name(),
@@ -833,40 +842,123 @@ fn create_window(instance: HMODULE, size: (u32, u32)) -> HWND {
             None,
         )
         .unwrap_or_default()
-    }
+    };
+    MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    hwnd
 }
 
-/// 启动时的收起态宽度：固定在任务栏用紧凑宽度，否则为药丸胶囊宽度。
+/// 启动时的收起态宽度：固定在任务栏用紧凑宽度，竖排用细长条宽度，否则为药丸胶囊宽度。
 fn initial_w(config: &Config) -> u32 {
     if config.capsule.taskbar_pin {
         CAPSULE_W
+    } else if config.capsule.orientation_hint() == Some(true) {
+        capsule_view::PILL_V_W
     } else {
         CapsuleView::pill_width()
     }
 }
 
-/// 初始位置：配置优先，否则工作区右上角。
-fn set_initial_pos(hwnd: HWND, config: &Config) {
-    let (mut x, mut y) = match (config.capsule.x, config.capsule.y) {
-        (Some(x), Some(y)) => (x, y),
-        _ => {
-            let mut rc = RECT::default();
-            unsafe {
-                let _ = SystemParametersInfoW(
-                    SPI_GETWORKAREA,
-                    0,
-                    Some(&mut rc as *mut RECT as *mut c_void),
-                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-                );
-            }
-            (rc.right - initial_w(config) as i32 - 24, rc.top + 24)
+/// 未固定时的收起态尺寸：竖排＝细长条，横排＝药丸胶囊。
+fn collapsed_main_size(vertical: bool) -> (u32, u32) {
+    if vertical {
+        (capsule_view::PILL_V_W, capsule_view::PILL_V_H)
+    } else {
+        (CapsuleView::pill_width(), CAPSULE_H)
+    }
+}
+
+/// 收起态默认位置：
+/// - 横排：吸附工作区顶边，横向让开标题栏的窗口按钮区（最大化窗口的三键就在右上角）；
+/// - 竖排：吸附工作区右缘，纵向让开标题栏那一行。
+/// SM_CXSIZE 在不同系统上口径不一，按钮区宽度取 150px 兜底。
+fn default_capsule_pos(w: i32, vertical: bool) -> (i32, i32) {
+    /// 与屏幕边缘、与按钮区之间的留白
+    const MARGIN: i32 = 12;
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rc as *mut RECT as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    // 标题栏高度（随系统 DPI 缩放）
+    let caption = unsafe { GetSystemMetrics(SM_CYCAPTION) };
+    if vertical {
+        (rc.right - w, rc.top + caption + MARGIN)
+    } else {
+        let buttons_w = (unsafe {
+            GetSystemMetrics(SM_CXSIZE) * 3 + GetSystemMetrics(SM_CXPADDEDBORDER) * 2
+        })
+        .max(150);
+        ((rc.right - buttons_w - w - MARGIN).max(rc.left), rc.top)
+    }
+}
+
+/// 判定当前应采用的方向与展开侧：
+/// - 显式选了 横向/竖向 就照用（竖排的"面板在哪一侧"取离窗口较近的那边）；
+/// - `auto` 且 `from_pos`（启动/拖动落定）时：贴左右边缘 12px 内 → 竖排，贴哪边决定面板在另一侧；
+/// - 否则横排。
+fn desired_layout(state: &AppState, from_pos: bool) -> (bool, bool) {
+    // 固定到任务栏时主窗口只作展开面板用，方向设置不参与
+    if state.config.capsule.taskbar_pin {
+        return (false, false);
+    }
+    let mut rc = RECT::default();
+    unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
+    let wa = monitor_work_area(unsafe { MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST) });
+    if let Some(v) = state.config.capsule.orientation_hint() {
+        // 竖排：贴右缘时面板在左（窗口右缘固定），贴左缘时面板在右
+        let panel_left = (wa.right - rc.right) <= (rc.left - wa.left);
+        return (v, v && panel_left);
+    }
+    if from_pos {
+        if rc.left <= wa.left + SNAP_PX {
+            return (true, false);
+        }
+        if rc.right >= wa.right - SNAP_PX {
+            return (true, true);
+        }
+    }
+    (false, false)
+}
+
+/// 把方向/展开侧同步给渲染侧；有变化时立刻重排窗口并重绘（收起态尺寸也随方向变化）。
+fn apply_layout(state: &mut AppState, from_pos: bool) {
+    let (vertical, panel_left) = desired_layout(state, from_pos);
+    let changed = {
+        let mut sh = state.shared.write().unwrap();
+        if sh.vertical == vertical && sh.panel_left == panel_left {
+            false
+        } else {
+            sh.vertical = vertical;
+            sh.panel_left = panel_left;
+            sh.bump_seq();
+            true
         }
     };
-    if x < 0 {
-        x = 24;
+    if changed {
+        resize_window(state);
+        paint_frame(state, true);
     }
-    if y < 0 {
-        y = 24;
+}
+
+/// 初始位置：配置优先，否则用默认落点（按方向偏好选横排/竖排）。
+fn set_initial_pos(hwnd: HWND, config: &Config) {
+    let vertical = config.capsule.orientation_hint() == Some(true);
+    let (cw, _) = collapsed_main_size(vertical);
+    let (mut x, mut y) = match (config.capsule.x, config.capsule.y) {
+        (Some(x), Some(y)) => (x, y),
+        _ => default_capsule_pos(cw as i32, vertical),
+    };
+    // 落点必须在某台显示器内。不能只看 x<0/y<0——主屏左侧或上方的副屏坐标本来就是负的，
+    // 那样会把副屏上的落点强行拉到主屏左上角（表现为"胶囊莫名跳到另一块屏"）。
+    let pt = POINT { x, y };
+    if unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) }.is_invalid() {
+        let (dx, dy) = default_capsule_pos(cw as i32, vertical);
+        x = dx;
+        y = dy;
     }
     unsafe {
         let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -900,16 +992,22 @@ fn tray_remove(hwnd: HWND) {
 }
 
 const WM_APP_TRAY: u32 = WM_APP + 2;
+/// 面板展开期间，鼠标在面板外按下（由低级鼠标钩子投递）。
+/// 注意避开已在用的 WM_APP+1（数据）、+2（托盘回调）、+3（面板就绪）。
+const WM_APP_CLICK_OUTSIDE: u32 = WM_APP + 4;
+/// 展开期间安装的全局低级鼠标钩子句柄；0 表示未安装
+static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// 主窗口句柄：钩子回调在消息泵上下文里执行，投递消息时也要能拿到它
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 const ID_TRAY_SETTINGS: u32 = 1001;
 const ID_TRAY_EXIT: u32 = 1002;
-const ID_TRAY_OPACITY_BASE: u32 = 2001;
-const ID_TRAY_FROST: u32 = 2005;
-const ID_TRAY_TASKBAR: u32 = 2006;
+/// 托盘菜单「胶囊 / 三环 切换」（勾选项，反映当前是否挂在任务栏）
+const ID_TRAY_PIN: u32 = 1003;
 /// 展开/收起动效定时器 ID
 const IDT_ANIM: usize = 0x4A11;
 /// 固定在任务栏时，周期性把窗口重新提到任务栏之上的定时器 ID
 const IDT_PIN: usize = 0x4A12;
-/// 托盘可选择的透明度档位
+/// 设置窗可选的透明度档位（同时也是设置窗单选钮的顺序）
 const OPACITY_STEPS: [f32; 4] = [1.0, 0.85, 0.70, 0.55];
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -948,6 +1046,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.config.capsule.taskbar_pin && !state.view.expanded() {
                     unsafe { let _ = ShowWindow(state.hwnd, SW_HIDE); }
                     acrylic_show(state, false);
+                } else if !state.view.expanded() {
+                    // 收起完成：回到配置里记的收起态落点。展开时若为让长面板进屏而临时上移，
+                    // 这个位移不该被带进收起态（竖排 838 高的面板在矮屏上会触发）。
+                    if let (Some(cx), Some(cy)) = (state.config.capsule.x, state.config.capsule.y) {
+                        let mut rc = RECT::default();
+                        unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
+                        if rc.left != cx || rc.top != cy {
+                            unsafe {
+                                let _ = SetWindowPos(
+                                    state.hwnd,
+                                    None,
+                                    cx,
+                                    cy,
+                                    0,
+                                    0,
+                                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             LRESULT(0)
@@ -1006,10 +1124,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if !state.drag_moved {
                     // 展开态点中顶栏设置齿轮 → 打开设置窗口，不收起胶囊
                     if state.view.hit_settings(x, y) {
-                        open_settings(state);
+                        open_settings(state, SettingsAnchor::Panel);
                     } else {
                         toggle_expand(state);
                     }
+                } else if !state.config.capsule.taskbar_pin && !state.view.expanded() {
+                    // 收起态拖动落定：记住位置（下次启动回到这里），
+                    // 并让"自动"档按新位置判定横排/竖排（贴到左右边缘即变竖条）
+                    let mut rc = RECT::default();
+                    let _ = GetWindowRect(state.hwnd, &mut rc);
+                    state.config.capsule.x = Some(rc.left);
+                    state.config.capsule.y = Some(rc.top);
+                    let _ = crate::config::save(&state.config);
+                    apply_layout(state, true);
                 }
             }
             LRESULT(0)
@@ -1026,7 +1153,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if state.view.expanded() && wparam.0 as isize != state.settings_hwnd.0 as isize {
                 // 固定到任务栏时，鼠标移向任务栏/三环也会让面板失焦——此时不能收起，
                 // 否则用户还没点到三环面板就没了（点三环收起也因此失效）。
-                let over_own = cursor_over_window(state.hwnd)
+                let over_own = cursor_over_main(state)
+                    || state.rings.as_ref().is_some_and(|r| cursor_over_window(r.hwnd));
+                if !over_own {
+                    collapse(state);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_CLICK_OUTSIDE => {
+            // 面板展开时，点击自身窗口（面板/三环）以外的任意位置即收起。
+            // 用全局鼠标钩子而不是窗口焦点：面板是置顶浮窗，经常拿不到前台焦点，
+            // 只靠 WM_KILLFOCUS 会出现"点了桌面面板不收"的情况。
+            // 设置窗口开着时不收起，避免调设置时面板闪没。
+            if state.config.capsule.click_outside_collapse
+                && state.view.expanded()
+                && state.settings_hwnd.0.is_null()
+            {
+                let over_own = cursor_over_main(state)
                     || state.rings.as_ref().is_some_and(|r| cursor_over_window(r.hwnd));
                 if !over_own {
                     collapse(state);
@@ -1047,20 +1191,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 tray_remove(state.hwnd);
                 PostQuitMessage(0);
             } else if id == ID_TRAY_SETTINGS {
-                open_settings(state);
-            } else if (ID_TRAY_OPACITY_BASE..ID_TRAY_OPACITY_BASE + OPACITY_STEPS.len() as u32).contains(&id) {
-                state.config.capsule.opacity = OPACITY_STEPS[(id - ID_TRAY_OPACITY_BASE) as usize];
-                let _ = crate::config::save(&state.config);
-                paint_frame(state, true);
-            } else if id == ID_TRAY_FROST {
-                state.config.capsule.frost = !state.config.capsule.frost;
-                let _ = crate::config::save(&state.config);
-                state.shared.write().unwrap().frost = state.config.capsule.frost;
-                unsafe { apply_frost(state.hwnd, state.config.capsule.frost); }
-                paint_frame(state, true);
-            } else if id == ID_TRAY_TASKBAR {
+                // 从托盘菜单打开：在光标（托盘图标）处弹出
+                open_settings(state, SettingsAnchor::Cursor);
+            } else if id == ID_TRAY_PIN {
+                // 胶囊 ↔ 三环 切换：与设置窗里那个开关走同一套动作
                 state.config.capsule.taskbar_pin = !state.config.capsule.taskbar_pin;
                 let _ = crate::config::save(&state.config);
+                // 取消固定时 apply_taskbar_pin 自己会再存一次（它还会落默认位置），
+                // 固定方向上不会存，所以这里统一先存。
                 apply_taskbar_pin(state);
             }
             LRESULT(0)
@@ -1075,6 +1213,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// 光标是否落在主窗口的**可见内容**上。
+/// 竖排展开时窗口右侧（或左侧）有一条只放竖条的透明空带，点在空带上应视为"面板外"，
+/// 否则点面板旁边的空白收不起面板。
+fn cursor_over_main(state: &AppState) -> bool {
+    let mut pt = POINT::default();
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        if GetWindowRect(state.hwnd, &mut rc).is_err() {
+            return false;
+        }
+    }
+    if pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom {
+        return false;
+    }
+    let sh = state.shared.read().unwrap();
+    if !(sh.vertical && state.view.expanded()) {
+        return true;
+    }
+    let (x, y) = (pt.x - rc.left, pt.y - rc.top);
+    let panel_x0 = if sh.panel_left { 0 } else { capsule_view::PILL_V_W as i32 };
+    let bar_x0 = if sh.panel_left { capsule_view::PANEL_W as i32 } else { 0 };
+    let on_panel =
+        x >= panel_x0 && x < panel_x0 + capsule_view::PANEL_W as i32;
+    let on_bar = x >= bar_x0
+        && x < bar_x0 + capsule_view::PILL_V_W as i32
+        && y < capsule_view::PILL_V_H as i32;
+    on_panel || on_bar
 }
 
 /// 光标当前是否落在指定窗口矩形内。
@@ -1093,10 +1261,49 @@ fn cursor_over_window(h: HWND) -> bool {
     pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
 }
 
+/// 安装全局低级鼠标钩子（仅在面板展开期间存在，收起立即卸载，常驻零开销）。
+fn mouse_hook_install() {
+    if MOUSE_HOOK.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), instance, 0) {
+            MOUSE_HOOK.store(h.0 as isize, Ordering::Relaxed);
+        }
+    }
+}
+
+fn mouse_hook_remove() {
+    let v = MOUSE_HOOK.swap(0, Ordering::Relaxed);
+    if v != 0 {
+        unsafe {
+            let _ = UnhookWindowsHookEx(HHOOK(v as *mut c_void));
+        }
+    }
+}
+
+/// 低级鼠标钩子回调：钩子在安装它的线程（本进程消息泵）里被调用，
+/// 因此这里只做最轻的事——把「按钮按下」投给主窗口，是否在面板外、要不要收起
+/// 都交给 wndproc 判定，避免在钩子里做窗口操作拖慢全局鼠标输入。
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let m = wparam.0 as u32;
+        if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN {
+            let h = MAIN_HWND.load(Ordering::Relaxed);
+            if h != 0 {
+                let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_CLICK_OUTSIDE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 fn collapse(state: &mut AppState) {
     if !state.view.expanded() {
         return;
     }
+    mouse_hook_remove(); // 面板收起，撤掉"点外部收起"用的全局鼠标钩子
     dbg_log("collapse");
     state.view.set_expanded(false);
     let _ = state.cmd_tx.send(SourceCmd::SetDetail(Detail::Collapsed));
@@ -1154,6 +1361,11 @@ fn paint_frame(state: &mut AppState, force: bool) {
         return;
     }
 
+    // 暗色主题：整套界面按亮色构建，上屏前一次性把中性色翻转（彩色状态色原样保留）
+    if frame_data.dark {
+        capsule_view::apply_dark(&mut state.pix);
+    }
+
     let opacity = state.config.capsule.opacity.clamp(0.05, 1.0);
     let fade = state.view.row_fade();
     blit_and_present(
@@ -1208,7 +1420,12 @@ fn blit_and_present(
                 lut_key = f;
                 let k = opacity * f as f32 / 255.0;
                 for (v, e) in lut.iter_mut().enumerate() {
-                    *e = (v as f32 * k) as u8;
+                    // 源 alpha 非 0 的像素，缩放后**至少保留 1**：分层窗口的命中测试按 alpha
+                    // 判定，乘完透明度取整到 0 会让这块区域变成"鼠标穿透"。三环窗口整块铺的
+                    // alpha=1 近透明底就是这么被 70%/55% 透明度抹掉的——表现为"必须点在三环的
+                    // 数值上才能弹出面板"；保留到 1 则与 100% 不透明度时的可点区域完全一致，
+                    // 视觉上 0→1 无差别。源 alpha=0 的区域仍然保持穿透。
+                    *e = if v == 0 { 0 } else { (v as f32 * k).max(1.0) as u8 };
                 }
             }
             for px4 in row.as_chunks_mut::<4>().0 {
@@ -1328,6 +1545,15 @@ fn toggle_expand(state: &mut AppState) {
 /// 按下它会先让面板失焦（WM_KILLFOCUS → collapse），若抬起时再按当前状态取反会把面板又展开。
 fn set_panel_open(state: &mut AppState, open: bool) {
     dbg_log(&format!("set_panel_open open={open}"));
+    // 展开期间挂全局鼠标钩子（点面板外任意位置收起），收起时立即撤掉；
+    // 设置里关掉"点击面板外自动收起"就不挂，面板只在按 Esc / 点胶囊时收起
+    if open {
+        if state.config.capsule.click_outside_collapse {
+            mouse_hook_install();
+        }
+    } else {
+        mouse_hook_remove();
+    }
     let changed = state.view.expanded() != open;
     if changed {
         state.view.set_expanded(open);
@@ -1342,10 +1568,11 @@ fn set_panel_open(state: &mut AppState, open: bool) {
         // 展开前先把窗口摆到位（几何变化在隐藏态完成，避免显示瞬间闪现旧位置）
         resize_window(state);
         unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
-        // 磨砂背景层与面板同显（固定态）
-        if pinned {
-            acrylic_show(state, true);
-        }
+        // 注意：亚克力磨砂背景层**不再显示**。它此前只挂在固定态，导致同一透明度下
+        // 三环模式的面板比横/竖排"厚"一层（面板底下多垫了一块系统磨砂）；用户已要求去掉
+        // 磨砂效果，这里统一为不加背景，两种模式的透明度表现就一致了。
+        // 若要恢复"两种模式都带磨砂"，改成在这里无条件 acrylic_show(state, true)
+        // 并让 resize_window 里也无条件 acrylic_place。
     }
     if pinned {
         if open {
@@ -1409,7 +1636,27 @@ fn resize_window(state: &mut AppState) {
                 };
                 (x, y)
             }
-            _ => (rc.right - w as i32, rc.top),
+            _ => {
+                // 未固定：横排与"竖条贴右缘"都保持右缘不动（面板向左推/向下长）；
+                // 只有"竖条贴左缘"时保持左缘不动（面板向右推）。
+                let (mut x, mut y) = if frame.vertical && !frame.panel_left {
+                    (rc.left, rc.top)
+                } else {
+                    (rc.right - w as i32, rc.top)
+                };
+                // 竖排面板很长（含全部卡片可达 800+）：底边超出工作区时整体上移，
+                // 保证竖条与面板都在屏内（方案 A：面板顶边对齐竖条顶边，超了就整体上夹）。
+                // 横向同理：面板 + 竖条共 376 宽，贴边展开时可能越过本显示器边界，
+                // 不夹回来就会"露到隔壁副屏上"。
+                let wa = monitor_work_area(MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST));
+                if wa.right > wa.left {
+                    x = x.clamp(wa.left, (wa.right - w as i32).max(wa.left));
+                }
+                if wa.bottom > wa.top {
+                    y = y.min(wa.bottom - h as i32).max(wa.top);
+                }
+                (x, y)
+            }
         };
         // 几何未变时跳过 SetWindowPos：固定态展开动画只动内容，窗口尺寸一次到位，
         // 而 SWP_FRAMECHANGED 每帧都触发 WM_NCCALCSIZE，是展开动画抖动的根源。
@@ -1880,6 +2127,34 @@ fn apply_taskbar_pin(state: &mut AppState) {
         state.view.set_expanded(false);
         state.view.jump_anim();
         sync_taskbar_state(state); // 恢复普通布局与配色，并显示主窗口
+        resize_window(state);      // 先收回到收起态尺寸
+        // 再回到该方向的默认落点：固定期间主窗口是隐藏的，矩形还停在面板/三环的残留几何上，
+        // 直接沿用会压在屏幕右上角——正好是最大化窗口的最小化/关闭按钮那一块。
+        let vertical = state.config.capsule.orientation_hint() == Some(true);
+        let (cw, _) = collapsed_main_size(vertical);
+        let (dx, dy) = default_capsule_pos(cw as i32, vertical);
+        {
+            let mut sh = state.shared.write().unwrap();
+            if sh.vertical != vertical || sh.panel_left {
+                sh.vertical = vertical;
+                sh.panel_left = false;
+                sh.bump_seq();
+            }
+        }
+        state.config.capsule.x = Some(dx);
+        state.config.capsule.y = Some(dy);
+        let _ = crate::config::save(&state.config);
+        unsafe {
+            let _ = SetWindowPos(
+                state.hwnd,
+                None,
+                dx,
+                dy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
         resize_window(state);
         paint_frame(state, true);
         return;
@@ -1899,27 +2174,14 @@ fn apply_taskbar_pin(state: &mut AppState) {
 
 fn show_tray_menu(state: &mut AppState) {
     let menu = unsafe { CreatePopupMenu().unwrap() };
-    let sub = unsafe { CreatePopupMenu().unwrap() };
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS as usize, pcwstr("设置 NAS 地址"));
+        // 「胶囊 / 三环 切换」：勾选态表示当前是"挂在任务栏的三环"形态。
+        // 原先这个开关放设置窗里叫"固定到任务栏"，放托盘右键更顺手（不用开设置窗）。
+        let pin_flags = MF_STRING
+            | if state.config.capsule.taskbar_pin { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(menu, pin_flags, ID_TRAY_PIN as usize, pcwstr("胶囊/三环切换"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        // 透明度子菜单
-        let labels = ["100%", "85%", "70%", "55%"];
-        for (i, label) in labels.iter().enumerate() {
-            let mut flags = MF_STRING;
-            if (state.config.capsule.opacity - OPACITY_STEPS[i]).abs() < 0.01 {
-                flags |= MF_CHECKED;
-            }
-            let _ = AppendMenuW(sub, flags, (ID_TRAY_OPACITY_BASE + i as u32) as usize, pcwstr(label));
-        }
-        let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, sub.0 as usize, pcwstr("透明度"));
-
-        let frost_flags = if state.config.capsule.frost { MF_STRING | MF_CHECKED } else { MF_STRING };
-        let _ = AppendMenuW(menu, frost_flags, ID_TRAY_FROST as usize, pcwstr("磨砂效果"));
-
-        let pin_flags = if state.config.capsule.taskbar_pin { MF_STRING | MF_CHECKED } else { MF_STRING };
-        let _ = AppendMenuW(menu, pin_flags, ID_TRAY_TASKBAR as usize, pcwstr("固定在任务栏"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS as usize, pcwstr("设置…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT as usize, pcwstr("退出"));
     }
@@ -1970,51 +2232,6 @@ fn snap_to_work_area(hwnd: HWND, w: i32, h: i32, nx: &mut i32, ny: &mut i32) {
     }
 }
 
-// ---- 磨砂：SetWindowCompositionAttribute（未公开 API，Win10 1803+ 可用）----
-
-#[repr(C)]
-struct AccentPolicy {
-    accent_state: u32,
-    accent_flags: u32,
-    /// AABBGGRR
-    gradient_color: u32,
-    animation_id: u32,
-}
-
-#[repr(C)]
-struct WindowCompositionAttribData {
-    attrib: u32, // WCA_ACCENT_POLICY
-    data: *mut c_void,
-    size_of_data: usize,
-}
-
-const WCA_ACCENT_POLICY: u32 = 19;
-const ACCENT_DISABLED: u32 = 0;
-const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
-
-/// 开/关磨砂。失败时静默返回（老系统没有该 API）。
-unsafe fn apply_frost(hwnd: HWND, on: bool) {
-    let user32 = GetModuleHandleW(pcwstr("user32.dll")).unwrap_or_default();
-    let Some(far) = GetProcAddress(user32, pcstr("SetWindowCompositionAttribute")) else {
-        return;
-    };
-    type SetWca = unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> BOOL;
-    let set_wca: SetWca = std::mem::transmute(far);
-    let mut policy = AccentPolicy {
-        accent_state: if on { ACCENT_ENABLE_ACRYLICBLURBEHIND } else { ACCENT_DISABLED },
-        accent_flags: 0,
-        // 深色薄纱，与胶囊底色一致
-        gradient_color: 0x5A1E1412,
-        animation_id: 0,
-    };
-    let mut data = WindowCompositionAttribData {
-        attrib: WCA_ACCENT_POLICY,
-        data: &mut policy as *mut AccentPolicy as *mut c_void,
-        size_of_data: std::mem::size_of::<AccentPolicy>(),
-    };
-    let _ = set_wca(hwnd, &mut data);
-}
-
 // ---- 设置窗口：NAS 地址输入 ----
 
 const SETTINGS_CLASS: &str = "HeTaoCapsuleSettings";
@@ -2022,9 +2239,65 @@ const IDC_ADDR_EDIT: usize = 101;
 const IDC_TOKEN_EDIT: usize = 102;
 const IDC_TEST_BUTTON: usize = 103;
 const IDC_TEST_RESULT: usize = 104;
+/// 胶囊 / 三环 切换（与托盘右键菜单里那项是同一个开关）
 const IDC_TASKBAR_CHK: usize = 105;
+/// 点击面板外自动收起（默认开启）
+const IDC_CLICK_OUTSIDE_CHK: usize = 106;
+/// 主题 2 档单选（顺序同 config::THEMES：亮色 / 暗色）
+const IDC_THEME_BASE: usize = 150;
+const THEME_LABELS: [&str; 2] = ["亮色", "暗色"];
+/// 三个分组小标题（只有它们用系统灰色绘制）
+const IDC_SEC_CONN: usize = 107;
+const IDC_SEC_CARDS: usize = 108;
+const IDC_SEC_OTHER: usize = 109;
+/// 卡片选择提示行（全部取消时提示"请至少保留一张卡片"）
+const IDC_CARDS_HINT: usize = 110;
+/// 六个卡片复选（顺序同 CardVis::all：CPU/内存/显卡/网络/硬盘读写/存储状态）
+const IDC_CARD_BASE: usize = 120;
+const CARD_COUNT: usize = 6;
+const CARD_LABELS: [&str; CARD_COUNT] = ["CPU", "内存", "显卡", "网络", "硬盘读写", "存储状态"];
+/// 透明度 4 档单选（顺序同 OPACITY_STEPS）
+const IDC_OPACITY_BASE: usize = 130;
+/// 显示方向 3 档单选（顺序同 config::ORIENTATIONS：自动 / 横向 / 竖向）
+const IDC_ORIENT_BASE: usize = 140;
+const ORIENT_LABELS: [&str; 3] = ["自动", "横向", "竖向"];
+/// 设置窗口客户区尺寸（三段式：连接 / 显示卡片 / 其他）
+const SETTINGS_CLIENT_W: i32 = 420;
+const SETTINGS_CLIENT_H: i32 = 520;
+/// 按钮通知码 BN_CLICKED = 0（不依赖 crate 常量类型）
+const BN_CLICKED_CODE: u32 = 0;
+/// 静态控件样式 SS_ETCHEDHORZ = 0x10：一条 1px 蚀刻横线（分组分隔）
+const SS_ETCHEDHORZ_STYLE: u32 = 0x0010;
 
-fn open_settings(state: &mut AppState) {
+/// 设置窗定位锚点：决定窗口从哪里长出来（两种入口都尽量让用户少移动鼠标）。
+#[derive(Clone, Copy)]
+enum SettingsAnchor {
+    /// 贴展开面板左侧、纵向对齐齿轮（面板里点齿轮打开）
+    Panel,
+    /// 在光标处弹出（从托盘菜单打开，鼠标就在托盘上）
+    Cursor,
+}
+
+/// 指定显示器的工作区（已排除任务栏）；拿不到时回退主屏工作区。
+fn monitor_work_area(mon: HMONITOR) -> RECT {
+    unsafe {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return mi.rcWork;
+        }
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        wa
+    }
+}
+
+fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
     if !state.settings_hwnd.0.is_null() {
         unsafe {
             let _ = SetForegroundWindow(state.settings_hwnd);
@@ -2051,37 +2324,74 @@ fn open_settings(state: &mut AppState) {
         unsafe { let _ = RegisterClassW(&wc); }
     });
 
-    // 以胶囊/面板位置为参照：优先贴其左侧、底边对齐；放不下改右侧；最后夹进工作区，保证整窗可见
-    // （固定到任务栏时面板底边已是任务栏顶，不能再用「面板下方」定位）
-    let mut rc = RECT::default();
-    unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
-    let mut wa = RECT::default();
-    unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut wa as *mut RECT as *mut c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
-    }
-    let (w, h) = (360, 288);
-    let gap = 12;
-    let max_x = (wa.right - w).max(wa.left);
-    let max_y = (wa.bottom - h).max(wa.top);
-    let mut x = rc.left - w - gap;
-    if x < wa.left {
-        x = rc.right + gap;
-    }
-    let x = x.clamp(wa.left, max_x);
-    let y = (rc.bottom - h).clamp(wa.top, max_y);
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+
+    // 子控件字体：系统 UI 字体（Win11 上 Segoe UI，中文回退微软雅黑），
+    // 比 DEFAULT_GUI_FONT 的老式点阵更贴近系统原生观感。
+    state.settings_font = create_ui_font();
+
+    // 按客户区尺寸反推窗口外框（客户区尺寸固定，标题栏/边框由系统加上）
+    let mut frame = RECT { left: 0, top: 0, right: SETTINGS_CLIENT_W, bottom: SETTINGS_CLIENT_H };
+    unsafe { let _ = AdjustWindowRect(&mut frame, style, BOOL(0)); }
+    let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
+
+    // 定位：托盘来的在光标处弹出（底边贴光标，像弹出菜单那样往上长）；
+    // 面板齿轮来的贴面板左侧、纵向对齐齿轮——两种入口都尽量让用户少移动鼠标。
+    let mut pt = POINT::default();
+    unsafe { let _ = GetCursorPos(&mut pt); }
+    let (x, y) = match anchor {
+        SettingsAnchor::Cursor => {
+            let wa = monitor_work_area(unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) });
+            let max_x = (wa.right - w).max(wa.left);
+            let max_y = (wa.bottom - h).max(wa.top);
+            (pt.x.clamp(wa.left, max_x), (pt.y - h).clamp(wa.top, max_y))
+        }
+        SettingsAnchor::Panel => {
+            let wa = monitor_work_area(unsafe { MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST) });
+            let mut rc = RECT::default();
+            unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
+            let gap = 12;
+            let max_x = (wa.right - w).max(wa.left);
+            let max_y = (wa.bottom - h).max(wa.top);
+            let mut x = rc.left - w - gap;
+            if x < wa.left {
+                x = rc.right + gap;
+            }
+            let x = x.clamp(wa.left, max_x);
+            // 竖排展开：面板本身就从窗口顶部开始长，此时按"纵向居中于齿轮"会把设置窗
+            // 夹到屏幕最上沿、比面板还高一截；改成顶边对齐面板顶边，两块从同一条水平线开始。
+            let vertical_panel = {
+                let sh = state.shared.read().unwrap();
+                sh.vertical && state.view.expanded()
+            };
+            let y = if vertical_panel {
+                rc.top
+            } else {
+                // 齿轮一行的纵向中心（与标题行绘制位置对应）
+                let expand_up = state.shared.read().unwrap().expand_up;
+                let pinned = state.config.capsule.taskbar_pin;
+                let gear_cy = if !pinned {
+                    rc.top + CAPSULE_H as i32 / 2
+                } else if expand_up {
+                    rc.bottom - capsule_view::HEADER_ROW_CY
+                } else {
+                    rc.top + capsule_view::HEADER_ROW_CY
+                };
+                gear_cy - h / 2
+            };
+            (x, y.clamp(wa.top, max_y))
+        }
+    };
 
     let class_wide: Vec<u16> = SETTINGS_CLASS.encode_utf16().chain(Some(0)).collect();
+    // 即时预览的"还原点"：点取消 / 直接关窗时，用它把主题与透明度退回打开前的样子
+    state.settings_orig = Some((state.config.capsule.theme.clone(), state.config.capsule.opacity));
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             PCWSTR(class_wide.as_ptr()),
-            pcwstr("设置 NAS 连接"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            pcwstr("核桃胶囊 · 设置"),
+            style,
             x, y, w, h,
             state.hwnd,
             None,
@@ -2090,20 +2400,112 @@ fn open_settings(state: &mut AppState) {
         )
         .unwrap_or_default()
     };
+    if hwnd.is_invalid() {
+        // 创建失败：立刻释放刚建好的字体，避免句柄泄漏
+        if !state.settings_font.is_invalid() {
+            unsafe { let _ = DeleteObject(HGDIOBJ(state.settings_font.0)); }
+            state.settings_font = HFONT(null_mut());
+        }
+    }
     state.settings_hwnd = hwnd;
 }
 
-fn child_font(hwnd: HWND) {
-    let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+/// 系统 UI 字体：SPI_GETNONCLIENTMETRICS 的 lfMessageFont。失败返回空句柄
+/// （子控件退回系统默认字体，不影响可用性）。
+fn create_ui_font() -> HFONT {
     unsafe {
-        let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        let mut ncm: NONCLIENTMETRICSW = std::mem::zeroed();
+        ncm.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+        let ok = SystemParametersInfoW(
+            SPI_GETNONCLIENTMETRICS,
+            ncm.cbSize,
+            Some(&mut ncm as *mut NONCLIENTMETRICSW as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok();
+        if ok {
+            return CreateFontIndirectW(&ncm.lfMessageFont);
+        }
+        HFONT(null_mut())
     }
+}
+
+/// 给子控件套用设置窗字体（没有自建字体时退回系统 GUI 字体）。
+fn child_font(hwnd: HWND, font: HFONT) {
+    let f = if font.is_invalid() {
+        unsafe { GetStockObject(DEFAULT_GUI_FONT) }
+    } else {
+        HGDIOBJ(font.0)
+    };
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(f.0 as usize), LPARAM(1));
+    }
+}
+
+/// 读取复选/单选钮的勾选态。
+fn is_checked(hwnd: HWND, id: usize) -> bool {
+    unsafe {
+        let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
+        SendMessageW(ctl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0
+    }
+}
+
+/// 读取设置窗里六个卡片开关。
+fn read_cards(hwnd: HWND) -> CardVis {
+    let v: [bool; CARD_COUNT] = std::array::from_fn(|i| is_checked(hwnd, IDC_CARD_BASE + i));
+    let mut cv = CardVis::default();
+    cv.set_all(v);
+    cv
+}
+
+/// 读取透明度单选（返回最接近的档位值）。
+fn read_opacity(hwnd: HWND) -> f32 {
+    (0..OPACITY_STEPS.len())
+        .find(|&i| is_checked(hwnd, IDC_OPACITY_BASE + i))
+        .map_or(OPACITY_STEPS[0], |i| OPACITY_STEPS[i])
+}
+
+/// 设置窗即时预览：把窗里当前选中的主题/透明度写进**内存**配置并立刻重绘，不写盘。
+/// 主题是"按主题构建面板"的，所以还要 bump_seq 让后台线程按新主题重建一份。
+fn apply_settings_preview(state: &mut AppState, hwnd: HWND) {
+    let theme_idx = (0..THEME_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_THEME_BASE + i))
+        .unwrap_or(0);
+    state.config.capsule.theme = crate::config::THEMES[theme_idx].to_string();
+    state.config.capsule.opacity = read_opacity(hwnd);
+    let dark = state.config.capsule.theme_dark();
+    {
+        let mut sh = state.shared.write().unwrap();
+        sh.dark = dark;
+        sh.bump_seq();
+    }
+    paint_frame(state, true);
+    rings_paint(state, true); // 任务栏三环是独立窗口，单独刷一次
+}
+
+/// 还原即时预览（点"取消"或直接关窗时）：退回打开设置窗时的主题与透明度并重绘。
+/// 快照已被"确定"取走（None）时什么都不做。
+fn restore_settings_preview(state: &mut AppState) {
+    let Some((theme, opacity)) = state.settings_orig.take() else { return };
+    state.config.capsule.theme = theme;
+    state.config.capsule.opacity = opacity;
+    let dark = state.config.capsule.theme_dark();
+    {
+        let mut sh = state.shared.write().unwrap();
+        sh.dark = dark;
+        sh.bump_seq();
+    }
+    paint_frame(state, true);
+    rings_paint(state, true);
 }
 
 fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_CREATE => {
+                const PAD: i32 = 16;
+                const CW: i32 = SETTINGS_CLIENT_W - PAD * 2; // 内容宽（388）
+                let font = state.settings_font;
                 let mk_child = |class: &str, text: &str, style: WINDOW_STYLE, x: i32, y: i32, w: i32, h: i32, id: usize| {
                     let h = CreateWindowExW(
                         WINDOW_EX_STYLE(0),
@@ -2117,82 +2519,278 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                         None,
                     )
                     .unwrap_or_default();
-                    child_font(h);
+                    child_font(h, font);
                     h
                 };
-                mk_child("STATIC", "NAS 地址（host:port）：", WINDOW_STYLE(0), 12, 10, 330, 20, 100);
-                let edit = mk_child(
+                let set_check = |id: usize, on: bool| {
+                    let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
+                    let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(on as usize), LPARAM(0));
+                };
+
+                // 三组纵向布局：连接 / 显示卡片 / 其他，底部按钮贴右下角。
+                // 控件坐标都按各组的基准 y 偏移书写，调组间距只改这四个数。
+                let c0 = 16; // 连接组
+                let k0 = 192; // 显示卡片组
+                let o0 = 344; // 其他组
+                let btn_y = 474; // 底部按钮
+
+                // ---- 分组一：连接 ----
+                mk_child("STATIC", "连接", WINDOW_STYLE(0), PAD, c0, 200, 18, IDC_SEC_CONN);
+                mk_child("STATIC", "地址（host:port）", WINDOW_STYLE(0), PAD, c0 + 22, CW, 16, 0);
+                mk_child(
                     "EDIT",
                     &state.config.nas.addr(),
                     WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32),
-                    12, 34, 324, 24,
+                    PAD, c0 + 40, CW, 26,
                     IDC_ADDR_EDIT,
                 );
-                let _ = edit;
-                mk_child("STATIC", "配对令牌（见 NAS 管理页）：", WINDOW_STYLE(0), 12, 64, 330, 20, 103);
-                let token_edit = mk_child(
+                mk_child("STATIC", "配对令牌（见 NAS 管理页）", WINDOW_STYLE(0), PAD, c0 + 74, CW, 16, 0);
+                mk_child(
                     "EDIT",
                     &state.config.nas.token,
                     WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32),
-                    12, 88, 324, 24,
+                    PAD, c0 + 92, CW, 26,
                     IDC_TOKEN_EDIT,
                 );
-                let _ = token_edit;
-                mk_child("BUTTON", "测试连接", WINDOW_STYLE(0), 12, 120, 90, 26, IDC_TEST_BUTTON);
-                mk_child("STATIC", "", WINDOW_STYLE(0), 110, 150, 226, 20, IDC_TEST_RESULT);
-                let chk = mk_child(
+                mk_child("BUTTON", "测试连接", WINDOW_STYLE(0), PAD, c0 + 126, 88, 28, IDC_TEST_BUTTON);
+                mk_child("STATIC", "", WINDOW_STYLE(0), PAD + 98, c0 + 132, CW - 98, 18, IDC_TEST_RESULT);
+                mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
+                    PAD, c0 + 164, CW, 2, 0,
+                );
+
+                // ---- 分组二：显示卡片（两列三行）----
+                mk_child("STATIC", "显示卡片", WINDOW_STYLE(0), PAD, k0, 200, 18, IDC_SEC_CARDS);
+                mk_child(
+                    "STATIC",
+                    "仅影响展开面板；收起态与任务栏三环不受影响",
+                    WINDOW_STYLE(0),
+                    PAD, k0 + 18, CW, 16, 0,
+                );
+                for (i, label) in CARD_LABELS.iter().enumerate() {
+                    let col = (i % 2) as i32;
+                    let row = (i / 2) as i32;
+                    let chk = mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                        PAD + col * 198, k0 + 40 + row * 24, 190, 22,
+                        IDC_CARD_BASE + i,
+                    );
+                    let _ = chk;
+                    set_check(IDC_CARD_BASE + i, state.config.capsule.cards.all()[i]);
+                }
+                mk_child("STATIC", "", WINDOW_STYLE(0), PAD, k0 + 114, CW, 16, IDC_CARDS_HINT);
+                mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
+                    PAD, k0 + 140, CW, 2, 0,
+                );
+
+                // ---- 分组三：其他 ----
+                mk_child("STATIC", "其他", WINDOW_STYLE(0), PAD, o0, 200, 18, IDC_SEC_OTHER);
+                mk_child("STATIC", "主题", WINDOW_STYLE(0), PAD, o0 + 18, 64, 22, 0);
+                for (i, label) in THEME_LABELS.iter().enumerate() {
+                    // 每组第一颗加 WS_GROUP：自动单选钮按 WS_GROUP 划组，
+                    // 否则全窗口的自动单选钮会被当成同一组互相取消（主题与显示方向不能同时选）。
+                    mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 }),
+                        88 + i as i32 * 60, o0 + 18, 56, 22,
+                        IDC_THEME_BASE + i,
+                    );
+                }
+                let theme_idx = crate::config::THEMES
+                    .iter()
+                    .position(|v| *v == state.config.capsule.theme)
+                    .unwrap_or(0);
+                set_check(IDC_THEME_BASE + theme_idx, true);
+                mk_child("STATIC", "透明度", WINDOW_STYLE(0), PAD, o0 + 42, 64, 22, 0);
+                let opacity_now = state.config.capsule.opacity;
+                let opacity_idx = OPACITY_STEPS
+                    .iter()
+                    .position(|v| (v - opacity_now).abs() < 0.01)
+                    .unwrap_or(0);
+                for (i, label) in ["100%", "85%", "70%", "55%"].iter().enumerate() {
+                    mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 }),
+                        88 + i as i32 * 68, o0 + 42, 64, 22,
+                        IDC_OPACITY_BASE + i,
+                    );
+                }
+                set_check(IDC_OPACITY_BASE + opacity_idx, true);
+                mk_child("STATIC", "显示方向", WINDOW_STYLE(0), PAD, o0 + 68, 64, 22, 0);
+                for (i, label) in ORIENT_LABELS.iter().enumerate() {
+                    mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 }),
+                        88 + i as i32 * 60, o0 + 68, 56, 22,
+                        IDC_ORIENT_BASE + i,
+                    );
+                }
+                let orient_idx = crate::config::ORIENTATIONS
+                    .iter()
+                    .position(|v| *v == state.config.capsule.orientation)
+                    .unwrap_or(0);
+                set_check(IDC_ORIENT_BASE + orient_idx, true);
+                // 两个勾选并排一行：左「面板自动收起」、右「胶囊/三环切换」
+                mk_child(
                     "BUTTON",
-                    "固定在任务栏（显示在任务栏最左端）",
+                    "面板自动收起",
                     WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    12, 180, 324, 22,
+                    PAD, o0 + 94, 140, 22,
+                    IDC_CLICK_OUTSIDE_CHK,
+                );
+                set_check(IDC_CLICK_OUTSIDE_CHK, state.config.capsule.click_outside_collapse);
+                // 与托盘右键菜单里的「胶囊/三环切换」是同一个开关，两处都能改
+                mk_child(
+                    "BUTTON",
+                    "胶囊/三环切换",
+                    WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                    PAD + 150, o0 + 94, 220, 22,
                     IDC_TASKBAR_CHK,
                 );
-                if state.config.capsule.taskbar_pin {
-                    // 1 = BST_CHECKED（勾选态）
-                    let _ = SendMessageW(chk, BM_SETCHECK, WPARAM(1), LPARAM(0));
-                }
-                mk_child("BUTTON", "确定", WINDOW_STYLE(BS_DEFPUSHBUTTON as u32), 170, 216, 80, 26, 1); // IDOK
-                mk_child("BUTTON", "取消", WINDOW_STYLE(0), 258, 216, 80, 26, 2); // IDCANCEL
+                set_check(IDC_TASKBAR_CHK, state.config.capsule.taskbar_pin);
+
+                // ---- 底部按钮（贴客户区底边：竖排展开时设置窗与面板同高，按钮仍要够得着）----
+                mk_child("BUTTON", "取消", WINDOW_STYLE(0), 236, btn_y, 80, 30, 2); // IDCANCEL
+                mk_child("BUTTON", "确定", WINDOW_STYLE(BS_DEFPUSHBUTTON as u32), 324, btn_y, 80, 30, 1); // IDOK
                 LRESULT(0)
             }
+            // 分组小标题与卡片提示用系统灰色（其余控件保持默认黑色）
+            WM_CTLCOLORSTATIC => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let ctl = HWND(lparam.0 as *mut c_void);
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                let is_hint = [IDC_SEC_CONN, IDC_SEC_CARDS, IDC_SEC_OTHER, IDC_CARDS_HINT]
+                    .iter()
+                    .any(|id| GetDlgItem(hwnd, *id as i32).ok() == Some(ctl));
+                if is_hint {
+                    let _ = SetTextColor(hdc, COLORREF(GetSysColor(COLOR_GRAYTEXT)));
+                }
+                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+            }
             WM_COMMAND => {
-                let id = wparam.0 as u32 & 0xFFFF;
+                let id = (wparam.0 as u32) & 0xFFFF;
+                let code = ((wparam.0 as u32) >> 16) & 0xFFFF;
+
+                // 卡片复选：取消掉最后一张时回勾并提示（尽量留住卡片）
+                if (IDC_CARD_BASE..IDC_CARD_BASE + CARD_COUNT).contains(&(id as usize))
+                    && code == BN_CLICKED_CODE
+                {
+                    if read_cards(hwnd).any() {
+                        set_dlg_text(hwnd, IDC_CARDS_HINT as i32, "");
+                    } else {
+                        let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
+                        let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(1), LPARAM(0));
+                        set_dlg_text(hwnd, IDC_CARDS_HINT as i32, "请至少保留一张卡片");
+                    }
+                    return LRESULT(0);
+                }
+
+                // 透明度 / 明暗主题：点选**即时预览**——只改内存配置并重绘一帧，不落盘。
+                // 点"确定"才写盘生效；点"取消"或直接关窗由 WM_NCDESTROY 用快照还原。
+                let is_opacity =
+                    (IDC_OPACITY_BASE..IDC_OPACITY_BASE + OPACITY_STEPS.len()).contains(&(id as usize));
+                let is_theme = (IDC_THEME_BASE..IDC_THEME_BASE + THEME_LABELS.len()).contains(&(id as usize));
+                if (is_opacity || is_theme) && code == BN_CLICKED_CODE {
+                    apply_settings_preview(state, hwnd);
+                    return LRESULT(0);
+                }
+
                 if id == 1 {
-                    // IDOK
+                    // IDOK：地址非法只拦地址本身，其余开关照常保存并立即生效
                     let text = get_dlg_text(hwnd, IDC_ADDR_EDIT as i32);
                     let token_text = get_dlg_text(hwnd, IDC_TOKEN_EDIT as i32);
-
                     let mut nas = state.config.nas.clone();
-                    if nas.set_addr(&text) {
+                    let addr_ok = nas.set_addr(&text);
+                    if addr_ok {
                         nas.token = token_text.trim().to_string();
                         state.config.nas = nas;
-                        let _ = crate::config::save(&state.config);
-                        // 顶栏显示的 NAS 地址同步更新（下次重绘即生效）
-                        {
-                            let mut sh = state.shared.write().unwrap();
-                            sh.nas_host = state.config.nas.host.clone();
-                            sh.bump_seq();
+                    }
+
+                    let was_pinned = state.config.capsule.taskbar_pin;
+                    let theme_idx = (0..THEME_LABELS.len())
+                        .find(|&i| is_checked(hwnd, IDC_THEME_BASE + i))
+                        .unwrap_or(0);
+                    state.config.capsule.theme = crate::config::THEMES[theme_idx].to_string();
+                    state.config.capsule.taskbar_pin = is_checked(hwnd, IDC_TASKBAR_CHK);
+                    state.config.capsule.opacity = read_opacity(hwnd);
+                    state.config.capsule.click_outside_collapse =
+                        is_checked(hwnd, IDC_CLICK_OUTSIDE_CHK);
+                    let orient_idx = (0..ORIENT_LABELS.len())
+                        .find(|&i| is_checked(hwnd, IDC_ORIENT_BASE + i))
+                        .unwrap_or(0);
+                    state.config.capsule.orientation = crate::config::ORIENTATIONS[orient_idx].to_string();
+                    let picked = read_cards(hwnd);
+                    // 兜底：手改配置把六项全关掉时，按"至少保留一张卡片"回到全开
+                    state.config.capsule.cards = if picked.any() { picked } else { CardVis::default() };
+
+                    // 方向变了：先落到该方向的默认位置（竖条贴右缘 / 横条贴顶边），
+                    // 免得横竖互相"卡"在对方的位置上；再统一应用布局
+                    let want_v = state.config.capsule.orientation_hint() == Some(true);
+                    let cur_v = state.shared.read().unwrap().vertical;
+                    if want_v != cur_v {
+                        let (cw, _) = collapsed_main_size(want_v);
+                        let (dx, dy) = default_capsule_pos(cw as i32, want_v);
+                        state.config.capsule.x = Some(dx);
+                        state.config.capsule.y = Some(dy);
+                        let _ = SetWindowPos(
+                            state.hwnd,
+                            None,
+                            dx,
+                            dy,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    let _ = crate::config::save(&state.config);
+
+                    // "点击面板外自动收起"即时生效：面板正开着就立刻挂/撤全局鼠标钩子
+                    if state.view.expanded() {
+                        if state.config.capsule.click_outside_collapse {
+                            mouse_hook_install();
+                        } else {
+                            mouse_hook_remove();
                         }
+                    }
+
+                    // 立即生效：主题/掩码/主机名同步给渲染侧并强制重绘一帧
+                    {
+                        let mut sh = state.shared.write().unwrap();
+                        sh.nas_host = state.config.nas.host.clone();
+                        sh.dark = state.config.capsule.theme_dark();
+                        sh.cards = state.config.capsule.cards;
+                        sh.bump_seq();
+                    }
+                    if state.config.capsule.taskbar_pin != was_pinned {
+                        apply_taskbar_pin(state);
+                    } else {
+                        // 方向/位置变化在这里落定，再强制重绘一帧
+                        apply_layout(state, true);
+                        resize_window(state);
+                        paint_frame(state, true);
+                    }
+
+                    // 已经落盘生效，快照作废：之后关窗不该再"还原"
+                    state.settings_orig = None;
+                    if addr_ok {
                         let _ = state.cmd_tx.send(SourceCmd::SetTarget(
                             state.config.nas.addr(),
                             state.config.nas.token.clone(),
                         ));
-                        // “固定在任务栏”开关
-                        let chk = GetDlgItem(hwnd, IDC_TASKBAR_CHK as i32).unwrap_or_default();
-                        let want_pin = SendMessageW(chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0;
-                        if want_pin != state.config.capsule.taskbar_pin {
-                            state.config.capsule.taskbar_pin = want_pin;
-                            let _ = crate::config::save(&state.config);
-                            apply_taskbar_pin(state);
-                        }
                         let _ = DestroyWindow(hwnd);
                     } else {
-                        let _ = MessageBoxW(
-                            hwnd,
-                            pcwstr("地址格式无效。示例：192.168.1.50:8765"),
-                            pcwstr("核桃胶囊 - 设置"),
-                            MB_OK | MB_ICONWARNING,
-                        );
+                        // 只拦地址：窗口留着让用户改地址，其余设置已经保存并生效
+                        set_dlg_text(hwnd, IDC_TEST_RESULT as i32, "地址格式无效，连接设置未保存");
                     }
                 } else if id == 2 {
                     // IDCANCEL
@@ -2226,7 +2824,15 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                 LRESULT(0)
             }
             WM_NCDESTROY => {
+                // 窗口没了但快照还在 = 用户是"取消/直接关窗"退出的，
+                // 把即时预览过的主题与透明度还原回打开设置窗时的样子
+                restore_settings_preview(state);
                 state.settings_hwnd = HWND(null_mut());
+                // 释放设置窗字体（每开一次窗建一个，关窗即回收）
+                if !state.settings_font.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(state.settings_font.0));
+                    state.settings_font = HFONT(null_mut());
+                }
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

@@ -28,14 +28,17 @@ func NewCollector() *Collector {
 	proc := getenvOr("HOST_PROC", "/proc")
 	sys := getenvOr("HOST_SYS", "/sys")
 	root := getenvOr("HOST_ROOT", "") // 宿主机根在容器内的挂载点（/host/root），用于还原宿主路径
-	return &Collector{
+	c := &Collector{
 		cpu:      newCPUSampler(proc, sys),
 		mem:      newMemSampler(proc),
 		disk:     newDiskSampler(proc, sys, root),
-		gpu:      newGPUSampler(),
+		gpu:      newGPUSampler(sys),
 		net:      newNetSampler(proc, sys),
 		hostname: readHostname(proc),
 	}
+	// 启动时打一次温度源探测结果，便于用户报「CPU 温度不显示」时凭日志定位
+	c.cpu.logTempSources()
+	return c
 }
 
 // readHostname 取宿主机名：优先读挂载进来的宿主机 procfs
@@ -114,6 +117,16 @@ func (c *Collector) NetIface() string { return c.net.currentTarget() }
 
 // NetIfaceEffective 返回当前实际生效的网卡（含自动选择结果）。
 func (c *Collector) NetIfaceEffective() string { return c.net.effectiveTarget() }
+
+// SetNetSpeed 手动设置网卡协商速率（Mbps）；mbps<=0 表示清除手动值、恢复自动读取。
+// WiFi 网卡不导出 sysfs speed，需由管理页手动填写。
+func (c *Collector) SetNetSpeed(name string, mbps int) { c.net.setSpeed(name, mbps) }
+
+// NetSpeeds 返回手动设置的协商速率表（网卡名 → Mbps）。
+func (c *Collector) NetSpeeds() map[string]int { return c.net.speedsSnapshot() }
+
+// NetSpeedEffective 返回当前生效网卡的协商速率（Mbps，手动值优先）。
+func (c *Collector) NetSpeedEffective() int { return c.net.effectiveSpeed() }
 
 func loop(d time.Duration, f func()) {
 	t := time.NewTicker(d)

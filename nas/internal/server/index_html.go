@@ -1,7 +1,7 @@
 package server
 
 // indexHTML 是 NAS 端管理页（挂在飞牛统一网关的 unix socket 上，网关已校验登录态）。
-// 功能：令牌展示/复制、网卡选择、令牌重置、运行日志。
+// 功能：令牌展示/复制、网卡选择、网卡协商速率手动设置、令牌重置、运行日志。
 // 纯静态内联资源，不引外部依赖，离线可用。
 const indexHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -53,6 +53,7 @@ button.small{padding:6px 12px;font-size:13px}
 .btn:hover{background:#1d4ed8}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 select{flex:1;min-width:0;padding:9px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;background:#fff}
+input[type=number]{flex:1;min-width:0;padding:9px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;background:#fff;color:#1f2937}
 pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-radius:8px;max-height:280px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#111827;color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;box-shadow:0 4px 12px rgba(0,0,0,.2);z-index:10}
 .toast.show{opacity:1}
@@ -114,6 +115,22 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
   <button id="saveIface">保存</button>
 </div>
 <p class="hint small" id="ifaceEff"></p>
+<p class="hint">网卡协商速率（用于网络环百分比）。WiFi 网卡无法自动读取，可手动填写。</p>
+<div class="row">
+  <input id="speedInp" type="number" min="0" max="400000" step="1" placeholder="协商速率 Mbps（0＝自动识别）" list="speedOpts">
+  <datalist id="speedOpts">
+    <option value="100"></option>
+    <option value="1000"></option>
+    <option value="2500"></option>
+    <option value="10000"></option>
+    <option value="433"></option>
+    <option value="866"></option>
+    <option value="1200"></option>
+    <option value="2400"></option>
+  </datalist>
+  <button id="saveSpeed">保存速率</button>
+</div>
+<p class="hint small" id="speedNote"></p>
 </section>
 
 <section class="card">
@@ -151,6 +168,8 @@ function fmtBytes(n){
 }
 // 令牌默认只显示打码值；完整值由管理员点“显示/复制”时向 /api/token 获取。
 var tokenPlain = '';
+// 当前生效网卡名（协商速率按此网卡保存）
+var effIface = '';
 function setTokenMasked(m){
   tokenPlain = '';
   document.getElementById('token').textContent = m || '—';
@@ -186,6 +205,16 @@ function loadState(){
     });
     sel.value = s.iface || '';
     document.getElementById('ifaceEff').textContent = '当前生效网卡：' + (s.iface_effective || '未知');
+    // 协商速率：手动值按网卡存；WiFi 网卡读不到时由用户填写
+    effIface = s.iface_effective || '';
+    var speeds = s.net_speeds || {};
+    document.getElementById('speedInp').value = (effIface && speeds[effIface]) ? speeds[effIface] : '';
+    if (effIface) {
+      var sp = s.speed_effective || 0;
+      document.getElementById('speedNote').textContent = '当前生效网卡 ' + effIface + ' 的速率：' + (sp ? (sp + ' Mbps') : '未知（未识别到协商速率）');
+    } else {
+      document.getElementById('speedNote').textContent = '未识别到生效网卡，暂时无法设置速率。';
+    }
     // 电脑客户端安装包信息
     document.getElementById('cliVer').textContent = s.client_version ? ('v' + s.client_version) : '';
     if (s.client_available) {
@@ -224,6 +253,16 @@ document.getElementById('copyBtn').onclick = function(){
 document.getElementById('saveIface').onclick = function(){
   var name = document.getElementById('ifaceSel').value;
   fetch(api('/api/iface'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:name})})
+    .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+    .then(function(){ toast('已保存'); loadState(); })
+    .catch(function(){ toast('保存失败（需要管理员权限）'); });
+};
+document.getElementById('saveSpeed').onclick = function(){
+  if (!effIface) { toast('未识别到生效网卡'); return; }
+  var v = document.getElementById('speedInp').value;
+  var mbps = (v === '') ? 0 : parseInt(v, 10);
+  if (isNaN(mbps) || mbps < 0) { toast('请输入有效速率（0＝自动识别）'); return; }
+  fetch(api('/api/netspeed'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:effIface, mbps:mbps})})
     .then(function(r){ if(!r.ok) throw 0; return r.json(); })
     .then(function(){ toast('已保存'); loadState(); })
     .catch(function(){ toast('保存失败（需要管理员权限）'); });

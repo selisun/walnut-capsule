@@ -45,12 +45,12 @@ type Volume struct {
 }
 
 type GPU struct {
-	Index       int    `json:"index"`
-	Name        string `json:"name"`
-	Temp        *int   `json:"temp"`
-	Utilization *int   `json:"utilization"` // 0~100
-	MemUsed     uint64 `json:"memory_used"`
-	MemTotal    uint64 `json:"memory_total"`
+	Index       int     `json:"index"`
+	Name        string  `json:"name"`
+	Temp        *int    `json:"temp"`
+	Utilization *int    `json:"utilization"`           // 0~100
+	MemUsed     *uint64 `json:"memory_used,omitempty"` // 核显共享内存，无独立显存时为 null
+	MemTotal    *uint64 `json:"memory_total,omitempty"`
 }
 
 type NetIf struct {

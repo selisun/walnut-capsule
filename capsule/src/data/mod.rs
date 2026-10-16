@@ -13,6 +13,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
+use crate::config::CardVis;
+
 /// 数据更新时向 UI 线程投递的消息（wndproc 触发重绘）。
 pub const WM_APP_DATA: u32 = 0x8000 + 1; // WM_APP + 1
 /// 后台面板构建线程完成一帧时投递的消息（UI 取结果并重绘）。
@@ -175,8 +177,8 @@ pub struct SharedState {
     /// UI 线程渲染前只 clone Arc，全程不持锁，杜绝锁竞争造成的帧尖峰。
     pub snap: Arc<Snapshot>,
     pub has_data: bool,
-    /// 磨砂模式：UI 背景更透，露出系统模糊。
-    pub frost: bool,
+    /// 暗色主题：上屏前把画面里的中性色翻转（白底↔黑底、深字↔浅字），彩色保持不动。
+    pub dark: bool,
     /// 当前连接的 NAS 地址（用户配置的 host，用于展开态顶栏显示）。
     pub nas_host: String,
     /// 是否固定在任务栏（透明融入任务栏，不画卡片底）。
@@ -185,6 +187,12 @@ pub struct SharedState {
     pub taskbar_light: bool,
     /// 固定在任务栏且任务栏位于屏幕下方时为 true：展开面板向上生长（顶栏贴窗口底部）。
     pub expand_up: bool,
+    /// 竖排形态（细长条胶囊）；展开时面板从竖条一侧推出（不向下生长）。
+    pub vertical: bool,
+    /// 竖排且面板在竖条左侧（胶囊贴屏幕右缘）时为 true：窗口右缘固定、面板向左推。
+    pub panel_left: bool,
+    /// 展开面板卡片显示开关：UI 线程算窗口高度、构建线程画卡片必须共用这一份。
+    pub cards: CardVis,
     seq: AtomicU64,
 }
 
@@ -194,11 +202,14 @@ impl Default for SharedState {
             conn: ConnStatus::Connecting,
             snap: Arc::new(Snapshot::default()),
             has_data: false,
-            frost: false,
+            dark: false,
             nas_host: String::new(),
             pinned: false,
             taskbar_light: true,
             expand_up: false,
+            vertical: false,
+            panel_left: false,
+            cards: CardVis::default(),
             seq: AtomicU64::new(0),
         }
     }
@@ -213,7 +224,8 @@ pub struct Frame<'a> {
     /// 数据版本号：仅在快照/连接状态变化时递增，视图据此复用整帧缓存。
     pub seq: u64,
     pub has_data: bool,
-    pub frost: bool,
+    /// 是否暗色主题。
+    pub dark: bool,
     pub conn: &'a ConnStatus,
     /// 当前连接的 NAS 地址（host）。
     pub nas_host: &'a str,
@@ -223,6 +235,12 @@ pub struct Frame<'a> {
     pub taskbar_light: bool,
     /// 展开面板是否向上生长（顶栏位于窗口底部）。
     pub expand_up: bool,
+    /// 竖排形态（细长条胶囊）。
+    pub vertical: bool,
+    /// 竖排且面板在竖条左侧。
+    pub panel_left: bool,
+    /// 展开面板卡片显示开关。
+    pub cards: CardVis,
 }
 
 /// 锁外持有的一帧数据：Arc 快照指针 + 少量小字段拷贝。
@@ -231,11 +249,14 @@ pub struct OwnedFrame {
     pub seq: u64,
     pub conn: ConnStatus,
     pub has_data: bool,
-    pub frost: bool,
+    pub dark: bool,
     pub nas_host: String,
     pub pinned: bool,
     pub taskbar_light: bool,
     pub expand_up: bool,
+    pub vertical: bool,
+    pub panel_left: bool,
+    pub cards: CardVis,
 }
 
 impl OwnedFrame {
@@ -245,12 +266,15 @@ impl OwnedFrame {
             snap: &self.snap,
             seq: self.seq,
             has_data: self.has_data,
-            frost: self.frost,
+            dark: self.dark,
             conn: &self.conn,
             nas_host: &self.nas_host,
             pinned: self.pinned,
             taskbar_light: self.taskbar_light,
             expand_up: self.expand_up,
+            vertical: self.vertical,
+            panel_left: self.panel_left,
+            cards: self.cards,
         }
     }
 }
@@ -269,11 +293,14 @@ impl SharedState {
             seq: self.seq(),
             conn: self.conn.clone(),
             has_data: self.has_data,
-            frost: self.frost,
+            dark: self.dark,
             nas_host: self.nas_host.clone(),
             pinned: self.pinned,
             taskbar_light: self.taskbar_light,
             expand_up: self.expand_up,
+            vertical: self.vertical,
+            panel_left: self.panel_left,
+            cards: self.cards,
         }
     }
 }

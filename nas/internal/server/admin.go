@@ -22,7 +22,7 @@ type AdminDeps struct {
 	Version  string
 	Hostname string
 	LogPath  string
-	StateDir string // 持久化网卡选择（iface 文件）
+	StateDir string // 持久化网卡选择与手动协商速率（iface / netspeed 文件）
 	IconPath string // 管理页品牌图标（app/ui/images/icon_64.png）
 	// 电脑端安装器信息（随 fpk 一起下发，供管理页下载）
 	SetupPath     string // 安装器文件路径（app/ui/download/hetao-capsule-setup.exe）
@@ -45,6 +45,7 @@ func NewAdmin(prefix string, d AdminDeps) http.Handler {
 	// 管理类接口要求飞牛网关注入的管理员身份（X-Trim-Isadmin）。
 	// 网关只负责登录态与业务权限的区分交给应用（见文档「管理接口需要管理员身份」）。
 	mux.HandleFunc("/api/iface", requireAdmin(a.handleIface))
+	mux.HandleFunc("/api/netspeed", requireAdmin(a.handleNetSpeed))
 	mux.HandleFunc("/api/token", requireAdmin(a.handleTokenPlain))
 	mux.HandleFunc("/api/token/reset", requireAdmin(a.handleTokenReset))
 	mux.HandleFunc("/api/logs", requireAdmin(a.handleLogs))
@@ -128,6 +129,8 @@ func (a *admin) handleState(w http.ResponseWriter, _ *http.Request) {
 		"iface":            a.Col.NetIface(),          // 手动指定（空=自动）
 		"iface_effective":  a.Col.NetIfaceEffective(), // 实际生效
 		"ifaces":           a.Col.NetIfaces(),
+		"net_speeds":       a.Col.NetSpeeds(),         // 手动填写的协商速率（网卡名 → Mbps）
+		"speed_effective":  a.Col.NetSpeedEffective(), // 生效网卡的协商速率（0=未知）
 		"service_port":     8765,
 		"client_version":   a.ClientVersion,
 		"client_size":      a.ClientSize,
@@ -181,6 +184,57 @@ func (a *admin) handleIface(w http.ResponseWriter, r *http.Request) {
 		_ = os.WriteFile(filepath.Join(a.StateDir, "iface"), []byte(name), 0600)
 	}
 	writeJSON(w, map[string]any{"ok": true, "iface": name})
+}
+
+// maxSpeedMbps 手动协商速率上限（400 Gbps），防止写入明显不合理的值。
+const maxSpeedMbps = 400_000
+
+type netSpeedReq struct {
+	Name string `json:"name"`
+	Mbps int    `json:"mbps"`
+}
+
+// handleNetSpeed 手动设置某块网卡的协商速率（Mbps）。WiFi 网卡不导出
+// /sys/class/net/*/speed，无法自动识别，需管理员按实际链路填写；
+// 客户端据此计算网络环占比。mbps=0 表示清除该网卡的手动值、恢复自动读取。
+func (a *admin) handleNetSpeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req netSpeedReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		http.Error(w, "interface required", http.StatusBadRequest)
+		return
+	}
+	// 仅接受已发现的网卡名，避免把任意键写进配置文件。
+	ok := false
+	for _, n := range a.Col.NetIfaces() {
+		if n == name {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		http.Error(w, "unknown interface", http.StatusBadRequest)
+		return
+	}
+	if req.Mbps < 0 || req.Mbps > maxSpeedMbps {
+		http.Error(w, "invalid speed", http.StatusBadRequest)
+		return
+	}
+	a.Col.SetNetSpeed(name, req.Mbps)
+	if a.StateDir != "" {
+		if b, err := json.Marshal(a.Col.NetSpeeds()); err == nil {
+			_ = os.WriteFile(filepath.Join(a.StateDir, "netspeed"), b, 0600)
+		}
+	}
+	writeJSON(w, map[string]any{"ok": true, "name": name, "mbps": req.Mbps})
 }
 
 func (a *admin) handleTokenReset(w http.ResponseWriter, r *http.Request) {

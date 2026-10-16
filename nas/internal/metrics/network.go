@@ -24,6 +24,12 @@ type netSampler struct {
 	targetMu sync.RWMutex
 	target   string
 
+	// speeds 为手动指定的网卡协商速率（Mbps），键为网卡名。
+	// WiFi 网卡不导出 /sys/class/net/*/speed，无法自动识别，需由管理页手动填写，
+	// 客户端据此计算网络环占比。手动值优先于 sysfs。
+	speedMu sync.RWMutex
+	speeds  map[string]int
+
 	mu     sync.RWMutex
 	ifaces []NetIf
 	prev   map[string]netCounter
@@ -38,6 +44,7 @@ func newNetSampler(proc, sys string) *netSampler {
 		proc:   proc,
 		sys:    sys,
 		target: getenvOr("NET_IFACE", ""),
+		speeds: map[string]int{},
 		prev:   map[string]netCounter{},
 		seen:   map[string]netCounter{},
 	}
@@ -59,6 +66,42 @@ func linkSpeedMbps(sys, name string) int {
 		return 0
 	}
 	return v
+}
+
+// speedOf 返回网卡的协商速率（Mbps）：手动设置优先，其次读 sysfs，都取不到为 0。
+func (s *netSampler) speedOf(name string) int {
+	s.speedMu.RLock()
+	v := s.speeds[name]
+	s.speedMu.RUnlock()
+	if v > 0 {
+		return v
+	}
+	return linkSpeedMbps(s.sys, name)
+}
+
+// setSpeed 手动设置网卡协商速率（Mbps）；mbps<=0 表示清除手动值、恢复自动读取。
+func (s *netSampler) setSpeed(name string, mbps int) {
+	if name == "" {
+		return
+	}
+	s.speedMu.Lock()
+	defer s.speedMu.Unlock()
+	if mbps <= 0 {
+		delete(s.speeds, name)
+		return
+	}
+	s.speeds[name] = mbps
+}
+
+// speedsSnapshot 返回手动设置的协商速率表副本（网卡名 → Mbps）。
+func (s *netSampler) speedsSnapshot() map[string]int {
+	s.speedMu.RLock()
+	defer s.speedMu.RUnlock()
+	out := make(map[string]int, len(s.speeds))
+	for k, v := range s.speeds {
+		out[k] = v
+	}
+	return out
 }
 
 func (s *netSampler) snapshot() []NetIf {
@@ -168,7 +211,7 @@ func (s *netSampler) sample() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 协商速率：供客户端计算网络环百分比（读不到则为 0，客户端只画轨道）
-	speed := linkSpeedMbps(s.sys, target)
+	speed := s.speedOf(target)
 	var out []NetIf
 	if c, ok := cur[target]; ok {
 		if !s.prevAt.IsZero() {
@@ -232,4 +275,14 @@ func (s *netSampler) effectiveTarget() string {
 		return s.ifaces[0].Name
 	}
 	return ""
+}
+
+// effectiveSpeed 返回当前生效网卡的协商速率（Mbps，手动值优先）；
+// 无生效网卡或无法确定时为 0，供管理页回显。
+func (s *netSampler) effectiveSpeed() int {
+	name := s.effectiveTarget()
+	if name == "" {
+		return 0
+	}
+	return s.speedOf(name)
 }

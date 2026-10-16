@@ -23,3 +23,30 @@ pub fn bytes(b: u64) -> String {
         format!("{}K", b >> 10)
     }
 }
+
+/// 网卡协商速率（Mbps）→ "100 Mbps" / "1 Gbps" / "2.5 Gbps" / "10 Gbps"。
+/// 0（未知）返回空串，调用方据此不显示。
+pub fn link_speed(mbps: u32) -> String {
+    if mbps == 0 {
+        return String::new();
+    }
+    if mbps < 1000 {
+        return format!("{mbps} Mbps");
+    }
+    let g = mbps as f64 / 1000.0;
+    if (g - g.round()).abs() < 0.05 {
+        format!("{} Gbps", g.round() as u32)
+    } else {
+        format!("{g:.1} Gbps")
+    }
+}
+
+/// 紧凑速率：整数位达 3 位时舍弃小数（"1023.9M" → "1023M"），
+/// 供空间紧张的三环内使用，避免长串顶出环外；其余与 `rate` 一致。
+pub fn rate_compact(bps: u64) -> String {
+    let s = rate(bps);
+    match s.find('.') {
+        Some(dot) if dot >= 3 => format!("{}{}", &s[..dot], &s[dot + 2..]),
+        _ => s,
+    }
+}

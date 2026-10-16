@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
@@ -21,11 +22,11 @@ const appName = "hetaocapsule"
 
 // appVersion 仅作 TRIM_APPVER 缺失时的兜底显示，正常由 fpk 注入。
 // 需与 hetaocapsule/manifest 的 version 保持一致。
-const appVersion = "0.1.20"
+const appVersion = "0.1.29"
 
 // clientVersion 电脑端安装器版本，需与 capsule/installer/hetao-capsule.iss 的 AppVer 一致。
 // 版本策略：客户端与 fpk 各自独立计数——客户端每改一次递增；fpk 有改动也递增。
-const clientVersion = "0.1.17"
+const clientVersion = "0.1.25"
 
 func main() {
 	addr := flag.String("addr", ":8765", "listen address")
@@ -53,6 +54,20 @@ func main() {
 		if b, err := os.ReadFile(filepath.Join(stateDir, "iface")); err == nil {
 			if name := strings.TrimSpace(string(b)); name != "" {
 				col.SetNetIface(name)
+			}
+		}
+	}
+
+	// 手动协商速率：WiFi 网卡不导出 sysfs speed，管理页填写的值存于状态目录，启动时恢复。
+	if stateDir != "" {
+		if b, err := os.ReadFile(filepath.Join(stateDir, "netspeed")); err == nil {
+			var m map[string]int
+			if err := json.Unmarshal(b, &m); err == nil {
+				for name, mbps := range m {
+					col.SetNetSpeed(name, mbps)
+				}
+			} else {
+				log.Printf("解析 netspeed 失败：%v", err)
 			}
 		}
 	}
