@@ -1,6 +1,6 @@
 [package]
 name = "hetao-capsule"
-version = "0.1.25"
+version = "0.1.29"
 edition = "2021"
 
 [dependencies]

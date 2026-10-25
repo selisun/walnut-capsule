@@ -3,7 +3,7 @@
 ; 说明：免管理员安装（装到用户目录），创建开始菜单/桌面快捷方式，可选开机自启。
 
 #define AppName "核桃胶囊"
-#define AppVer "0.1.25"
+#define AppVer "0.1.29"
 #define AppExe "hetao-capsule.exe"
 #define AppPublisher "蓝胖纸"
 
@@ -18,7 +18,7 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=output
-OutputBaseFilename=hetao-capsule-setup
+OutputBaseFilename=hetao-capsule-setup-{#AppVer}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

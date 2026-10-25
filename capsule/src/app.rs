@@ -249,6 +249,7 @@ pub fn run(config: Config) {
         pin_avoid_x: None,
         pin_check_at: None,
         net_peak: (0, 0),
+        fs_hidden: false,
     };
 
     let raw = Box::into_raw(Box::new(state));
@@ -271,6 +272,12 @@ pub fn run(config: Config) {
     // 启动时若已开启“固定在任务栏”，立即归位并开始保持置顶
     if unsafe { (*raw).config.capsule.taskbar_pin } {
         apply_taskbar_pin(unsafe { &mut *raw });
+    }
+
+    // 全屏应用检测：游戏 / 放映进入全屏时隐藏悬浮窗，退出后恢复。
+    // 500ms 一次，每次只是几次窗口查询，空闲开销可忽略。
+    unsafe {
+        let _ = SetTimer(hwnd, IDT_FS, 500, None);
     }
 
     // 数据源在窗口首帧完成后再启动：配合入口处的 WSAStartup 串行预热，
@@ -353,6 +360,8 @@ struct AppState {
     pin_check_at: Option<Instant>,
     /// 网络环兜底刻度（会话峰值 rx/tx，字节/秒）：网卡协商速率读不到时（WiFi 等）用它做满环基准
     net_peak: (u64, u64),
+    /// 因全屏应用（游戏 / 放映）而临时隐藏了悬浮窗
+    fs_hidden: bool,
 }
 
 /// 任务栏内的三环子窗口：归属任务栏（owner = Shell_TrayWnd），常驻其上方。
@@ -965,7 +974,8 @@ fn set_initial_pos(hwnd: HWND, config: &Config) {
     }
 }
 
-fn tray_init(hwnd: HWND, icon: HICON) {
+/// 登记托盘图标。返回 false 表示当时 shell 不可用（例如开机自启早于资源管理器就绪）。
+fn tray_init(hwnd: HWND, icon: HICON) -> bool {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -978,7 +988,65 @@ fn tray_init(hwnd: HWND, icon: HICON) {
     let tip: Vec<u16> = "核桃胶囊".encode_utf16().collect();
     let len = tip.len().min(nid.szTip.len() - 1);
     nid.szTip[..len].copy_from_slice(&tip[..len]);
-    unsafe { let _ = Shell_NotifyIconW(NIM_ADD, &nid); }
+    // 图标已存在时 NIM_ADD 会失败（例如 shell 反复广播 TaskbarCreated），回退到 NIM_MODIFY
+    let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid).as_bool() }
+        || unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() };
+    if !ok {
+        dbg_log("tray: NIM_ADD 失败");
+    }
+    ok
+}
+
+/// 资源管理器重启时 shell 会向所有顶层窗口广播这条注册消息（"TaskbarCreated"）。
+fn taskbar_created_msg() -> u32 {
+    static MSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MSG.get_or_init(|| {
+        let name: Vec<u16> = "TaskbarCreated".encode_utf16().chain(Some(0)).collect();
+        unsafe { RegisterWindowMessageW(PCWSTR(name.as_ptr())) }
+    })
+}
+
+/// 资源管理器重启后的恢复：托盘图标已被 shell 清空，必须重新登记，否则只能等进程重启；
+/// 三环是旧 Shell_TrayWnd 的从属窗口，重建后重新绑到新任务栏。
+fn rebuild_after_shell_restart(state: &mut AppState) {
+    let _ = tray_init(state.hwnd, app_icons().1);
+    if !state.config.capsule.taskbar_pin {
+        return;
+    }
+    // 旧任务栏随 shell 一起销毁后，三环窗口即使句柄还在也已失去 owner：
+    // 不再压在任务栏之上、也不再随任务栏隐藏，表现为"窗口存在但画不出来"。
+    // 所以不能靠 IsWindow 判断存活，一律重建并绑到新任务栏。
+    let old_pos = state.rings.as_ref().map(|r| {
+        let mut rc = RECT::default();
+        unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+        (rc.left, rc.top)
+    });
+    if let Some(mut r) = state.rings.take() {
+        r.release();
+        unsafe { let _ = DestroyWindow(r.hwnd); }
+    }
+    // 位置与任务栏扫描缓存一并清空，交给 sync_taskbar_state 重新选位
+    state.pin_anchor = None;
+    state.pin_hidden = false;
+    state.seg = None;
+    state.seg_rect = None;
+    state.seg_at = None;
+    state.pin_avoid_cand = None;
+    state.pin_avoid_hits = 0;
+    state.pin_avoid_x = None;
+    state.pin_check_at = None;
+    if !rings_ensure(state) {
+        return;
+    }
+    if state.view.expanded() {
+        // 面板展开着：sync_taskbar_state 会跳过重算，先沿用重建前的位置
+        if let Some((x, y)) = old_pos {
+            rings_place(state, x, y);
+        }
+    } else {
+        sync_taskbar_state(state);
+    }
+    rings_paint(state, true);
 }
 
 fn tray_remove(hwnd: HWND) {
@@ -1007,6 +1075,8 @@ const ID_TRAY_PIN: u32 = 1003;
 const IDT_ANIM: usize = 0x4A11;
 /// 固定在任务栏时，周期性把窗口重新提到任务栏之上的定时器 ID
 const IDT_PIN: usize = 0x4A12;
+/// 全屏应用检测定时器 ID（500ms 一次，游戏进出全屏时及时隐藏/恢复）
+const IDT_FS: usize = 0x4A13;
 /// 设置窗可选的透明度档位（同时也是设置窗单选钮的顺序）
 const OPACITY_STEPS: [f32; 4] = [1.0, 0.85, 0.70, 0.55];
 
@@ -1077,6 +1147,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 unsafe { let _ = KillTimer(hwnd, IDT_PIN); }
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDT_FS => {
+            sync_fullscreen_state(state);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -1182,6 +1256,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if lparam.0 as u32 == WM_RBUTTONUP {
                 show_tray_menu(state);
             }
+            LRESULT(0)
+        }
+        m if m == taskbar_created_msg() => {
+            // 资源管理器重启：shell 会清空整个通知区域，托盘图标必须重新登记
+            dbg_log("TaskbarCreated");
+            rebuild_after_shell_restart(state);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -2117,6 +2197,148 @@ fn sync_taskbar_state(state: &mut AppState) {
     }
 }
 
+/// 全屏应用检测：前台窗口若占满整块显示器、且与本窗口在同一块屏上，返回 true。
+///
+/// 边界用 DWM 的「扩展边框」而不是 GetWindowRect——游戏 / UWP 窗口的不可见边框
+/// 和阴影会让普通矩形偏大，扩展边框才是肉眼看到的实际边界。
+/// 桌面 / 任务栏铺满整屏但不是"应用"，按窗口类名排除；本程序自己的窗口也排除。
+fn fullscreen_on_same_monitor(state: &AppState) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || fg == state.hwnd {
+            return false;
+        }
+        if !state.settings_hwnd.0.is_null() && fg == state.settings_hwnd {
+            return false;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(fg, &mut buf);
+        if n > 0 {
+            let name = String::from_utf16_lossy(&buf[..n as usize]);
+            if matches!(
+                name.as_str(),
+                "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+            ) {
+                return false;
+            }
+        }
+        let mut rc = RECT::default();
+        let ok = DwmGetWindowAttribute(
+            fg,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rc as *mut RECT as *mut c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_ok();
+        if !ok {
+            let _ = GetWindowRect(fg, &mut rc);
+        }
+        if rc.right <= rc.left || rc.bottom <= rc.top {
+            return false;
+        }
+        let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        if mon.0.is_null() {
+            return false;
+        }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        // 允许 2px 误差：个别窗口的边缘会差一两个像素
+        const TOL: i32 = 2;
+        let m = mi.rcMonitor;
+        let covers = rc.left <= m.left + TOL
+            && rc.top <= m.top + TOL
+            && rc.right >= m.right - TOL
+            && rc.bottom >= m.bottom - TOL;
+        if !covers {
+            return false;
+        }
+        // 只在"全屏应用与本窗口在同一块屏"时隐藏：副屏打游戏不该把主屏的胶囊也藏掉
+        let own = MonitorFromWindow(own_visible_hwnd(state), MONITOR_DEFAULTTONEAREST);
+        own.0 == mon.0
+    }
+}
+
+/// 当前代表悬浮窗的句柄：固定在任务栏时取三环窗口（此时主窗口常处于隐藏态）。
+fn own_visible_hwnd(state: &AppState) -> HWND {
+    if state.config.capsule.taskbar_pin {
+        if let Some(r) = state.rings.as_ref() {
+            return r.hwnd;
+        }
+    }
+    state.hwnd
+}
+
+/// 每 500ms 评估一次：全屏应用运行时隐藏悬浮窗，退出全屏后按原形态恢复。
+fn sync_fullscreen_state(state: &mut AppState) {
+    if !state.config.capsule.hide_on_fullscreen {
+        restore_after_fullscreen(state);
+        return;
+    }
+    // 设置窗开着时不做判定：用户正在调设置，别把窗口藏了
+    if !state.settings_hwnd.0.is_null() {
+        return;
+    }
+    let fullscreen = fullscreen_on_same_monitor(state);
+    if fullscreen == state.fs_hidden {
+        return;
+    }
+    if fullscreen {
+        hide_for_fullscreen(state);
+    } else {
+        restore_after_fullscreen(state);
+    }
+}
+
+/// 隐藏悬浮窗（主窗口 + 任务栏三环 + 磨砂层）。
+fn hide_for_fullscreen(state: &mut AppState) {
+    state.fs_hidden = true;
+    mouse_hook_remove(); // 面板已被藏起来，钩子留着只会误收起
+    unsafe {
+        let _ = ShowWindow(state.hwnd, SW_HIDE);
+        if let Some(r) = state.rings.as_ref() {
+            let _ = ShowWindow(r.hwnd, SW_HIDE);
+        }
+    }
+    acrylic_show(state, false);
+}
+
+/// 退出全屏后恢复：固定态恢复三环（展开中则连面板一起），普通态恢复胶囊 / 面板。
+fn restore_after_fullscreen(state: &mut AppState) {
+    if !state.fs_hidden {
+        return;
+    }
+    state.fs_hidden = false;
+    if state.pin_hidden {
+        return; // 任务栏没有空段，本来就该保持隐藏
+    }
+    if state.config.capsule.taskbar_pin {
+        if let Some((ax, ay, _)) = state.pin_anchor {
+            rings_place(state, ax, ay); // 带 SWP_SHOWWINDOW
+            rings_paint(state, true);
+        }
+        if state.view.expanded() {
+            resize_window(state);
+            unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
+            paint_frame(state, true);
+            if state.config.capsule.click_outside_collapse {
+                mouse_hook_install();
+            }
+        } else {
+            sync_taskbar_state(state);
+        }
+    } else {
+        resize_window(state);
+        unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
+        paint_frame(state, true);
+        if state.view.expanded() && state.config.capsule.click_outside_collapse {
+            mouse_hook_install();
+        }
+    }
+}
+
 /// 应用/取消“固定在任务栏”：三环挂成任务栏的从属窗口常驻其上方，展开面板为独立浮窗。
 fn apply_taskbar_pin(state: &mut AppState) {
     if !state.config.capsule.taskbar_pin {
@@ -2252,6 +2474,8 @@ const IDC_SEC_CARDS: usize = 108;
 const IDC_SEC_OTHER: usize = 109;
 /// 卡片选择提示行（全部取消时提示"请至少保留一张卡片"）
 const IDC_CARDS_HINT: usize = 110;
+/// 全屏应用时自动隐藏悬浮窗（默认开启）
+const IDC_FS_CHK: usize = 111;
 /// 六个卡片复选（顺序同 CardVis::all：CPU/内存/显卡/网络/硬盘读写/存储状态）
 const IDC_CARD_BASE: usize = 120;
 const CARD_COUNT: usize = 6;
@@ -2263,7 +2487,7 @@ const IDC_ORIENT_BASE: usize = 140;
 const ORIENT_LABELS: [&str; 3] = ["自动", "横向", "竖向"];
 /// 设置窗口客户区尺寸（三段式：连接 / 显示卡片 / 其他）
 const SETTINGS_CLIENT_W: i32 = 420;
-const SETTINGS_CLIENT_H: i32 = 520;
+const SETTINGS_CLIENT_H: i32 = 546;
 /// 按钮通知码 BN_CLICKED = 0（不依赖 crate 常量类型）
 const BN_CLICKED_CODE: u32 = 0;
 /// 静态控件样式 SS_ETCHEDHORZ = 0x10：一条 1px 蚀刻横线（分组分隔）
@@ -2532,7 +2756,7 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                 let c0 = 16; // 连接组
                 let k0 = 192; // 显示卡片组
                 let o0 = 344; // 其他组
-                let btn_y = 474; // 底部按钮
+                let btn_y = 500; // 底部按钮
 
                 // ---- 分组一：连接 ----
                 mk_child("STATIC", "连接", WINDOW_STYLE(0), PAD, c0, 200, 18, IDC_SEC_CONN);
@@ -2658,6 +2882,15 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     IDC_TASKBAR_CHK,
                 );
                 set_check(IDC_TASKBAR_CHK, state.config.capsule.taskbar_pin);
+                // 全屏应用（游戏 / 放映）运行时隐藏悬浮窗，退出后自动恢复
+                mk_child(
+                    "BUTTON",
+                    "全屏应用时自动隐藏",
+                    WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                    PAD, o0 + 120, 260, 22,
+                    IDC_FS_CHK,
+                );
+                set_check(IDC_FS_CHK, state.config.capsule.hide_on_fullscreen);
 
                 // ---- 底部按钮（贴客户区底边：竖排展开时设置窗与面板同高，按钮仍要够得着）----
                 mk_child("BUTTON", "取消", WINDOW_STYLE(0), 236, btn_y, 80, 30, 2); // IDCANCEL
@@ -2725,6 +2958,7 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     state.config.capsule.opacity = read_opacity(hwnd);
                     state.config.capsule.click_outside_collapse =
                         is_checked(hwnd, IDC_CLICK_OUTSIDE_CHK);
+                    state.config.capsule.hide_on_fullscreen = is_checked(hwnd, IDC_FS_CHK);
                     let orient_idx = (0..ORIENT_LABELS.len())
                         .find(|&i| is_checked(hwnd, IDC_ORIENT_BASE + i))
                         .unwrap_or(0);
@@ -2779,6 +3013,9 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                         resize_window(state);
                         paint_frame(state, true);
                     }
+
+                    // 刚关掉"全屏应用时自动隐藏"时，若此前正被全屏藏起来，这里立刻恢复
+                    sync_fullscreen_state(state);
 
                     // 已经落盘生效，快照作废：之后关窗不该再"还原"
                     state.settings_orig = None;

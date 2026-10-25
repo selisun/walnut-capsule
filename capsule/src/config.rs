@@ -54,6 +54,9 @@ pub struct CapsuleConfig {
     /// 点击面板外任意位置自动收起展开面板（默认开启）
     #[serde(default = "default_true")]
     pub click_outside_collapse: bool,
+    /// 全屏应用（游戏、放映等）运行时自动隐藏悬浮窗（默认开启）
+    #[serde(default = "default_true")]
+    pub hide_on_fullscreen: bool,
 }
 
 impl Default for CapsuleConfig {
@@ -68,6 +71,7 @@ impl Default for CapsuleConfig {
             orientation: default_orientation(),
             cards: CardVis::default(),
             click_outside_collapse: true,
+            hide_on_fullscreen: true,
         }
     }
 }

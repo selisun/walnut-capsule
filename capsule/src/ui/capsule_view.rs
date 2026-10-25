@@ -1492,6 +1492,18 @@ fn usage_color(v: f32) -> (u8, u8, u8, u8) {
     }
 }
 
+/// 深色任务栏上的环内文字：把分级色提亮一档（保留色相），保证 12.5px 小字在深底可读。
+/// 只用于文字；环描边仍用原始分级色，避免整环发白、丢掉分级感。
+fn ring_text_color(c: (u8, u8, u8, u8)) -> (u8, u8, u8, u8) {
+    match c {
+        LEVEL_GREEN => (74, 222, 128, c.3),
+        WARN => (251, 146, 60, c.3),
+        LEVEL_RED => (248, 113, 113, c.3),
+        ACCENT => (96, 165, 250, c.3),
+        _ => c,
+    }
+}
+
 /// 温度分级颜色：<60°C 绿、60~80°C 橙、≥80°C 红。
 fn temp_color(t: f32) -> (u8, u8, u8, u8) {
     if t < 60.0 {
@@ -2082,14 +2094,18 @@ pub(crate) const RINGS_H: u32 = 48;
 /// 由任务栏内的子窗口直接调用，不依赖 View 实例。
 pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>, net_peak: (u64, u64)) {
     let Some(font) = font else { return };
-    // 环内数值各自用分级色，标注用灰色（深色任务栏换浅灰）；暗色主题下标注统一提白
-    let base = if frame.pinned && !frame.taskbar_light { PIN_FG_DIM } else { FG_DIM };
-    let d = text_c(frame.dark, base);
+    // 三环直接浮在任务栏上，文字对比度取决于任务栏底色（不是应用主题）：
+    // 深色任务栏用浅色标注 + 提亮后的分级色，亮色任务栏沿用主题配色。
+    let dark_taskbar = frame.pinned && !frame.taskbar_light;
+    let base = if dark_taskbar { PIN_FG_DIM } else { FG_DIM };
+    let d = if dark_taskbar { base } else { text_c(frame.dark, base) };
     let dim = color(d.0, d.1, d.2, d.3);
+    let tint = |c: (u8, u8, u8, u8)| if dark_taskbar { ring_text_color(c) } else { c };
 
     if !frame.has_data {
-        // 无数据时只画一个居中的状态环（灰轨道）+ 状态文字
-        let (text, c) = status_text(frame.conn, frame.dark);
+        // 无数据时只画一个居中的状态环（灰轨道）+ 状态文字。
+        // 深色任务栏没有 apply_dark 兜底，这里必须直接取浅色文案。
+        let (text, c) = status_text(frame.conn, frame.dark && !dark_taskbar);
         let cx = RINGS_W as f32 / 2.0;
         draw_ring(px, cx, RING_CY, RING_R, RING_STROKE, None, TRACK);
         draw_ring_inner(px, font, cx, RING_CY, &text, c, "", dim, RING_VALUE_FS, RING_LABEL_FS, false);
@@ -2103,6 +2119,7 @@ pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>, ne
 
     // CPU 环：数值（分色）+ 环内小字标注
     let cpu_color = cpu_pct.map_or(ACCENT, usage_color);
+    let cpu_text_color = tint(cpu_color);
     draw_ring(px, RING_CX[0], RING_CY, RING_R, RING_STROKE, cpu_pct, cpu_color);
     let cpu_text = cpu_pct.map_or_else(|| "--%".into(), |v| format!("{:.0}%", v.round()));
     draw_ring_inner(
@@ -2111,7 +2128,7 @@ pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>, ne
         RING_CX[0],
         RING_CY,
         &cpu_text,
-        color(cpu_color.0, cpu_color.1, cpu_color.2, cpu_color.3),
+        color(cpu_text_color.0, cpu_text_color.1, cpu_text_color.2, cpu_text_color.3),
         "CPU",
         dim,
         RING_VALUE_FS,
@@ -2121,6 +2138,7 @@ pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>, ne
 
     // 内存环
     let mem_color = mem_pct.map_or(ACCENT, usage_color);
+    let mem_text_color = tint(mem_color);
     draw_ring(px, RING_CX[1], RING_CY, RING_R, RING_STROKE, mem_pct, mem_color);
     let mem_text = mem_pct.map_or_else(|| "--%".into(), |v| format!("{:.0}%", v.round()));
     draw_ring_inner(
@@ -2129,7 +2147,7 @@ pub(crate) fn draw_rings(px: &mut Pixmap, frame: &Frame, font: Option<&Font>, ne
         RING_CX[1],
         RING_CY,
         &mem_text,
-        color(mem_color.0, mem_color.1, mem_color.2, mem_color.3),
+        color(mem_text_color.0, mem_text_color.1, mem_text_color.2, mem_text_color.3),
         "内存",
         dim,
         RING_VALUE_FS,
@@ -4240,6 +4258,59 @@ mod video_h {
         font.draw(px, cx2 - dw2 / 2.0, cy + p(10.0), p(11.5), &ds, color(PURPLEC.0, PURPLEC.1, PURPLEC.2, a));
     }
 
+    // 竖版三环（竖排胶囊收起态）：56×178，三环纵向堆叠
+    fn draw_rings_v_at(px: &mut Pixmap, font: &Font, ox: f32, oy: f32, s: f32, frame: u32, a: u8) {
+        let snap = mock_snap(frame);
+        let p = |v: f32| v * s;
+        let cc = |c: C4| (c.0, c.1, c.2, (c.3 as u16 * a as u16 / 255) as u8);
+
+        // 胶囊底
+        fill_round(px, ox, oy, p(PILL_V_W as f32), p(PILL_V_H as f32), p(PILL_R),
+            (BG.0, BG.1, BG.2, a));
+
+        let cx = ox + p(RING_V_CX);
+        let cpu_v = snap.cpu.as_ref().and_then(|c| c.usage).unwrap_or(0.0) as f32;
+        let mem_v = snap.memory.as_ref().and_then(|m| m.usage).unwrap_or(0.0) as f32;
+
+        // CPU 环（上）
+        let cy0 = oy + p(RING_V_CY[0]);
+        ring(px, cx, cy0, p(RING_V_R), p(RING_V_STROKE), Some(cpu_v), cc(usage_col(cpu_v)), a);
+        let vt = format!("{:.0}%", cpu_v.round());
+        let vw = font.measure(p(RING_V_VALUE_FS), &vt);
+        font.draw_bold(px, cx - vw / 2.0, cy0 - p(RING_V_VALUE_FS * 0.36), p(RING_V_VALUE_FS), &vt,
+            color(FGC.0, FGC.1, FGC.2, a));
+        let lw = font.measure(p(RING_V_LABEL_FS), "CPU");
+        font.draw(px, cx - lw / 2.0, cy0 + p(RING_V_R - 4.0), p(RING_V_LABEL_FS), "CPU",
+            color(DIMC.0, DIMC.1, DIMC.2, a));
+
+        // 内存环（中）
+        let cy1 = oy + p(RING_V_CY[1]);
+        ring(px, cx, cy1, p(RING_V_R), p(RING_V_STROKE), Some(mem_v), cc(usage_col(mem_v)), a);
+        let vt = format!("{:.0}%", mem_v.round());
+        let vw = font.measure(p(RING_V_VALUE_FS), &vt);
+        font.draw_bold(px, cx - vw / 2.0, cy1 - p(RING_V_VALUE_FS * 0.36), p(RING_V_VALUE_FS), &vt,
+            color(FGC.0, FGC.1, FGC.2, a));
+        let lw = font.measure(p(RING_V_LABEL_FS), "内存");
+        font.draw(px, cx - lw / 2.0, cy1 + p(RING_V_R - 4.0), p(RING_V_LABEL_FS), "内存",
+            color(DIMC.0, DIMC.1, DIMC.2, a));
+
+        // 网络环（下，上下半环）
+        let (nr, nw) = net_io_sum(&snap);
+        let cap = 125_000_000u64;
+        let ul = (nw as f32 / cap as f32 * 100.0).min(100.0);
+        let dl = (nr as f32 / cap as f32 * 100.0).min(100.0);
+        let cy2 = oy + p(RING_V_CY[2]);
+        ring_split(px, cx, cy2, p(RING_V_R), p(RING_V_STROKE), ul, dl, a);
+        let us = fmt::rate_compact(nw);
+        let ds = fmt::rate_compact(nr);
+        let uw = font.measure(p(RING_V_NET_FS), &us);
+        let dw = font.measure(p(RING_V_NET_FS), &ds);
+        font.draw_bold(px, cx - uw / 2.0, cy2 - p(RING_V_NET_FS * 0.85), p(RING_V_NET_FS), &us,
+            color(ORANGEC.0, ORANGEC.1, ORANGEC.2, a));
+        font.draw_bold(px, cx - dw / 2.0, cy2 + p(RING_V_NET_FS * 0.15), p(RING_V_NET_FS), &ds,
+            color(PURPLEC.0, PURPLEC.1, PURPLEC.2, a));
+    }
+
     const PPW: f32 = 320.0;
     const PPH: f32 = 854.0;
     const CARD_Y: [f32; 6] = [38.0, 180.0, 306.0, 432.0, 574.0, 716.0];
@@ -4524,24 +4595,39 @@ mod video_h {
         let total = fc(1);
         let t = frame as f32 / total as f32;
 
-        // 真实产品：右缘距屏幕右边 24px、顶部距工作区上沿 24px；视频里按 2.4× 放大特写
-        const PS2: f32 = 2.4;
-        const RIGHT_M: f32 = 170.0;
-        const TOP_M: f32 = 150.0;
-        let pcx = VW as f32 - RIGHT_M - 138.0 * PS2;
-        let pcy = TOP_M + 16.0 * PS2;
+        // ---------- A 段（t<0.45）：横向药丸胶囊，六项指标 ----------
+        let a_out = 1.0 - clamp01((t - 0.40) / 0.05); // 0.40 起淡出，0.45 消失
+        if a_out > 0.0 {
+            const PS2: f32 = 2.4;
+            const RIGHT_M: f32 = 170.0;
+            const TOP_M: f32 = 150.0;
+            let pcx = VW as f32 - RIGHT_M - 138.0 * PS2;
+            let pcy = TOP_M + 16.0 * PS2;
+            let e = ease_out_back(clamp01(t / 0.30));
+            let sc = 0.45 + 0.55 * e;
+            let cx = pcx + (1.0 - e) * 60.0;
+            let cy = pcy + (1.0 - e) * 14.0;
+            let pa = (clamp01(t / 0.18) * 255.0 * a_out) as u8;
+            draw_pill(&mut px, font, icons, cx, cy, PS2 * sc, frame, pa);
+        }
 
-        let e = ease_out_back(clamp01(t / 0.30));
-        let sc = 0.45 + 0.55 * e;
-        // 放大时轻微向左下锚定（右缘不动，模拟真实向左生长的方向感）
-        let cx = pcx + (1.0 - e) * 60.0;
-        let cy = pcy + (1.0 - e) * 14.0;
-        let pa = (clamp01(t / 0.18) * 255.0) as u8;
-        draw_pill(&mut px, font, icons, cx, cy, PS2 * sc, frame, pa);
+        // ---------- B 段（t>=0.45）：竖排胶囊，竖版三环纵向堆叠 ----------
+        let v_in = clamp01((t - 0.45) / 0.10); // 0.45 起淡入，0.55 到位
+        if v_in > 0.0 {
+            const VS: f32 = 2.2; // 竖排胶囊放大倍数（56×178 → 123×392）
+            let vw = PILL_V_W as f32 * VS;
+            let vh = PILL_V_H as f32 * VS;
+            // 放在画面右侧中部，与横向胶囊同列
+            let vx = VW as f32 - 200.0 - vw;
+            let vy = (VH as f32 - vh) / 2.0;
+            let va = (v_in * 255.0) as u8;
+            draw_rings_v_at(&mut px, font, vx, vy, VS, frame, va);
+        }
 
+        // 标题（全程，A→B 时不淡出）
         let a1 = (ease_out_cubic(clamp01((t - 0.36) / 0.18)) * 255.0) as u8;
         font.draw_bold(&mut px, 150.0, 430.0, 80.0, "悬浮胶囊", color(FGC.0, FGC.1, FGC.2, a1));
-        font.draw(&mut px, 152.0, 512.0, 42.0, "六项关键指标 · 一目了然", color(DIMC.0, DIMC.1, DIMC.2, a1));
+        font.draw(&mut px, 152.0, 512.0, 42.0, "横竖两种形态 · 一目了然", color(DIMC.0, DIMC.1, DIMC.2, a1));
 
         fade_edges(&mut px, frame, total);
         px
@@ -4829,7 +4915,7 @@ mod video_h {
         let (a1, r1) = rise(0.22);
         center_text(&mut px, font, 650.0 - r1, 104.0, "核桃胶囊", mul_a(BLUEC, a1), true);
         let (a2, r2) = rise(0.38);
-        center_text(&mut px, font, 812.0 - r2, 50.0, "飞牛应用中心 · 内测上线", mul_a(FGC, a2), true);
+        center_text(&mut px, font, 812.0 - r2, 50.0, "飞牛应用中心 · 正式上架", mul_a(FGC, a2), true);
 
         fade_edges(&mut px, frame, total);
         px
