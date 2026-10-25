@@ -23,9 +23,11 @@ type AdminDeps struct {
 	Hostname string
 	LogPath  string
 	StateDir string // 持久化网卡选择与手动协商速率（iface / netspeed 文件）
-	IconPath string // 管理页品牌图标（app/ui/images/icon_64.png）
+	// ServicePort 是实际监听的局域网端口（安装时由用户填写，默认 8765）。
+	ServicePort int
+	IconPath    string // 管理页品牌图标（app/ui/images/icon_64.png）
 	// 电脑端安装器信息（随 fpk 一起下发，供管理页下载）
-	SetupPath     string // 安装器文件路径（app/ui/download/hetao-capsule-setup.exe）
+	SetupPath     string // 安装器文件路径（app/ui/download/hetao-capsule-setup-<版本>.exe）
 	ClientVersion string // 安装器版本号
 	ClientSize    int64  // 安装器字节数（0 表示缺失）
 	ClientSHA256  string // 安装器 SHA256 十六进制
@@ -131,7 +133,7 @@ func (a *admin) handleState(w http.ResponseWriter, _ *http.Request) {
 		"ifaces":           a.Col.NetIfaces(),
 		"net_speeds":       a.Col.NetSpeeds(),         // 手动填写的协商速率（网卡名 → Mbps）
 		"speed_effective":  a.Col.NetSpeedEffective(), // 生效网卡的协商速率（0=未知）
-		"service_port":     8765,
+		"service_port":     a.ServicePort,
 		"client_version":   a.ClientVersion,
 		"client_size":      a.ClientSize,
 		"client_sha256":    a.ClientSHA256,
@@ -305,6 +307,7 @@ func (a *admin) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", `attachment; filename="hetao-capsule-setup.exe"`)
-	http.ServeContent(w, r, "hetao-capsule-setup.exe", st.ModTime(), f)
+	name := filepath.Base(a.SetupPath)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	http.ServeContent(w, r, name, st.ModTime(), f)
 }

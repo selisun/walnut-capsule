@@ -3,9 +3,63 @@
 #
 # 注意：磁盘 SMART 温度需要 CAP_SYS_RAWIO（root），与本应用"非 root 上架"要求冲突，
 # 因此本应用不采集磁盘温度（客户端显示 --°C）；CPU 温度经 hwmon 非 root 可读，正常采集。
-# 这里仅确保二进制具备可执行位。
+# 这里确保二进制具备可执行位，并确保 ${TRIM_PKGVAR}/port 里有有效端口。
+# 端口优先级：安装向导字段（install_init 已先行落盘）> 平台 TRIM_SERVICE_PORT > 已有配置 > 8765。
 
 BIN="${TRIM_APPDEST}/hetao-nas"
 chmod 0755 "${BIN}" 2>/dev/null || true
 
-exit 0
+PORT_FILE="${TRIM_PKGVAR}/port"
+
+pick_port() {
+    for name in wizard_service_port service_port WIZARD_SERVICE_PORT; do
+        eval "v=\${$name:-}"
+        [ -n "$v" ] && { printf '%s' "$v"; return; }
+    done
+    # 兜底：任何 wizard_* 形式的变量，取值像端口（1024-65535）就采用。
+    while IFS='=' read -r k v; do
+        case "$k" in wizard_* | WIZARD_*) : ;; *) continue ;; esac
+        case "$v" in '' | *[!0-9]*) continue ;; esac
+        if [ "$v" -ge 1024 ] && [ "$v" -le 65535 ]; then
+            printf '%s' "$v"
+            return
+        fi
+    done <<EOF
+$(env)
+EOF
+    printf '%s' "${TRIM_SERVICE_PORT:-}"
+}
+
+valid_port() {
+    case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]
+}
+
+fail() {
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "$1" > "${TRIM_TEMP_LOGFILE}"
+    fi
+    echo "$1" >&2
+    exit 1
+}
+
+{
+    [ -n "${TRIM_PKGVAR:-}" ] || fail "缺少 TRIM_PKGVAR，无法保存端口配置。"
+    mkdir -p "${TRIM_PKGVAR}"
+
+    PORT="$(pick_port | tr -d '[:space:]')"
+    if valid_port "$PORT"; then
+        printf '%s' "$PORT" > "${PORT_FILE}"
+        exit 0
+    fi
+
+    # 回调阶段拿不到向导值：保留 install_init 写下的结果，避免回退成默认端口。
+    if [ -f "${PORT_FILE}" ] && valid_port "$(tr -d '[:space:]' < "${PORT_FILE}")"; then
+        exit 0
+    fi
+
+    printf '%s' 8765 > "${PORT_FILE}"
+    exit 0
+}

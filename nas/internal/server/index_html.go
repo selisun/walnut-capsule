@@ -39,6 +39,9 @@ header{display:flex;align-items:center;justify-content:space-between;gap:12px;ma
 .card h2 .ic{width:18px;height:18px;color:#1e90ff;flex:none}
 .hint{margin:0 0 12px;color:#6b7280;font-size:13px}
 .hint.small{font-size:12px;margin-top:10px;color:#9ca3af}
+/* 下载提示：未签名 exe 的安全说明 */
+.notice{margin-top:10px;padding:10px 12px;border:1px solid #fde68a;background:#fffbeb;border-radius:10px;color:#92400e;font-size:12px;line-height:1.7}
+.notice b{color:#92400e}
 /* 令牌卡：令牌文本 + 复制 */
 .token-row{display:flex;gap:10px;align-items:center}
 code#token{flex:1;min-width:0;font:15px/1.4 ui-monospace,Consolas,monospace;background:#f6f7f9;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;word-break:break-all;user-select:all}
@@ -83,7 +86,7 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
 </div>
 
 <div class="grid">
-<section class="card">
+<section class="card wide">
 <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>配对令牌</h2>
 <p class="hint">在电脑客户端的设置中填入本令牌，即可连接查看监控数据。</p>
 <div class="token-row">
@@ -105,6 +108,11 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
   <a id="dlBtn" class="btn" href="api/download">下载安装包</a>
 </div>
 <p class="hint small" id="cliSha" style="word-break:break-all"></p>
+<div class="notice" id="cliNotice">
+  <b>下载提示</b>：安装包是未做代码签名的 .exe，浏览器或 Windows 可能提示“此文件不常见”或“已保护你的电脑”。这是未签名的常规提示，并非病毒。<br>
+  核桃胶囊客户端只与局域网内的本台 NAS 通信，不上传任何数据、不监听公网端口，可放心安装。<br>
+  若被拦截：浏览器里点“保留”；Windows 提示里点“更多信息 → 仍要运行”。
+</div>
 </section>
 
 <section class="card">
@@ -133,10 +141,12 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
 <p class="hint small" id="speedNote"></p>
 </section>
 
-<section class="card">
+<section class="card wide">
 <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 6v6c0 5 3.8 8.7 9 10 5.2-1.3 9-5 9-10V6z"/><path d="M12 8v4m0 3h.01"/></svg>安全</h2>
-<p class="hint">重置后旧令牌立即失效，所有客户端需用新令牌重新配对。</p>
-<button id="resetBtn" class="danger">重置令牌</button>
+<div class="row" style="justify-content:space-between">
+  <p class="hint" style="margin:0">重置后旧令牌立即失效，所有客户端需用新令牌重新配对。</p>
+  <button id="resetBtn" class="danger">重置令牌</button>
+</div>
 </section>
 
 <section class="card wide">
@@ -223,6 +233,7 @@ function loadState(){
     } else {
       document.getElementById('cliSize').textContent = '安装包未随本应用提供';
       document.getElementById('dlBtn').style.display = 'none';
+      document.getElementById('cliNotice').style.display = 'none';
     }
   }).catch(function(){ toast('加载状态失败'); });
 }
