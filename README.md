@@ -4,7 +4,7 @@
   <p>
     <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
     <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20fnOS-lightgrey">
-    <img alt="version" src="https://img.shields.io/badge/version-0.1.13-green">
+    <img alt="version" src="https://img.shields.io/badge/version-0.1.71-green">
   </p>
 </div>
 
@@ -33,28 +33,33 @@
 - 亚克力磨砂背景 + 窗口圆角，动效曲线对齐 Fluent（展开 300ms / 收起 220ms）
 - 系统托盘、开机自启（可选）、窗口与 exe 图标
 - 断线自动重连，状态灯实时反映连接状况（绿=已连接 / 蓝=连接中 / 橙=重连 / 红=令牌错误）
+- 点击面板外自动收起；设置里可开关面板卡片、调整显示顺序
+- 竖排模式：拖到屏幕左右边缘自动变竖条（56×178）
+- 全屏应用自动隐藏：看视频、玩游戏时自动收起，退出全屏后恢复（默认开启）
 
 **NAS 采集服务**
 
-- CPU 使用率、温度与平均负载（1/5/15 分钟）、内存、GPU（如有）、物理盘速率/电源状态/温度、卷与底层物理盘、网卡速率
+- CPU 使用率、温度与平均负载（1/5/15/30 分钟）、内存、GPU（独显优先，无独显时回退核显）、物理盘速率/电源状态/温度、卷与底层物理盘、网卡速率
 - WebSocket 实时推送 + HTTP `/metrics`，全部接口需配对令牌鉴权
 - 内置管理页：复制配对令牌、选择监控网卡、查看运行日志、下载 Windows 客户端、查看应用自身 CPU/内存占用
 - 管理页只挂在飞牛统一网关的 unix socket 上（复用平台登录态），不在局域网端口暴露
+- 管理类接口校验管理员身份；请求体限长，日志只读末尾并自动轮转
 - 局域网监听端口在**安装时由用户填写**（默认 `8765`），端口被占用时可改；管理页会显示实际端口
 - **绝不主动唤醒休眠硬盘**：只用 `hdparm -C` 查电源状态，SMART 前加 `smartctl -n standby` 双保险，间隔 ≥30 分钟
 
 ## 下载
 
-从 [Releases](../../releases) 获取：
+从 [Releases](../../releases) 获取应用包：
 
 | 文件 | 用途 |
 |---|---|
-| `hetaocapsule-0.1.13.fpk` | 飞牛 fnOS 应用包，在应用中心「手动安装」上传 |
-| `hetao-capsule-setup-0.1.13.exe` | Windows 电脑客户端安装程序（免管理员，单文件，无运行库依赖） |
+| `hetaocapsule_0.1.71.fpk` | 飞牛 fnOS 应用包（x86），在应用中心「手动安装」上传 |
+
+Windows 电脑客户端安装器（`hetao-capsule-setup-0.1.60.exe`）已内置在应用包中：装好应用后打开管理页，在「电脑客户端」处下载即可。
 
 ## 安装与使用
 
-1. 在飞牛应用中心安装 `hetaocapsule-*.fpk`，安装向导里填写**局域网监听端口**（默认 `8765`，被占用时改一个），装好后桌面会出现「核桃胶囊」图标
+1. 在飞牛应用中心安装 `hetaocapsule_*.fpk`，安装向导里填写**局域网监听端口**（默认 `8765`，被占用时改一个），装好后桌面会出现「核桃胶囊」图标
 2. 打开管理页，复制**配对令牌**（页面顶部同时显示实际监听端口）
 3. 运行 Windows 客户端安装程序，填入 NAS 的 IP / 端口（安装时填写的端口，默认 `8765`）与配对令牌，点「测试连接」
 4. 连接成功后胶囊浮在屏幕右上角；单击展开、按住拖动、右键（托盘）进入设置
@@ -110,6 +115,10 @@ go build -trimpath -ldflags "-s -w" -o ../hetaocapsule/app/hetao-nas .
 # fpk 必须在 NAS 上用官方 fnpack 打包（勿手工 tar.gz，会缺 checksum 字段）
 fnpack build -d /tmp/hetaocapsule
 ```
+
+## 更新记录
+
+各版本变更见 [Releases](../../releases)。
 
 ## 许可
 
