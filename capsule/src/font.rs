@@ -51,7 +51,14 @@ struct GlyphBmp {
 
 impl GlyphBmp {
     fn empty(advance: f32) -> Self {
-        Self { w: 0, h: 0, left: 0.0, top: 0.0, advance, cov: Vec::new() }
+        Self {
+            w: 0,
+            h: 0,
+            left: 0.0,
+            top: 0.0,
+            advance,
+            cov: Vec::new(),
+        }
     }
 }
 
@@ -102,7 +109,11 @@ impl Font {
             None => {
                 let mut lf = LOGFONTW::default();
                 lf.lfHeight = -h; // 负值 = 字符高度（不含内部行距）
-                lf.lfWeight = if bold { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 };
+                lf.lfWeight = if bold {
+                    FW_BOLD.0 as i32
+                } else {
+                    FW_NORMAL.0 as i32
+                };
                 lf.lfCharSet = DEFAULT_CHARSET;
                 lf.lfOutPrecision = OUT_TT_PRECIS;
                 lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
@@ -132,7 +143,11 @@ impl Font {
         self.select(size, false);
         let mut tm = TEXTMETRICW::default();
         let ok = unsafe { GetTextMetricsW(self.dc, &mut tm) };
-        let v = if ok.as_bool() { tm.tmAscent as f32 } else { size * 0.76 };
+        let v = if ok.as_bool() {
+            tm.tmAscent as f32
+        } else {
+            size * 0.76
+        };
         self.ascents.borrow_mut().insert(key, v);
         v
     }
@@ -173,7 +188,11 @@ impl Font {
         for c in text.chars() {
             let ch = c as u32;
             self.ensure(size, bold, ch);
-            let key = GlyphKey { ch, size_bits: size.to_bits(), bold };
+            let key = GlyphKey {
+                ch,
+                size_bits: size.to_bits(),
+                bold,
+            };
             if let Some(b) = self.cache.borrow().get(&key) {
                 w += b.advance;
             }
@@ -182,22 +201,51 @@ impl Font {
     }
 
     /// 在 (x, baseline) 处绘制文本，返回末端的 x。
-    pub fn draw(&self, px: &mut Pixmap, x: f32, baseline: f32, size: f32, text: &str, color: Color) -> f32 {
+    pub fn draw(
+        &self,
+        px: &mut Pixmap,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        text: &str,
+        color: Color,
+    ) -> f32 {
         self.draw_impl(px, x, baseline, size, text, color, false)
     }
 
     /// 粗体文本绘制（无粗体字体时回退常规字形）。
-    pub fn draw_bold(&self, px: &mut Pixmap, x: f32, baseline: f32, size: f32, text: &str, color: Color) -> f32 {
+    pub fn draw_bold(
+        &self,
+        px: &mut Pixmap,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        text: &str,
+        color: Color,
+    ) -> f32 {
         self.draw_impl(px, x, baseline, size, text, color, true)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_impl(&self, px: &mut Pixmap, x: f32, baseline: f32, size: f32, text: &str, color: Color, bold: bool) -> f32 {
+    fn draw_impl(
+        &self,
+        px: &mut Pixmap,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        text: &str,
+        color: Color,
+        bold: bool,
+    ) -> f32 {
         let mut caret = x;
         for c in text.chars() {
             let ch = c as u32;
             self.ensure(size, bold, ch);
-            let key = GlyphKey { ch, size_bits: size.to_bits(), bold };
+            let key = GlyphKey {
+                ch,
+                size_bits: size.to_bits(),
+                bold,
+            };
             let cache = self.cache.borrow();
             let Some(bmp) = cache.get(&key) else { continue };
             blit_glyph(px, caret, baseline, bmp, color);
@@ -208,7 +256,11 @@ impl Font {
 
     /// 缓存缺失时补一次 GDI 光栅化。
     fn ensure(&self, size: f32, bold: bool, ch: u32) {
-        let key = GlyphKey { ch, size_bits: size.to_bits(), bold };
+        let key = GlyphKey {
+            ch,
+            size_bits: size.to_bits(),
+            bold,
+        };
         if self.cache.borrow().contains_key(&key) {
             return;
         }
@@ -222,7 +274,12 @@ impl Font {
         // MAT2 单位矩阵（FIXED 是 16.16：整数部分在 value）
         let one = FIXED { fract: 0, value: 1 };
         let zero = FIXED { fract: 0, value: 0 };
-        let mat = MAT2 { eM11: one, eM12: zero, eM21: zero, eM22: one };
+        let mat = MAT2 {
+            eM11: one,
+            eM12: zero,
+            eM21: zero,
+            eM22: one,
+        };
 
         // 第一次调用只取度量（cbBuffer=0）
         let mut gm = GLYPHMETRICS::default();
@@ -230,7 +287,11 @@ impl Font {
         let advance = gm.gmCellIncX as f32;
         if n == 0 || n == u32::MAX {
             // 0 = 无位图（空格）；GDI_ERROR = 该字体没有这个字形 → 用 extent 兜一个推进宽度
-            return GlyphBmp::empty(if n == u32::MAX { self.fallback_advance(ch, size) } else { advance });
+            return GlyphBmp::empty(if n == u32::MAX {
+                self.fallback_advance(ch, size)
+            } else {
+                advance
+            });
         }
 
         let mut buf = vec![0u8; n as usize];

@@ -12,7 +12,13 @@ pub trait View {
     /// `vis` 为本帧可视区域尺寸（可能小于像素缓冲的实际尺寸）。
     /// 传入的 Frame 是锁外快照，渲染全程不与数据源线程争锁。
     /// 返回 false 表示本帧画面无变化、调用方应跳过本次上屏提交。
-    fn render(&mut self, px: &mut Pixmap, frame: &Frame, font: Option<&Font>, vis: (u32, u32)) -> bool;
+    fn render(
+        &mut self,
+        px: &mut Pixmap,
+        frame: &Frame,
+        font: Option<&Font>,
+        vis: (u32, u32),
+    ) -> bool;
     /// 是否处于展开视觉态（含展开动画过程中）。
     fn expanded(&self) -> bool;
     /// 立即跳到目标展开态（不做尺寸动画）。固定在任务栏时面板使用（三环常驻任务栏，面板不做形变）。
@@ -25,6 +31,9 @@ pub trait View {
     fn frame_size(&self, frame: &Frame) -> (u32, u32);
     /// 展开动画过程中的“可见面板高度”，供固定态的磨砂背景层跟随。
     fn visible_panel_h(&self, frame: &Frame) -> u32;
+    /// 超大卡片的目标几何（宽、高、是否贴屏幕左侧）。由 app 按工作区算好后下发；
+    /// 非超大卡片形态传 (0, 0, false) 即可。默认实现无此行为。
+    fn set_big_geometry(&mut self, _w: u32, _h: u32, _left: bool) {}
     /// 像素缓冲/DIB 的分配尺寸：展开动画期间一次性按全展开尺寸分配，
     /// 避免动画每帧重建像素缓冲与 GDI DIB；收起后回到小尺寸。
     fn buffer_size(&self, frame: &Frame) -> (u32, u32);
@@ -41,6 +50,14 @@ pub trait View {
     }
     /// 固定在任务栏时的鼠标悬停态（药丸底悬停高亮）。返回 true 表示状态已变化。默认形态无此行为。
     fn set_hovered(&mut self, _on: bool) -> bool {
+        false
+    }
+    /// 展开态柱状图悬停命中：返回柱子下标。默认形态无柱状图。
+    fn hit_bar(&self, _x: i32, _y: i32) -> Option<usize> {
+        None
+    }
+    /// 设置柱状图悬停柱子。返回 true 表示状态已变化、需要重绘。默认形态无此行为。
+    fn set_hover_bar(&mut self, _v: Option<usize>) -> bool {
         false
     }
 }

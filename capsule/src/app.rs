@@ -16,30 +16,40 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::c_void;
 use std::ptr::null_mut;
-use std::sync::mpsc::channel;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc::channel;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 #[allow(dead_code)]
 fn dbg_log(s: &str) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let _ = OpenOptions::new().create(true).append(true).open("C:/Users/nmche/AppData/Local/Temp/htc_debug.log")
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:/Users/nmche/AppData/Local/Temp/htc_debug.log")
         .and_then(|mut f| writeln!(f, "{}.{:03} {}", t.as_secs() % 10000, t.subsec_millis(), s));
 }
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Dwm::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::Networking::WinSock::{WSAStartup, WSADATA};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// 鼠标离开窗口（部分 feature 组合下该常量不导出，这里直接给出值）。
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 fn pcwstr(s: &str) -> PCWSTR {
     let v: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
@@ -64,7 +74,12 @@ fn static_pcwstr(s: &'static str) -> PCWSTR {
         .lock()
         .unwrap();
     let v = g.entry(s).or_insert_with(|| {
-        Box::leak(s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>().into_boxed_slice())
+        Box::leak(
+            s.encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<u16>>()
+                .into_boxed_slice(),
+        )
     });
     PCWSTR(v.as_ptr())
 }
@@ -155,12 +170,10 @@ pub fn run(config: Config) {
     // winsock 首次初始化必须在建窗口之前于本线程同步完成：
     // WSAStartup 会加载 mswsock 并枚举协议目录，若与窗口首显（GDI/IME/TSF/DWM
     // 等系统组件首次初始化）并发，实测会触发系统侧约 68MB 的异常内存提交；
-    // 串行预热后该问题消失。fake 源不用网络，不初始化。
-    if config.nas.source != "fake" {
-        unsafe {
-            let mut wsa: WSADATA = std::mem::zeroed();
-            let _ = WSAStartup(0x0202, &mut wsa);
-        }
+    // 串行预热后该问题消失。
+    unsafe {
+        let mut wsa: WSADATA = std::mem::zeroed();
+        let _ = WSAStartup(0x0202, &mut wsa);
     }
 
     let instance = unsafe { GetModuleHandleW(None).unwrap_or_default() };
@@ -174,7 +187,9 @@ pub fn run(config: Config) {
         hbrBackground: HBRUSH(null_mut()),
         ..Default::default()
     };
-    unsafe { let _ = RegisterClassW(&wc); }
+    unsafe {
+        let _ = RegisterClassW(&wc);
+    }
 
     // 任务栏内三环子窗口使用独立的窗口类（不同 wndproc）。
     let wc_rings = WNDCLASSW {
@@ -185,15 +200,24 @@ pub fn run(config: Config) {
         hbrBackground: HBRUSH(null_mut()),
         ..Default::default()
     };
-    unsafe { let _ = RegisterClassW(&wc_rings); }
+    unsafe {
+        let _ = RegisterClassW(&wc_rings);
+    }
 
     let shared = Arc::new(RwLock::new(SharedState::default()));
     {
         // 启动即把卡片开关同步给渲染侧（UI 线程与面板构建线程共用这一份）
-        let mut sh = shared.write().unwrap();
+        let mut sh = match shared.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[App] RwLock poisoned during init: {:?}", e);
+                return;
+            }
+        };
         sh.nas_host = config.nas.host.clone();
         sh.dark = config.capsule.theme_dark();
         sh.cards = config.capsule.cards;
+        sh.big = config.capsule.expand_big();
     }
     let (cmd_tx, cmd_rx) = channel::<SourceCmd>();
 
@@ -205,9 +229,9 @@ pub fn run(config: Config) {
 
     tray_init(hwnd, app_icons().1);
 
-    let view = Box::new(CapsuleView::new(Arc::new(std::sync::atomic::AtomicIsize::new(
-        hwnd.0 as isize,
-    ))));
+    let view = Box::new(CapsuleView::new(Arc::new(
+        std::sync::atomic::AtomicIsize::new(hwnd.0 as isize),
+    )));
     let font = Font::load();
     // 预热界面用字字形缓存（启动期一次性冷光栅化，避免展开首帧毫秒级尖峰）
     if let Some(f) = &font {
@@ -215,7 +239,6 @@ pub fn run(config: Config) {
     }
     let addr = config.nas.addr();
     let token = config.nas.token.clone();
-    let source_kind = config.nas.source.clone();
 
     let state = AppState {
         hwnd,
@@ -235,6 +258,7 @@ pub fn run(config: Config) {
         config,
         settings_hwnd: HWND(null_mut()),
         settings_orig: None,
+        settings_card_order: crate::config::DEFAULT_CARD_ORDER,
         settings_font: HFONT(null_mut()),
         last_seq: 0,
         pin_anchor: None,
@@ -253,12 +277,15 @@ pub fn run(config: Config) {
     };
 
     let raw = Box::into_raw(Box::new(state));
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize); }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
+    }
 
     // 首次运行或配置不完整：自动打开设置窗，避免用户看到空白胶囊不知所措。
-    // fake 模式用于演示，不弹窗。
-    if source_kind != "fake" && unsafe { (*raw).config.nas.needs_setup() } {
-        unsafe { open_settings(&mut *raw, SettingsAnchor::Panel); }
+    if unsafe { (*raw).config.nas.needs_setup() } {
+        unsafe {
+            open_settings(&mut *raw, SettingsAnchor::Panel);
+        }
     }
 
     unsafe {
@@ -283,22 +310,13 @@ pub fn run(config: Config) {
     // 数据源在窗口首帧完成后再启动：配合入口处的 WSAStartup 串行预热，
     // 双重保证 winsock 首次连接不与窗口/合成器初始化并发（否则系统侧会
     // 出现约 68MB 的异常内存提交，实测概率性触发）。
-    let source_handle = match source_kind.as_str() {
-        "fake" => FakeSource.spawn(SourceCtx {
-            hwnd: hwnd.0 as isize,
-            state: shared.clone(),
-            cmd_rx,
-            target: addr,
-            token,
-        }),
-        _ => WsSource.spawn(SourceCtx {
-            hwnd: hwnd.0 as isize,
-            state: shared.clone(),
-            cmd_rx,
-            target: addr,
-            token,
-        }),
-    };
+    let source_handle = WsSource.spawn(SourceCtx {
+        hwnd: hwnd.0 as isize,
+        state: shared.clone(),
+        cmd_rx,
+        target: addr,
+        token,
+    });
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.into() {
@@ -335,6 +353,8 @@ struct AppState {
     settings_hwnd: HWND,
     /// 设置窗打开时的 (主题, 透明度) 快照：即时预览靠它"取消/关窗"时还原
     settings_orig: Option<(String, f32)>,
+    /// 设置窗里卡片的勾选顺序（勾一张挪到末尾），点"确定"才写进配置
+    settings_card_order: [u8; crate::config::CARD_COUNT],
     /// 设置窗子控件用的系统 UI 字体（窗口销毁时释放）
     settings_font: HFONT,
     last_seq: u64,
@@ -449,7 +469,12 @@ fn acrylic_class_name() -> PCWSTR {
 }
 
 /// 亚克力窗口的窗口过程（简化版：仅处理基本消息）。
-unsafe extern "system" fn acrylic_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn acrylic_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
@@ -472,7 +497,7 @@ fn acrylic_ensure(state: &mut AppState) -> bool {
         return true;
     }
     let instance = unsafe { GetModuleHandleW(None).unwrap_or_default() };
-    
+
     // 注册亚克力窗口类（首次调用时）
     static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     REGISTERED.get_or_init(|| {
@@ -484,7 +509,9 @@ fn acrylic_ensure(state: &mut AppState) -> bool {
             hbrBackground: HBRUSH(null_mut()),
             ..Default::default()
         };
-        unsafe { let _ = RegisterClassW(&wc); }
+        unsafe {
+            let _ = RegisterClassW(&wc);
+        }
         true
     });
 
@@ -511,31 +538,31 @@ fn acrylic_ensure(state: &mut AppState) -> bool {
             return false;
         }
     };
-    
+
     if hwnd.is_invalid() {
         dbg_log("acrylic: create returned null");
         return false;
     }
 
     // 设置 DWM 系统磨砂背景（亚克力效果）
-        unsafe {
-            let backdrop_type = 3i32; // DWMSBT_TRANSIENTWINDOW (亚克力)
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &backdrop_type as *const i32 as *const c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
+    unsafe {
+        let backdrop_type = 3i32; // DWMSBT_TRANSIENTWINDOW (亚克力)
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop_type as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
 
-            // 设置圆角裁剪
-            let corner_pref = 2i32; // DWMWCP_ROUND (圆角)
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWINDOWATTRIBUTE(33), // DWMWA_WINDOW_CORNER_PREFERENCE
-                &corner_pref as *const i32 as *const c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-        }
+        // 设置圆角裁剪
+        let corner_pref = 2i32; // DWMWCP_ROUND (圆角)
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(33), // DWMWA_WINDOW_CORNER_PREFERENCE
+            &corner_pref as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
 
     let win = AcrylicWin::new(hwnd);
     state.acrylic = Some(win);
@@ -557,21 +584,16 @@ fn acrylic_destroy(state: &mut AppState) {
 fn acrylic_place(state: &mut AppState, ax: i32, ay: i32, aw: i32, ah: i32) {
     if let Some(a) = state.acrylic.as_ref() {
         let mut rc = RECT::default();
-        unsafe { let _ = GetWindowRect(a.hwnd, &mut rc); }
-        if rc.left == ax && rc.top == ay && (rc.right - rc.left) == aw && (rc.bottom - rc.top) == ah {
+        unsafe {
+            let _ = GetWindowRect(a.hwnd, &mut rc);
+        }
+        if rc.left == ax && rc.top == ay && (rc.right - rc.left) == aw && (rc.bottom - rc.top) == ah
+        {
             return;
         }
         unsafe {
             // 亚克力窗口在三环/面板之下，Z-order 低于 HWND_TOPMOST
-            let _ = SetWindowPos(
-                a.hwnd,
-                HWND_NOTOPMOST,
-                ax,
-                ay,
-                aw,
-                ah,
-                SWP_NOACTIVATE,
-            );
+            let _ = SetWindowPos(a.hwnd, HWND_NOTOPMOST, ax, ay, aw, ah, SWP_NOACTIVATE);
         }
     }
 }
@@ -597,7 +619,9 @@ fn rings_ensure(state: &mut AppState) -> bool {
     if state.rings.is_some() {
         return true;
     }
-    let Some(tb) = shell_tray_wnd() else { return false };
+    let Some(tb) = shell_tray_wnd() else {
+        return false;
+    };
     let instance = unsafe { GetModuleHandleW(None).unwrap_or_default() };
     // 三环窗口建成任务栏的“从属窗口”（owner = Shell_TrayWnd）：
     // 顶层分层窗口（UpdateLayeredWindow 上屏可用），归属任务栏后始终压在其上、
@@ -633,12 +657,14 @@ fn rings_ensure(state: &mut AppState) -> bool {
         SetWindowLongPtrW(hwnd, GWL_HWNDPARENT, tb.0 as isize);
     }
     let win = RingsWin::new(hwnd);
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as *mut AppState as isize); }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as *mut AppState as isize);
+    }
     state.rings = Some(win);
-    
+
     // 同步创建亚克力磨砂背景窗口（底层）
     acrylic_ensure(state);
-    
+
     true
 }
 
@@ -646,7 +672,7 @@ fn rings_ensure(state: &mut AppState) -> bool {
 fn rings_destroy(state: &mut AppState) {
     // 先销毁亚克力背景窗口
     acrylic_destroy(state);
-    
+
     if let Some(mut r) = state.rings.take() {
         r.release();
         unsafe {
@@ -660,7 +686,9 @@ fn rings_destroy(state: &mut AppState) {
 fn rings_place(state: &mut AppState, ax: i32, ay: i32) {
     if let Some(r) = state.rings.as_mut() {
         let mut rc = RECT::default();
-        unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+        unsafe {
+            let _ = GetWindowRect(r.hwnd, &mut rc);
+        }
         let visible = unsafe { IsWindowVisible(r.hwnd) }.as_bool();
         if visible && rc.left == ax && rc.top == ay {
             return;
@@ -681,13 +709,27 @@ fn rings_place(state: &mut AppState, ax: i32, ay: i32) {
 
 /// 渲染并上屏三环子窗口。
 fn rings_paint(state: &mut AppState, force: bool) {
-    let Some(r) = state.rings.as_mut() else { return };
-    let seq = state.shared.read().unwrap().seq();
+    let Some(r) = state.rings.as_mut() else {
+        return;
+    };
+    let seq = match state.shared.read() {
+        Ok(g) => g.seq(),
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in rings_paint seq check: {:?}", e);
+            return;
+        }
+    };
     if !force && seq == r.last_seq {
         return;
     }
     r.last_seq = seq;
-    let frame_data = state.shared.read().unwrap().grab();
+    let frame_data = match state.shared.read() {
+        Ok(g) => g.grab(),
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in rings_paint grab: {:?}", e);
+            return;
+        }
+    };
     let frame = frame_data.as_frame();
     let (w, h) = (capsule_view::RINGS_W, capsule_view::RINGS_H);
     // 整块铺一层 alpha=1 的近乎透明底：分层窗口只有 alpha>0 的像素才响应鼠标，
@@ -733,10 +775,16 @@ fn ring_anchor_y() -> i32 {
 /// 三环窗口拖动跟手：在整个任务栏范围内移动（不再限制在扫描出的空段里）。
 fn rings_drag_move(state: &mut AppState) {
     let Some(tr) = taskbar_rect() else { return };
-    let Some((x0, x1)) = taskbar_span(&tr) else { return };
-    let Some(grab) = state.rings.as_ref().map(|r| r.drag_grab) else { return };
+    let Some((x0, x1)) = taskbar_span(&tr) else {
+        return;
+    };
+    let Some(grab) = state.rings.as_ref().map(|r| r.drag_grab) else {
+        return;
+    };
     let mut pt = POINT::default();
-    unsafe { let _ = GetCursorPos(&mut pt); }
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
     let ax = pin_fit(x0, x1, Some(pt.x - grab));
     state.pin_anchor = Some((ax, ring_anchor_y(), true));
     rings_place(state, ax, ring_anchor_y());
@@ -745,10 +793,16 @@ fn rings_drag_move(state: &mut AppState) {
 /// 三环窗口拖动松手：记住选定位置。
 fn rings_drag_commit(state: &mut AppState) {
     let Some(tr) = taskbar_rect() else { return };
-    let Some((x0, x1)) = taskbar_span(&tr) else { return };
-    let Some(r) = state.rings.as_ref() else { return };
+    let Some((x0, x1)) = taskbar_span(&tr) else {
+        return;
+    };
+    let Some(r) = state.rings.as_ref() else {
+        return;
+    };
     let mut wr = RECT::default();
-    unsafe { let _ = GetWindowRect(r.hwnd, &mut wr); }
+    unsafe {
+        let _ = GetWindowRect(r.hwnd, &mut wr);
+    }
     let ax = pin_fit(x0, x1, Some(wr.left));
     state.config.capsule.taskbar_x = Some(ax);
     let _ = crate::config::save(&state.config);
@@ -757,7 +811,12 @@ fn rings_drag_commit(state: &mut AppState) {
 }
 
 /// 任务栏内三环子窗口的消息处理：点击展开/收起面板，拖动在任务栏内换位。
-unsafe extern "system" fn rings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn rings_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if ptr == 0 {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -784,14 +843,18 @@ unsafe extern "system" fn rings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 r.drag_grab = pt.x - wr.left;
                 r.expanded_at_press = expanded_now;
             }
-            unsafe { let _ = SetCapture(hwnd); }
+            unsafe {
+                let _ = SetCapture(hwnd);
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             let moved = match state.rings.as_mut() {
                 Some(r) if r.dragging => {
                     let mut pt = POINT::default();
-                    unsafe { let _ = GetCursorPos(&mut pt); }
+                    unsafe {
+                        let _ = GetCursorPos(&mut pt);
+                    }
                     if (pt.x - r.drag_origin.0).abs() >= 4 || (pt.y - r.drag_origin.1).abs() >= 4 {
                         r.drag_moved = true;
                     }
@@ -815,7 +878,9 @@ unsafe extern "system" fn rings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 }
                 None => (false, false, false),
             };
-            unsafe { let _ = ReleaseCapture(); }
+            unsafe {
+                let _ = ReleaseCapture();
+            }
             if dragging {
                 if moved {
                     rings_drag_commit(state);
@@ -843,8 +908,10 @@ fn create_window(instance: HMODULE, size: (u32, u32)) -> HWND {
             class_name(),
             window_title(),
             style,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            size.0 as i32, size.1 as i32,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            size.0 as i32,
+            size.1 as i32,
             None,
             None,
             instance,
@@ -897,10 +964,9 @@ fn default_capsule_pos(w: i32, vertical: bool) -> (i32, i32) {
     if vertical {
         (rc.right - w, rc.top + caption + MARGIN)
     } else {
-        let buttons_w = (unsafe {
-            GetSystemMetrics(SM_CXSIZE) * 3 + GetSystemMetrics(SM_CXPADDEDBORDER) * 2
-        })
-        .max(150);
+        let buttons_w =
+            (unsafe { GetSystemMetrics(SM_CXSIZE) * 3 + GetSystemMetrics(SM_CXPADDEDBORDER) * 2 })
+                .max(150);
         ((rc.right - buttons_w - w - MARGIN).max(rc.left), rc.top)
     }
 }
@@ -915,7 +981,9 @@ fn desired_layout(state: &AppState, from_pos: bool) -> (bool, bool) {
         return (false, false);
     }
     let mut rc = RECT::default();
-    unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
+    unsafe {
+        let _ = GetWindowRect(state.hwnd, &mut rc);
+    }
     let wa = monitor_work_area(unsafe { MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST) });
     if let Some(v) = state.config.capsule.orientation_hint() {
         // 竖排：贴右缘时面板在左（窗口右缘固定），贴左缘时面板在右
@@ -923,10 +991,21 @@ fn desired_layout(state: &AppState, from_pos: bool) -> (bool, bool) {
         return (v, v && panel_left);
     }
     if from_pos {
-        if rc.left <= wa.left + SNAP_PX {
+        // 展开态（尤其超大卡片贴边）窗口矩形是面板尺寸，直接拿它判「贴边」会把横排
+        // 误判成竖排（收起后胶囊变成顶部竖三环）；此时改用配置里记录的收起态落点判断。
+        let (left, right) = if state.view.expanded() {
+            let w = CapsuleView::pill_width() as i32;
+            match state.config.capsule.x {
+                Some(x) => (x, x + w),
+                None => (rc.left, rc.right),
+            }
+        } else {
+            (rc.left, rc.right)
+        };
+        if left <= wa.left + SNAP_PX {
             return (true, false);
         }
-        if rc.right >= wa.right - SNAP_PX {
+        if right >= wa.right - SNAP_PX {
             return (true, true);
         }
     }
@@ -937,7 +1016,13 @@ fn desired_layout(state: &AppState, from_pos: bool) -> (bool, bool) {
 fn apply_layout(state: &mut AppState, from_pos: bool) {
     let (vertical, panel_left) = desired_layout(state, from_pos);
     let changed = {
-        let mut sh = state.shared.write().unwrap();
+        let mut sh = match state.shared.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[App] RwLock poisoned in apply_layout: {:?}", e);
+                return;
+            }
+        };
         if sh.vertical == vertical && sh.panel_left == panel_left {
             false
         } else {
@@ -970,7 +1055,15 @@ fn set_initial_pos(hwnd: HWND, config: &Config) {
         y = dy;
     }
     unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -1018,12 +1111,16 @@ fn rebuild_after_shell_restart(state: &mut AppState) {
     // 所以不能靠 IsWindow 判断存活，一律重建并绑到新任务栏。
     let old_pos = state.rings.as_ref().map(|r| {
         let mut rc = RECT::default();
-        unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+        unsafe {
+            let _ = GetWindowRect(r.hwnd, &mut rc);
+        }
         (rc.left, rc.top)
     });
     if let Some(mut r) = state.rings.take() {
         r.release();
-        unsafe { let _ = DestroyWindow(r.hwnd); }
+        unsafe {
+            let _ = DestroyWindow(r.hwnd);
+        }
     }
     // 位置与任务栏扫描缓存一并清空，交给 sync_taskbar_state 重新选位
     state.pin_anchor = None;
@@ -1056,7 +1153,9 @@ fn tray_remove(hwnd: HWND) {
         uID: 1,
         ..Default::default()
     };
-    unsafe { let _ = Shell_NotifyIconW(NIM_DELETE, &nid); }
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
 }
 
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -1114,14 +1213,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // 固定到任务栏：收起动画结束后面板直接消失，收起态由任务栏内三环窗口承担
                 if state.config.capsule.taskbar_pin && !state.view.expanded() {
-                    unsafe { let _ = ShowWindow(state.hwnd, SW_HIDE); }
+                    unsafe {
+                        let _ = ShowWindow(state.hwnd, SW_HIDE);
+                    }
                     acrylic_show(state, false);
                 } else if !state.view.expanded() {
                     // 收起完成：回到配置里记的收起态落点。展开时若为让长面板进屏而临时上移，
                     // 这个位移不该被带进收起态（竖排 838 高的面板在矮屏上会触发）。
                     if let (Some(cx), Some(cy)) = (state.config.capsule.x, state.config.capsule.y) {
                         let mut rc = RECT::default();
-                        unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
+                        unsafe {
+                            let _ = GetWindowRect(state.hwnd, &mut rc);
+                        }
                         if rc.left != cx || rc.top != cy {
                             unsafe {
                                 let _ = SetWindowPos(
@@ -1145,7 +1248,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if state.config.capsule.taskbar_pin {
                 sync_taskbar_state(state);
             } else {
-                unsafe { let _ = KillTimer(hwnd, IDT_PIN); }
+                unsafe {
+                    let _ = KillTimer(hwnd, IDT_PIN);
+                }
             }
             LRESULT(0)
         }
@@ -1166,6 +1271,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // 大卡网络柱图悬停：柱子下标变化时重绘一次（不是每帧）
+            if state.view.expanded() {
+                let hx = lparam.0 as i16 as i32;
+                let hy = (lparam.0 >> 16) as i16 as i32;
+                if state.view.set_hover_bar(state.view.hit_bar(hx, hy)) {
+                    paint_frame(state, true);
+                }
+                // 登记离开通知，鼠标移出窗口时收到 WM_MOUSELEAVE
+                unsafe {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
             // 固定到任务栏时主窗口只作展开面板显示，不参与拖动（收起态由任务栏内三环窗口拖动换位）
             if state.config.capsule.taskbar_pin {
                 return LRESULT(0);
@@ -1173,7 +1296,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if state.dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
-                if (pt.x - state.drag_origin.0).abs() >= 4 || (pt.y - state.drag_origin.1).abs() >= 4 {
+                if (pt.x - state.drag_origin.0).abs() >= 4
+                    || (pt.y - state.drag_origin.1).abs() >= 4
+                {
                     state.drag_moved = true;
                 }
                 // 未固定：自由拖动
@@ -1185,7 +1310,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut nx = rc.left + (x - state.drag_start.0);
                 let mut ny = rc.top + (y - state.drag_start.1);
                 snap_to_work_area(hwnd, w, h, &mut nx, &mut ny);
-                let _ = SetWindowPos(hwnd, None, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    nx,
+                    ny,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            // 鼠标离开窗口：清掉柱图悬停高亮
+            if state.view.set_hover_bar(None) {
+                paint_frame(state, true);
             }
             LRESULT(0)
         }
@@ -1199,7 +1339,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // 展开态点中顶栏设置齿轮 → 打开设置窗口，不收起胶囊
                     if state.view.hit_settings(x, y) {
                         open_settings(state, SettingsAnchor::Panel);
-                    } else {
+                    } else if !state.view.expanded() || click_on_capsule_bar(state, x, y) {
+                        // 收起态点胶囊 → 展开；展开态只有点到胶囊条（竖条 / 顶栏）才收起。
+                        // 点在面板正文（大卡尤甚）不做任何事，收起只交给「点面板外」钩子，
+                        // 否则齿轮命中稍有偏差就会把面板关掉。
                         toggle_expand(state);
                     }
                 } else if !state.config.capsule.taskbar_pin && !state.view.expanded() {
@@ -1228,7 +1371,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 固定到任务栏时，鼠标移向任务栏/三环也会让面板失焦——此时不能收起，
                 // 否则用户还没点到三环面板就没了（点三环收起也因此失效）。
                 let over_own = cursor_over_main(state)
-                    || state.rings.as_ref().is_some_and(|r| cursor_over_window(r.hwnd));
+                    || state
+                        .rings
+                        .as_ref()
+                        .is_some_and(|r| cursor_over_window(r.hwnd));
                 if !over_own {
                     collapse(state);
                 }
@@ -1245,7 +1391,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 && state.settings_hwnd.0.is_null()
             {
                 let over_own = cursor_over_main(state)
-                    || state.rings.as_ref().is_some_and(|r| cursor_over_window(r.hwnd));
+                    || state
+                        .rings
+                        .as_ref()
+                        .is_some_and(|r| cursor_over_window(r.hwnd));
                 if !over_own {
                     collapse(state);
                 }
@@ -1288,10 +1437,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = state.cmd_tx.send(SourceCmd::Shutdown);
             tray_remove(state.hwnd);
             rings_destroy(state);
+            // 清理全局鼠标钩子（规范做法：虽然进程结束时系统会自动清理，但应主动释放）
+            mouse_hook_remove();
             PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 点击是否落在「可收起的胶囊条」上：竖排是窗口另一侧的竖条，横排是顶部那条胶囊。
+/// 超大卡片的窗口本身就是整块面板；固定到任务栏时收起由三环负责——两种情况都返回 false，
+/// 即展开态点面板正文不会收起。
+fn click_on_capsule_bar(state: &AppState, x: i32, y: i32) -> bool {
+    if state.config.capsule.expand_big() || state.config.capsule.taskbar_pin {
+        return false;
+    }
+    let sh = match state.shared.read() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in click_on_capsule_bar: {:?}", e);
+            return false;
+        }
+    };
+    if sh.vertical {
+        let bar_x0 = if sh.panel_left {
+            capsule_view::PANEL_W as i32
+        } else {
+            0
+        };
+        x >= bar_x0 && x < bar_x0 + capsule_view::PILL_V_W as i32
+    } else {
+        y < CAPSULE_H as i32
     }
 }
 
@@ -1310,15 +1487,28 @@ fn cursor_over_main(state: &AppState) -> bool {
     if pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom {
         return false;
     }
-    let sh = state.shared.read().unwrap();
+    let sh = match state.shared.read() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in cursor_over_main: {:?}", e);
+            return false;
+        }
+    };
     if !(sh.vertical && state.view.expanded()) {
         return true;
     }
     let (x, y) = (pt.x - rc.left, pt.y - rc.top);
-    let panel_x0 = if sh.panel_left { 0 } else { capsule_view::PILL_V_W as i32 };
-    let bar_x0 = if sh.panel_left { capsule_view::PANEL_W as i32 } else { 0 };
-    let on_panel =
-        x >= panel_x0 && x < panel_x0 + capsule_view::PANEL_W as i32;
+    let panel_x0 = if sh.panel_left {
+        0
+    } else {
+        capsule_view::PILL_V_W as i32
+    };
+    let bar_x0 = if sh.panel_left {
+        capsule_view::PANEL_W as i32
+    } else {
+        0
+    };
+    let on_panel = x >= panel_x0 && x < panel_x0 + capsule_view::PANEL_W as i32;
     let on_bar = x >= bar_x0
         && x < bar_x0 + capsule_view::PILL_V_W as i32
         && y < capsule_view::PILL_V_H as i32;
@@ -1372,7 +1562,12 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN {
             let h = MAIN_HWND.load(Ordering::Relaxed);
             if h != 0 {
-                let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_CLICK_OUTSIDE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    HWND(h as *mut c_void),
+                    WM_APP_CLICK_OUTSIDE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
         }
     }
@@ -1400,13 +1595,30 @@ fn paint_frame(state: &mut AppState, force: bool) {
     if state.config.capsule.taskbar_pin && !state.view.expanded() {
         return;
     }
-    let seq = state.shared.read().unwrap().seq();
+    let seq = match state.shared.read() {
+        Ok(g) => g.seq(),
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in paint_frame seq check: {:?}", e);
+            return;
+        }
+    };
     if !force && seq == state.last_seq {
         return;
     }
     state.last_seq = seq;
 
-    let frame_data = state.shared.read().unwrap().grab();
+    let frame_data = match state.shared.read() {
+        Ok(g) => g.grab(),
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in paint_frame grab: {:?}", e);
+            return;
+        }
+    };
+    // 超大卡片：几何按当前显示器工作区算好下发给视图（面板大小恒定，与卡片数无关）
+    if state.config.capsule.expand_big() {
+        let g = big_geometry(state);
+        state.view.set_big_geometry(g.0, g.1, g.2);
+    }
     let (vis_w, vis_h) = state.view.frame_size(&frame_data.as_frame());
     let (buf_w, buf_h) = state.view.buffer_size(&frame_data.as_frame());
 
@@ -1434,7 +1646,12 @@ fn paint_frame(state: &mut AppState, force: bool) {
         tiny_skia::Transform::identity(),
         None,
     );
-    let presented = state.view.render(&mut state.pix, &frame_data.as_frame(), state.font.as_ref(), (vis_w, vis_h));
+    let presented = state.view.render(
+        &mut state.pix,
+        &frame_data.as_frame(),
+        state.font.as_ref(),
+        (vis_w, vis_h),
+    );
     if !presented {
         // 视图判定本帧画面无变化（稳态数据帧已派发后台构建，等 WM_APP_PANEL
         // 携带新面板再上屏）：跳过像素拷贝与 UpdateLayeredWindow 提交。
@@ -1505,7 +1722,11 @@ fn blit_and_present(
                     // alpha=1 近透明底就是这么被 70%/55% 透明度抹掉的——表现为"必须点在三环的
                     // 数值上才能弹出面板"；保留到 1 则与 100% 不透明度时的可点区域完全一致，
                     // 视觉上 0→1 无差别。源 alpha=0 的区域仍然保持穿透。
-                    *e = if v == 0 { 0 } else { (v as f32 * k).max(1.0) as u8 };
+                    *e = if v == 0 {
+                        0
+                    } else {
+                        (v as f32 * k).max(1.0) as u8
+                    };
                 }
             }
             for px4 in row.as_chunks_mut::<4>().0 {
@@ -1534,7 +1755,10 @@ fn blit_and_present(
     unsafe {
         let _ = GetWindowRect(hwnd, &mut rc);
     }
-    let pt_dst = POINT { x: rc.left, y: rc.top };
+    let pt_dst = POINT {
+        x: rc.left,
+        y: rc.top,
+    };
     let pt_src = POINT { x: 0, y: 0 };
     let size = SIZE {
         cx: vis_w as i32,
@@ -1637,7 +1861,11 @@ fn set_panel_open(state: &mut AppState, open: bool) {
     let changed = state.view.expanded() != open;
     if changed {
         state.view.set_expanded(open);
-        let detail = if open { Detail::Expanded } else { Detail::Collapsed };
+        let detail = if open {
+            Detail::Expanded
+        } else {
+            Detail::Collapsed
+        };
         let _ = state.cmd_tx.send(SourceCmd::SetDetail(detail));
     }
     let pinned = state.config.capsule.taskbar_pin;
@@ -1647,7 +1875,9 @@ fn set_panel_open(state: &mut AppState, open: bool) {
     if open {
         // 展开前先把窗口摆到位（几何变化在隐藏态完成，避免显示瞬间闪现旧位置）
         resize_window(state);
-        unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
+        unsafe {
+            let _ = ShowWindow(state.hwnd, SW_SHOWNA);
+        }
         // 注意：亚克力磨砂背景层**不再显示**。它此前只挂在固定态，导致同一透明度下
         // 三环模式的面板比横/竖排"厚"一层（面板底下多垫了一块系统磨砂）；用户已要求去掉
         // 磨砂效果，这里统一为不加背景，两种模式的透明度表现就一致了。
@@ -1656,7 +1886,9 @@ fn set_panel_open(state: &mut AppState, open: bool) {
     }
     if pinned {
         if open {
-            unsafe { let _ = SetActiveWindow(state.hwnd); }
+            unsafe {
+                let _ = SetActiveWindow(state.hwnd);
+            }
         }
         // 固定到任务栏：面板底边贴任务栏，动画从下往上长出；收起动画结束时隐藏窗口
         start_anim(state);
@@ -1682,11 +1914,44 @@ fn start_anim(state: &mut AppState) {
     paint_frame(state, true);
 }
 
+/// 超大卡片几何：宽 660（工作区太窄时收窄）；高恒定按 6 个卡位算，
+/// 不随勾选 / 可读卡片数变化（上限为工作区高 − 24）。
+/// 贴边侧跟任务栏走：任务栏竖直位于屏幕右半时改贴左侧，其余情况贴右侧。
+fn big_geometry(state: &AppState) -> (u32, u32, bool) {
+    let wa = monitor_work_area(unsafe { MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST) });
+    let full_w = (wa.right - wa.left).max(1) as u32;
+    let full_h = (wa.bottom - wa.top).max(1) as u32;
+    let w = capsule_view::BIG_W.min(full_w.saturating_sub(24)).max(320);
+    // 面板大小固定：不随内张小卡片增减而变（放不下的部分由工作区高度封顶）
+    let h = capsule_view::big_panel_height()
+        .min(full_h.saturating_sub(24))
+        .max(320);
+    let left = taskbar_rect().is_some_and(|tr| {
+        let (tw, th) = (tr.right - tr.left, tr.bottom - tr.top);
+        th > tw && tr.left > wa.left + (wa.right - wa.left) / 2
+    });
+    (w, h, left)
+}
+
 /// 按当前动画进度重设窗口；宽度变化时保持右缘不动（向左展开/收回）。
 /// 固定在任务栏时：面板在任务栏内三环上水平居中；任务栏在下方则面板向上生长（底边贴任务栏顶）。
 fn resize_window(state: &mut AppState) {
-    let frame_data = state.shared.read().unwrap().grab();
+    let frame_data = match state.shared.read() {
+        Ok(g) => g.grab(),
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in resize_window: {:?}", e);
+            return;
+        }
+    };
     let frame = frame_data.as_frame();
+    // 超大卡片：几何按工作区下发；展开期间窗口一次到位，动画只让内容滑入
+    let big = if state.config.capsule.expand_big() {
+        let g = big_geometry(state);
+        state.view.set_big_geometry(g.0, g.1, g.2);
+        Some(g)
+    } else {
+        None
+    };
     let (w, h) = state.view.frame_size(&frame);
     // 固定态：亚克力层按“可见面板高度”跟随（底/顶边与面板一致，随内容一起生长/收回）
     let vis_h = state.view.visible_panel_h(&frame) as i32;
@@ -1694,48 +1959,63 @@ fn resize_window(state: &mut AppState) {
     unsafe {
         let mut rc = RECT::default();
         let _ = GetWindowRect(state.hwnd, &mut rc);
-        let (x, y) = match (state.config.capsule.taskbar_pin, state.pin_anchor) {
-            (true, Some((px, py, up))) => {
-                // 面板（320 宽）在任务栏内三环（CAPSULE_W 宽）上水平居中
-                let mut x = px + (CAPSULE_W as i32 - w as i32) / 2;
-                // 居中后可能探出屏幕边缘，夹回工作区
-                let mut wa = RECT::default();
-                let _ = SystemParametersInfoW(
-                    SPI_GETWORKAREA,
-                    0,
-                    Some(&mut wa as *mut RECT as *mut c_void),
-                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-                );
-                if wa.right > wa.left {
-                    x = x.clamp(wa.left, (wa.right - w as i32).max(wa.left));
+        let (x, y) = if let Some((_, _, left)) = big.filter(|_| state.view.expanded()) {
+            // 贴工作区侧边：上下各 12，宽度取 big_geometry 的结果
+            let wa = monitor_work_area(MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST));
+            let x = if left {
+                wa.left + 12
+            } else {
+                wa.right - 12 - w as i32
+            };
+            (x, wa.top + 12)
+        } else {
+            match (state.config.capsule.taskbar_pin, state.pin_anchor) {
+                (true, Some((px, py, up))) => {
+                    // 面板（320 宽）在任务栏内三环（CAPSULE_W 宽）上水平居中
+                    let mut x = px + (CAPSULE_W as i32 - w as i32) / 2;
+                    // 居中后可能探出屏幕边缘，夹回工作区
+                    let mut wa = RECT::default();
+                    let _ = SystemParametersInfoW(
+                        SPI_GETWORKAREA,
+                        0,
+                        Some(&mut wa as *mut RECT as *mut c_void),
+                        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                    );
+                    if wa.right > wa.left {
+                        x = x.clamp(wa.left, (wa.right - w as i32).max(wa.left));
+                    }
+                    let y = if up {
+                        taskbar_rect()
+                            .map(|t| t.top)
+                            .unwrap_or(py + CAPSULE_H as i32)
+                            - h as i32
+                    } else {
+                        taskbar_rect().map(|t| t.bottom).unwrap_or(py)
+                    };
+                    (x, y)
                 }
-                let y = if up {
-                    taskbar_rect().map(|t| t.top).unwrap_or(py + CAPSULE_H as i32) - h as i32
-                } else {
-                    taskbar_rect().map(|t| t.bottom).unwrap_or(py)
-                };
-                (x, y)
-            }
-            _ => {
-                // 未固定：横排与"竖条贴右缘"都保持右缘不动（面板向左推/向下长）；
-                // 只有"竖条贴左缘"时保持左缘不动（面板向右推）。
-                let (mut x, mut y) = if frame.vertical && !frame.panel_left {
-                    (rc.left, rc.top)
-                } else {
-                    (rc.right - w as i32, rc.top)
-                };
-                // 竖排面板很长（含全部卡片可达 800+）：底边超出工作区时整体上移，
-                // 保证竖条与面板都在屏内（方案 A：面板顶边对齐竖条顶边，超了就整体上夹）。
-                // 横向同理：面板 + 竖条共 376 宽，贴边展开时可能越过本显示器边界，
-                // 不夹回来就会"露到隔壁副屏上"。
-                let wa = monitor_work_area(MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST));
-                if wa.right > wa.left {
-                    x = x.clamp(wa.left, (wa.right - w as i32).max(wa.left));
+                _ => {
+                    // 未固定：横排与"竖条贴右缘"都保持右缘不动（面板向左推/向下长）；
+                    // 只有"竖条贴左缘"时保持左缘不动（面板向右推）。
+                    let (mut x, mut y) = if frame.vertical && !frame.panel_left {
+                        (rc.left, rc.top)
+                    } else {
+                        (rc.right - w as i32, rc.top)
+                    };
+                    // 竖排面板很长（含全部卡片可达 800+）：底边超出工作区时整体上移，
+                    // 保证竖条与面板都在屏内（方案 A：面板顶边对齐竖条顶边，超了就整体上夹）。
+                    // 横向同理：面板 + 竖条共 376 宽，贴边展开时可能越过本显示器边界，
+                    // 不夹回来就会"露到隔壁副屏上"。
+                    let wa =
+                        monitor_work_area(MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST));
+                    if wa.right > wa.left {
+                        x = x.clamp(wa.left, (wa.right - w as i32).max(wa.left));
+                    }
+                    if wa.bottom > wa.top {
+                        y = y.min(wa.bottom - h as i32).max(wa.top);
+                    }
+                    (x, y)
                 }
-                if wa.bottom > wa.top {
-                    y = y.min(wa.bottom - h as i32).max(wa.top);
-                }
-                (x, y)
             }
         };
         // 几何未变时跳过 SetWindowPos：固定态展开动画只动内容，窗口尺寸一次到位，
@@ -1758,7 +2038,8 @@ fn resize_window(state: &mut AppState) {
 
         // 亚克力磨砂背景层：与可见面板同框。固定态面板一次到位、内容由底部（向上展开时）
         // 生长，故背景层底边对齐面板底边、高度取可见高度，避免动画期间露出整块灰底。
-        if state.config.capsule.taskbar_pin {
+        // 超大卡片自带不透明纯色底，不需要磨砂层。
+        if state.config.capsule.taskbar_pin && !state.config.capsule.expand_big() {
             let ay = if up { y + h as i32 - vis_h } else { y };
             acrylic_place(state, x, ay, w as i32, vis_h);
         }
@@ -1775,8 +2056,11 @@ fn taskbar_rect() -> Option<RECT> {
 
 /// 系统托盘区左缘（TrayNotifyWnd）。可用段的右边界。
 fn taskbar_tray_left(tr: &RECT) -> i32 {
-    let tb = unsafe { FindWindowW(static_pcwstr("Shell_TrayWnd"), PCWSTR::null()) }.unwrap_or_default();
-    if let Ok(h) = unsafe { FindWindowExW(tb, None, static_pcwstr("TrayNotifyWnd"), PCWSTR::null()) } {
+    let tb =
+        unsafe { FindWindowW(static_pcwstr("Shell_TrayWnd"), PCWSTR::null()) }.unwrap_or_default();
+    if let Ok(h) =
+        unsafe { FindWindowExW(tb, None, static_pcwstr("TrayNotifyWnd"), PCWSTR::null()) }
+    {
         if !h.0.is_null() {
             let mut r = RECT::default();
             if unsafe { GetWindowRect(h, &mut r) }.is_ok() && r.left > tr.left {
@@ -1789,12 +2073,18 @@ fn taskbar_tray_left(tr: &RECT) -> i32 {
 
 /// 任务栏“任务按钮区”右缘（ReBarWindow32）。可用段从左邻开始。
 fn taskbar_rebar_right(tr: &RECT) -> i32 {
-    let tb = unsafe { FindWindowW(static_pcwstr("Shell_TrayWnd"), PCWSTR::null()) }.unwrap_or_default();
+    let tb =
+        unsafe { FindWindowW(static_pcwstr("Shell_TrayWnd"), PCWSTR::null()) }.unwrap_or_default();
     // ReBarWindow32 是任务按钮区的父容器；Win11 上其右缘即已打开窗口按钮区右缘。
-    if let Ok(h) = unsafe { FindWindowExW(tb, None, static_pcwstr("ReBarWindow32"), PCWSTR::null()) } {
+    if let Ok(h) =
+        unsafe { FindWindowExW(tb, None, static_pcwstr("ReBarWindow32"), PCWSTR::null()) }
+    {
         if !h.0.is_null() {
             let mut r = RECT::default();
-            if unsafe { GetWindowRect(h, &mut r) }.is_ok() && r.right > tr.left && r.right < tr.right {
+            if unsafe { GetWindowRect(h, &mut r) }.is_ok()
+                && r.right > tr.left
+                && r.right < tr.right
+            {
                 return r.right;
             }
         }
@@ -1849,8 +2139,9 @@ fn taskbar_free_columns(tr: &RECT) -> Option<Vec<bool>> {
         bmiColors: [RGBQUAD::default(); 1],
     };
     let mut bits: *mut c_void = null_mut();
-    let bmp = unsafe { CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE(null_mut()), 0) }
-        .unwrap_or_default();
+    let bmp =
+        unsafe { CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE(null_mut()), 0) }
+            .unwrap_or_default();
     let cols = if bmp.0.is_null() || bits.is_null() {
         None
     } else {
@@ -1859,7 +2150,11 @@ fn taskbar_free_columns(tr: &RECT) -> Option<Vec<bool>> {
             let screen = GetDC(HWND(null_mut()));
             let ok = BitBlt(mem, 0, 0, tw, th, screen, tr.left, tr.top, SRCCOPY).is_ok();
             let _ = ReleaseDC(HWND(null_mut()), screen);
-            let out = if ok { Some(scan_columns(bits, tw, th, w)) } else { None };
+            let out = if ok {
+                Some(scan_columns(bits, tw, th, w))
+            } else {
+                None
+            };
             let _ = SelectObject(mem, old);
             out
         }
@@ -1961,7 +2256,9 @@ fn rings_current_x(state: &AppState) -> Option<i32> {
     }
     let r = state.rings.as_ref()?;
     let mut rc = RECT::default();
-    unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+    unsafe {
+        let _ = GetWindowRect(r.hwnd, &mut rc);
+    }
     (rc.right > rc.left).then_some(rc.left)
 }
 
@@ -1995,7 +2292,9 @@ fn taskbar_free_segment_uncached(state: &mut AppState, tr: &RECT) -> Option<(i32
         // 首次落位：把三环自身覆盖的列视为空（它本来就该待在空段里）
         if let Some(r) = state.rings.as_ref() {
             let mut rc = RECT::default();
-            unsafe { let _ = GetWindowRect(r.hwnd, &mut rc); }
+            unsafe {
+                let _ = GetWindowRect(r.hwnd, &mut rc);
+            }
             let n = free.len() as i32;
             let l = (rc.left - tr.left).clamp(0, n) as usize;
             let rr = (rc.right - tr.left).clamp(0, n) as usize;
@@ -2045,7 +2344,9 @@ fn taskbar_is_light(tr: &RECT) -> bool {
         return true;
     }
     let c = unsafe { GetPixel(dc, tr.left + 4, (tr.top + tr.bottom) / 2) };
-    unsafe { let _ = ReleaseDC(HWND(null_mut()), dc); }
+    unsafe {
+        let _ = ReleaseDC(HWND(null_mut()), dc);
+    }
     if c.0 == u32::MAX {
         return true; // CLR_INVALID：取不到按浅色处理
     }
@@ -2096,11 +2397,14 @@ fn sync_taskbar_state(state: &mut AppState) {
                                     if state.pin_avoid_x.is_none() {
                                         match avoid_candidate(&free, bx, tr.left) {
                                             Some(cx) => {
-                                                let same = state
-                                                    .pin_avoid_cand
-                                                    .is_some_and(|p| (p - cx).abs() <= PIN_DEADZONE);
-                                                state.pin_avoid_hits =
-                                                    if same { state.pin_avoid_hits.saturating_add(1) } else { 1 };
+                                                let same = state.pin_avoid_cand.is_some_and(|p| {
+                                                    (p - cx).abs() <= PIN_DEADZONE
+                                                });
+                                                state.pin_avoid_hits = if same {
+                                                    state.pin_avoid_hits.saturating_add(1)
+                                                } else {
+                                                    1
+                                                };
                                                 state.pin_avoid_cand = Some(cx);
                                                 if state.pin_avoid_hits >= 2 {
                                                     state.pin_avoid_x = Some(cx);
@@ -2150,7 +2454,13 @@ fn sync_taskbar_state(state: &mut AppState) {
         }
     }
     {
-        let mut sh = state.shared.write().unwrap();
+        let mut sh = match state.shared.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[App] RwLock poisoned in sync_taskbar_state: {:?}", e);
+                return;
+            }
+        };
         if sh.pinned != pinned || sh.taskbar_light != light || sh.expand_up != (pinned && up) {
             sh.pinned = pinned;
             sh.taskbar_light = light;
@@ -2179,17 +2489,23 @@ fn sync_taskbar_state(state: &mut AppState) {
         }
         if !fits {
             if let Some(r) = state.rings.as_ref() {
-                unsafe { let _ = ShowWindow(r.hwnd, SW_HIDE); }
+                unsafe {
+                    let _ = ShowWindow(r.hwnd, SW_HIDE);
+                }
             }
         }
         state.pin_hidden = !fits;
-        unsafe { let _ = ShowWindow(state.hwnd, SW_HIDE); }
+        unsafe {
+            let _ = ShowWindow(state.hwnd, SW_HIDE);
+        }
         // 收起态不显示磨砂背景层（否则桌面残留无内容灰底）
         acrylic_show(state, false);
     } else {
         rings_destroy(state);
         state.pin_hidden = false;
-        unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
+        unsafe {
+            let _ = ShowWindow(state.hwnd, SW_SHOWNA);
+        }
         if dirty {
             resize_window(state);
             paint_frame(state, true);
@@ -2321,7 +2637,9 @@ fn restore_after_fullscreen(state: &mut AppState) {
         }
         if state.view.expanded() {
             resize_window(state);
-            unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
+            unsafe {
+                let _ = ShowWindow(state.hwnd, SW_SHOWNA);
+            }
             paint_frame(state, true);
             if state.config.capsule.click_outside_collapse {
                 mouse_hook_install();
@@ -2331,7 +2649,9 @@ fn restore_after_fullscreen(state: &mut AppState) {
         }
     } else {
         resize_window(state);
-        unsafe { let _ = ShowWindow(state.hwnd, SW_SHOWNA); }
+        unsafe {
+            let _ = ShowWindow(state.hwnd, SW_SHOWNA);
+        }
         paint_frame(state, true);
         if state.view.expanded() && state.config.capsule.click_outside_collapse {
             mouse_hook_install();
@@ -2344,19 +2664,27 @@ fn apply_taskbar_pin(state: &mut AppState) {
     if !state.config.capsule.taskbar_pin {
         state.pin_anchor = None;
         state.view.set_hovered(false);
-        unsafe { let _ = KillTimer(state.hwnd, IDT_PIN); }
+        unsafe {
+            let _ = KillTimer(state.hwnd, IDT_PIN);
+        }
         // 取消固定：销毁任务栏内的三环子窗口，收起面板，恢复普通胶囊
         state.view.set_expanded(false);
         state.view.jump_anim();
         sync_taskbar_state(state); // 恢复普通布局与配色，并显示主窗口
-        resize_window(state);      // 先收回到收起态尺寸
-        // 再回到该方向的默认落点：固定期间主窗口是隐藏的，矩形还停在面板/三环的残留几何上，
-        // 直接沿用会压在屏幕右上角——正好是最大化窗口的最小化/关闭按钮那一块。
+        resize_window(state); // 先收回到收起态尺寸
+                              // 再回到该方向的默认落点：固定期间主窗口是隐藏的，矩形还停在面板/三环的残留几何上，
+                              // 直接沿用会压在屏幕右上角——正好是最大化窗口的最小化/关闭按钮那一块。
         let vertical = state.config.capsule.orientation_hint() == Some(true);
         let (cw, _) = collapsed_main_size(vertical);
         let (dx, dy) = default_capsule_pos(cw as i32, vertical);
         {
-            let mut sh = state.shared.write().unwrap();
+            let mut sh = match state.shared.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("[App] RwLock poisoned in apply_taskbar_pin: {:?}", e);
+                    return;
+                }
+            };
             if sh.vertical != vertical || sh.panel_left {
                 sh.vertical = vertical;
                 sh.panel_left = false;
@@ -2400,8 +2728,17 @@ fn show_tray_menu(state: &mut AppState) {
         // 「胶囊 / 三环 切换」：勾选态表示当前是"挂在任务栏的三环"形态。
         // 原先这个开关放设置窗里叫"固定到任务栏"，放托盘右键更顺手（不用开设置窗）。
         let pin_flags = MF_STRING
-            | if state.config.capsule.taskbar_pin { MF_CHECKED } else { MF_UNCHECKED };
-        let _ = AppendMenuW(menu, pin_flags, ID_TRAY_PIN as usize, pcwstr("胶囊/三环切换"));
+            | if state.config.capsule.taskbar_pin {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            };
+        let _ = AppendMenuW(
+            menu,
+            pin_flags,
+            ID_TRAY_PIN as usize,
+            pcwstr("胶囊/三环切换"),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS as usize, pcwstr("设置…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -2484,10 +2821,14 @@ const CARD_LABELS: [&str; CARD_COUNT] = ["CPU", "内存", "显卡", "网络", "�
 const IDC_OPACITY_BASE: usize = 130;
 /// 显示方向 3 档单选（顺序同 config::ORIENTATIONS：自动 / 横向 / 竖向）
 const IDC_ORIENT_BASE: usize = 140;
+/// 展开样式单选（小面板 / 超大卡片）
+const IDC_STYLE_BASE: usize = 160;
 const ORIENT_LABELS: [&str; 3] = ["自动", "横向", "竖向"];
+/// 展开样式档位（顺序同 config::EXPAND_STYLES）
+const STYLE_LABELS: [&str; 2] = ["小面板", "超大卡片"];
 /// 设置窗口客户区尺寸（三段式：连接 / 显示卡片 / 其他）
 const SETTINGS_CLIENT_W: i32 = 420;
-const SETTINGS_CLIENT_H: i32 = 546;
+const SETTINGS_CLIENT_H: i32 = 578;
 /// 按钮通知码 BN_CLICKED = 0（不依赖 crate 常量类型）
 const BN_CLICKED_CODE: u32 = 0;
 /// 静态控件样式 SS_ETCHEDHORZ = 0x10：一条 1px 蚀刻横线（分组分隔）
@@ -2545,7 +2886,9 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
             hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut c_void),
             ..Default::default()
         };
-        unsafe { let _ = RegisterClassW(&wc); }
+        unsafe {
+            let _ = RegisterClassW(&wc);
+        }
     });
 
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
@@ -2555,14 +2898,23 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
     state.settings_font = create_ui_font();
 
     // 按客户区尺寸反推窗口外框（客户区尺寸固定，标题栏/边框由系统加上）
-    let mut frame = RECT { left: 0, top: 0, right: SETTINGS_CLIENT_W, bottom: SETTINGS_CLIENT_H };
-    unsafe { let _ = AdjustWindowRect(&mut frame, style, BOOL(0)); }
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: SETTINGS_CLIENT_W,
+        bottom: SETTINGS_CLIENT_H,
+    };
+    unsafe {
+        let _ = AdjustWindowRect(&mut frame, style, BOOL(0));
+    }
     let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
 
     // 定位：托盘来的在光标处弹出（底边贴光标，像弹出菜单那样往上长）；
     // 面板齿轮来的贴面板左侧、纵向对齐齿轮——两种入口都尽量让用户少移动鼠标。
     let mut pt = POINT::default();
-    unsafe { let _ = GetCursorPos(&mut pt); }
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
     let (x, y) = match anchor {
         SettingsAnchor::Cursor => {
             let wa = monitor_work_area(unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) });
@@ -2571,9 +2923,13 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
             (pt.x.clamp(wa.left, max_x), (pt.y - h).clamp(wa.top, max_y))
         }
         SettingsAnchor::Panel => {
-            let wa = monitor_work_area(unsafe { MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST) });
+            let wa = monitor_work_area(unsafe {
+                MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST)
+            });
             let mut rc = RECT::default();
-            unsafe { let _ = GetWindowRect(state.hwnd, &mut rc); }
+            unsafe {
+                let _ = GetWindowRect(state.hwnd, &mut rc);
+            }
             let gap = 12;
             let max_x = (wa.right - w).max(wa.left);
             let max_y = (wa.bottom - h).max(wa.top);
@@ -2585,14 +2941,26 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
             // 竖排展开：面板本身就从窗口顶部开始长，此时按"纵向居中于齿轮"会把设置窗
             // 夹到屏幕最上沿、比面板还高一截；改成顶边对齐面板顶边，两块从同一条水平线开始。
             let vertical_panel = {
-                let sh = state.shared.read().unwrap();
+                let sh = match state.shared.read() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("[App] RwLock poisoned in show_settings vertical_panel: {:?}", e);
+                        return;
+                    }
+                };
                 sh.vertical && state.view.expanded()
             };
             let y = if vertical_panel {
                 rc.top
             } else {
                 // 齿轮一行的纵向中心（与标题行绘制位置对应）
-                let expand_up = state.shared.read().unwrap().expand_up;
+                let expand_up = match state.shared.read() {
+                    Ok(g) => g.expand_up,
+                    Err(e) => {
+                        eprintln!("[App] RwLock poisoned in show_settings expand_up: {:?}", e);
+                        return;
+                    }
+                };
                 let pinned = state.config.capsule.taskbar_pin;
                 let gear_cy = if !pinned {
                     rc.top + CAPSULE_H as i32 / 2
@@ -2609,14 +2977,22 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
 
     let class_wide: Vec<u16> = SETTINGS_CLASS.encode_utf16().chain(Some(0)).collect();
     // 即时预览的"还原点"：点取消 / 直接关窗时，用它把主题与透明度退回打开前的样子
-    state.settings_orig = Some((state.config.capsule.theme.clone(), state.config.capsule.opacity));
+    state.settings_orig = Some((
+        state.config.capsule.theme.clone(),
+        state.config.capsule.opacity,
+    ));
+    // 勾选顺序的起点：面板里当前的卡片顺序，之后每勾一张就挪到末尾
+    state.settings_card_order = state.config.capsule.cards.order;
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             PCWSTR(class_wide.as_ptr()),
             pcwstr("核桃胶囊 · 设置"),
             style,
-            x, y, w, h,
+            x,
+            y,
+            w,
+            h,
             state.hwnd,
             None,
             instance,
@@ -2627,7 +3003,9 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
     if hwnd.is_invalid() {
         // 创建失败：立刻释放刚建好的字体，避免句柄泄漏
         if !state.settings_font.is_invalid() {
-            unsafe { let _ = DeleteObject(HGDIOBJ(state.settings_font.0)); }
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(state.settings_font.0));
+            }
             state.settings_font = HFONT(null_mut());
         }
     }
@@ -2699,7 +3077,13 @@ fn apply_settings_preview(state: &mut AppState, hwnd: HWND) {
     state.config.capsule.opacity = read_opacity(hwnd);
     let dark = state.config.capsule.theme_dark();
     {
-        let mut sh = state.shared.write().unwrap();
+        let mut sh = match state.shared.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[App] RwLock poisoned in apply_settings_preview: {:?}", e);
+                return;
+            }
+        };
         sh.dark = dark;
         sh.bump_seq();
     }
@@ -2710,12 +3094,20 @@ fn apply_settings_preview(state: &mut AppState, hwnd: HWND) {
 /// 还原即时预览（点"取消"或直接关窗时）：退回打开设置窗时的主题与透明度并重绘。
 /// 快照已被"确定"取走（None）时什么都不做。
 fn restore_settings_preview(state: &mut AppState) {
-    let Some((theme, opacity)) = state.settings_orig.take() else { return };
+    let Some((theme, opacity)) = state.settings_orig.take() else {
+        return;
+    };
     state.config.capsule.theme = theme;
     state.config.capsule.opacity = opacity;
     let dark = state.config.capsule.theme_dark();
     {
-        let mut sh = state.shared.write().unwrap();
+        let mut sh = match state.shared.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[App] RwLock poisoned in restore_settings_preview: {:?}", e);
+                return;
+            }
+        };
         sh.dark = dark;
         sh.bump_seq();
     }
@@ -2723,20 +3115,36 @@ fn restore_settings_preview(state: &mut AppState) {
     rings_paint(state, true);
 }
 
-fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+fn settings_wndproc_impl(
+    state: &mut AppState,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     unsafe {
         match msg {
             WM_CREATE => {
                 const PAD: i32 = 16;
                 const CW: i32 = SETTINGS_CLIENT_W - PAD * 2; // 内容宽（388）
                 let font = state.settings_font;
-                let mk_child = |class: &str, text: &str, style: WINDOW_STYLE, x: i32, y: i32, w: i32, h: i32, id: usize| {
+                let mk_child = |class: &str,
+                                text: &str,
+                                style: WINDOW_STYLE,
+                                x: i32,
+                                y: i32,
+                                w: i32,
+                                h: i32,
+                                id: usize| {
                     let h = CreateWindowExW(
                         WINDOW_EX_STYLE(0),
                         pcwstr(class),
                         pcwstr(text),
                         WS_CHILD | WS_VISIBLE | style,
-                        x, y, w, h,
+                        x,
+                        y,
+                        w,
+                        h,
                         hwnd,
                         HMENU(id as *mut c_void),
                         GetModuleHandleW(None).unwrap_or_default(),
@@ -2756,42 +3164,110 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                 let c0 = 16; // 连接组
                 let k0 = 192; // 显示卡片组
                 let o0 = 344; // 其他组
-                let btn_y = 500; // 底部按钮
+                let btn_y = 532; // 底部按钮
 
                 // ---- 分组一：连接 ----
-                mk_child("STATIC", "连接", WINDOW_STYLE(0), PAD, c0, 200, 18, IDC_SEC_CONN);
-                mk_child("STATIC", "地址（host:port）", WINDOW_STYLE(0), PAD, c0 + 22, CW, 16, 0);
+                mk_child(
+                    "STATIC",
+                    "连接",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    c0,
+                    200,
+                    18,
+                    IDC_SEC_CONN,
+                );
+                mk_child(
+                    "STATIC",
+                    "地址（host:port）",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    c0 + 22,
+                    CW,
+                    16,
+                    0,
+                );
                 mk_child(
                     "EDIT",
                     &state.config.nas.addr(),
                     WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32),
-                    PAD, c0 + 40, CW, 26,
+                    PAD,
+                    c0 + 40,
+                    CW,
+                    26,
                     IDC_ADDR_EDIT,
                 );
-                mk_child("STATIC", "配对令牌（见 NAS 管理页）", WINDOW_STYLE(0), PAD, c0 + 74, CW, 16, 0);
+                mk_child(
+                    "STATIC",
+                    "配对令牌（见 NAS 管理页）",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    c0 + 74,
+                    CW,
+                    16,
+                    0,
+                );
                 mk_child(
                     "EDIT",
                     &state.config.nas.token,
                     WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32),
-                    PAD, c0 + 92, CW, 26,
+                    PAD,
+                    c0 + 92,
+                    CW,
+                    26,
                     IDC_TOKEN_EDIT,
                 );
-                mk_child("BUTTON", "测试连接", WINDOW_STYLE(0), PAD, c0 + 126, 88, 28, IDC_TEST_BUTTON);
-                mk_child("STATIC", "", WINDOW_STYLE(0), PAD + 98, c0 + 132, CW - 98, 18, IDC_TEST_RESULT);
+                mk_child(
+                    "BUTTON",
+                    "测试连接",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    c0 + 126,
+                    88,
+                    28,
+                    IDC_TEST_BUTTON,
+                );
+                mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(0),
+                    PAD + 98,
+                    c0 + 132,
+                    CW - 98,
+                    18,
+                    IDC_TEST_RESULT,
+                );
                 mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
-                    PAD, c0 + 164, CW, 2, 0,
+                    PAD,
+                    c0 + 164,
+                    CW,
+                    2,
+                    0,
                 );
 
                 // ---- 分组二：显示卡片（两列三行）----
-                mk_child("STATIC", "显示卡片", WINDOW_STYLE(0), PAD, k0, 200, 18, IDC_SEC_CARDS);
                 mk_child(
                     "STATIC",
-                    "仅影响展开面板；收起态与任务栏三环不受影响",
+                    "显示卡片",
                     WINDOW_STYLE(0),
-                    PAD, k0 + 18, CW, 16, 0,
+                    PAD,
+                    k0,
+                    200,
+                    18,
+                    IDC_SEC_CARDS,
+                );
+                mk_child(
+                    "STATIC",
+                    "勾选顺序即面板排列顺序（后勾的排到后面）；收起态不受影响",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    k0 + 18,
+                    CW,
+                    16,
+                    0,
                 );
                 for (i, label) in CARD_LABELS.iter().enumerate() {
                     let col = (i % 2) as i32;
@@ -2800,22 +3276,56 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                         "BUTTON",
                         label,
                         WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                        PAD + col * 198, k0 + 40 + row * 24, 190, 22,
+                        PAD + col * 198,
+                        k0 + 40 + row * 24,
+                        190,
+                        22,
                         IDC_CARD_BASE + i,
                     );
                     let _ = chk;
                     set_check(IDC_CARD_BASE + i, state.config.capsule.cards.all()[i]);
                 }
-                mk_child("STATIC", "", WINDOW_STYLE(0), PAD, k0 + 114, CW, 16, IDC_CARDS_HINT);
+                // 回显当前排列顺序（与点击复选后的回显一致）
+                let names: Vec<&str> = state
+                    .config
+                    .capsule
+                    .cards
+                    .ordered()
+                    .iter()
+                    .map(|&i| CARD_LABELS[i])
+                    .collect();
+                mk_child(
+                    "STATIC",
+                    &format!("面板顺序：{}", names.join(" → ")),
+                    WINDOW_STYLE(0),
+                    PAD,
+                    k0 + 114,
+                    CW,
+                    16,
+                    IDC_CARDS_HINT,
+                );
                 mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
-                    PAD, k0 + 140, CW, 2, 0,
+                    PAD,
+                    k0 + 140,
+                    CW,
+                    2,
+                    0,
                 );
 
                 // ---- 分组三：其他 ----
-                mk_child("STATIC", "其他", WINDOW_STYLE(0), PAD, o0, 200, 18, IDC_SEC_OTHER);
+                mk_child(
+                    "STATIC",
+                    "其他",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    o0,
+                    200,
+                    18,
+                    IDC_SEC_OTHER,
+                );
                 mk_child("STATIC", "主题", WINDOW_STYLE(0), PAD, o0 + 18, 64, 22, 0);
                 for (i, label) in THEME_LABELS.iter().enumerate() {
                     // 每组第一颗加 WS_GROUP：自动单选钮按 WS_GROUP 划组，
@@ -2823,8 +3333,13 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 }),
-                        88 + i as i32 * 60, o0 + 18, 56, 22,
+                        WINDOW_STYLE(
+                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
+                        ),
+                        88 + i as i32 * 60,
+                        o0 + 18,
+                        56,
+                        22,
                         IDC_THEME_BASE + i,
                     );
                 }
@@ -2843,19 +3358,38 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 }),
-                        88 + i as i32 * 68, o0 + 42, 64, 22,
+                        WINDOW_STYLE(
+                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
+                        ),
+                        88 + i as i32 * 68,
+                        o0 + 42,
+                        64,
+                        22,
                         IDC_OPACITY_BASE + i,
                     );
                 }
                 set_check(IDC_OPACITY_BASE + opacity_idx, true);
-                mk_child("STATIC", "显示方向", WINDOW_STYLE(0), PAD, o0 + 68, 64, 22, 0);
+                mk_child(
+                    "STATIC",
+                    "显示方向",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    o0 + 68,
+                    64,
+                    22,
+                    0,
+                );
                 for (i, label) in ORIENT_LABELS.iter().enumerate() {
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 }),
-                        88 + i as i32 * 60, o0 + 68, 56, 22,
+                        WINDOW_STYLE(
+                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
+                        ),
+                        88 + i as i32 * 60,
+                        o0 + 68,
+                        56,
+                        22,
                         IDC_ORIENT_BASE + i,
                     );
                 }
@@ -2864,21 +3398,60 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     .position(|v| *v == state.config.capsule.orientation)
                     .unwrap_or(0);
                 set_check(IDC_ORIENT_BASE + orient_idx, true);
+                // 展开样式：小面板（320 宽）/ 超大卡片（贴屏幕侧边滑出，尺寸对齐任务栏天气面板）
+                mk_child(
+                    "STATIC",
+                    "展开样式",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    o0 + 94,
+                    64,
+                    22,
+                    0,
+                );
+                for (i, label) in STYLE_LABELS.iter().enumerate() {
+                    mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(
+                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
+                        ),
+                        88 + i as i32 * 76,
+                        o0 + 94,
+                        72,
+                        22,
+                        IDC_STYLE_BASE + i,
+                    );
+                }
+                let style_idx = crate::config::EXPAND_STYLES
+                    .iter()
+                    .position(|v| *v == state.config.capsule.expand_style)
+                    .unwrap_or(0);
+                set_check(IDC_STYLE_BASE + style_idx, true);
                 // 两个勾选并排一行：左「面板自动收起」、右「胶囊/三环切换」
                 mk_child(
                     "BUTTON",
                     "面板自动收起",
                     WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    PAD, o0 + 94, 140, 22,
+                    PAD,
+                    o0 + 120,
+                    140,
+                    22,
                     IDC_CLICK_OUTSIDE_CHK,
                 );
-                set_check(IDC_CLICK_OUTSIDE_CHK, state.config.capsule.click_outside_collapse);
+                set_check(
+                    IDC_CLICK_OUTSIDE_CHK,
+                    state.config.capsule.click_outside_collapse,
+                );
                 // 与托盘右键菜单里的「胶囊/三环切换」是同一个开关，两处都能改
                 mk_child(
                     "BUTTON",
                     "胶囊/三环切换",
                     WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    PAD + 150, o0 + 94, 220, 22,
+                    PAD + 150,
+                    o0 + 120,
+                    220,
+                    22,
                     IDC_TASKBAR_CHK,
                 );
                 set_check(IDC_TASKBAR_CHK, state.config.capsule.taskbar_pin);
@@ -2887,14 +3460,26 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     "BUTTON",
                     "全屏应用时自动隐藏",
                     WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    PAD, o0 + 120, 260, 22,
+                    PAD,
+                    o0 + 146,
+                    260,
+                    22,
                     IDC_FS_CHK,
                 );
                 set_check(IDC_FS_CHK, state.config.capsule.hide_on_fullscreen);
 
                 // ---- 底部按钮（贴客户区底边：竖排展开时设置窗与面板同高，按钮仍要够得着）----
                 mk_child("BUTTON", "取消", WINDOW_STYLE(0), 236, btn_y, 80, 30, 2); // IDCANCEL
-                mk_child("BUTTON", "确定", WINDOW_STYLE(BS_DEFPUSHBUTTON as u32), 324, btn_y, 80, 30, 1); // IDOK
+                mk_child(
+                    "BUTTON",
+                    "确定",
+                    WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+                    324,
+                    btn_y,
+                    80,
+                    30,
+                    1,
+                ); // IDOK
                 LRESULT(0)
             }
             // 分组小标题与卡片提示用系统灰色（其余控件保持默认黑色）
@@ -2914,12 +3499,28 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                 let id = (wparam.0 as u32) & 0xFFFF;
                 let code = ((wparam.0 as u32) >> 16) & 0xFFFF;
 
-                // 卡片复选：取消掉最后一张时回勾并提示（尽量留住卡片）
+                // 卡片复选：勾选顺序就是面板里的排列顺序（后勾的排到后面）；
+                // 取消掉最后一张时回勾并提示（尽量留住卡片）
                 if (IDC_CARD_BASE..IDC_CARD_BASE + CARD_COUNT).contains(&(id as usize))
                     && code == BN_CLICKED_CODE
                 {
                     if read_cards(hwnd).any() {
-                        set_dlg_text(hwnd, IDC_CARDS_HINT as i32, "");
+                        if is_checked(hwnd, id as usize) {
+                            crate::config::touch_order(
+                                &mut state.settings_card_order,
+                                id as usize - IDC_CARD_BASE,
+                            );
+                        }
+                        // 回显当前顺序，让"勾一张挪到末尾"看得见
+                        let mut cv = read_cards(hwnd);
+                        cv.order = state.settings_card_order;
+                        let names: Vec<&str> =
+                            cv.ordered().iter().map(|&i| CARD_LABELS[i]).collect();
+                        set_dlg_text(
+                            hwnd,
+                            IDC_CARDS_HINT as i32,
+                            &format!("面板顺序：{}", names.join(" → ")),
+                        );
                     } else {
                         let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
                         let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(1), LPARAM(0));
@@ -2930,9 +3531,10 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
 
                 // 透明度 / 明暗主题：点选**即时预览**——只改内存配置并重绘一帧，不落盘。
                 // 点"确定"才写盘生效；点"取消"或直接关窗由 WM_NCDESTROY 用快照还原。
-                let is_opacity =
-                    (IDC_OPACITY_BASE..IDC_OPACITY_BASE + OPACITY_STEPS.len()).contains(&(id as usize));
-                let is_theme = (IDC_THEME_BASE..IDC_THEME_BASE + THEME_LABELS.len()).contains(&(id as usize));
+                let is_opacity = (IDC_OPACITY_BASE..IDC_OPACITY_BASE + OPACITY_STEPS.len())
+                    .contains(&(id as usize));
+                let is_theme =
+                    (IDC_THEME_BASE..IDC_THEME_BASE + THEME_LABELS.len()).contains(&(id as usize));
                 if (is_opacity || is_theme) && code == BN_CLICKED_CODE {
                     apply_settings_preview(state, hwnd);
                     return LRESULT(0);
@@ -2962,15 +3564,38 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                     let orient_idx = (0..ORIENT_LABELS.len())
                         .find(|&i| is_checked(hwnd, IDC_ORIENT_BASE + i))
                         .unwrap_or(0);
-                    state.config.capsule.orientation = crate::config::ORIENTATIONS[orient_idx].to_string();
-                    let picked = read_cards(hwnd);
+                    state.config.capsule.orientation =
+                        crate::config::ORIENTATIONS[orient_idx].to_string();
+                    let was_big = state.config.capsule.expand_big();
+                    let style_idx = (0..STYLE_LABELS.len())
+                        .find(|&i| is_checked(hwnd, IDC_STYLE_BASE + i))
+                        .unwrap_or(0);
+                    state.config.capsule.expand_style =
+                        crate::config::EXPAND_STYLES[style_idx].to_string();
+                    // 展开样式只影响展开形态：切换时先收起，避免旧面板几何残留
+                    if was_big != state.config.capsule.expand_big() && state.view.expanded() {
+                        collapse(state);
+                    }
+                    let mut picked = read_cards(hwnd);
                     // 兜底：手改配置把六项全关掉时，按"至少保留一张卡片"回到全开
-                    state.config.capsule.cards = if picked.any() { picked } else { CardVis::default() };
+                    if !picked.any() {
+                        picked = CardVis::default();
+                    } else {
+                        // 顺序取设置窗里记录的勾选先后
+                        picked.order = state.settings_card_order;
+                    }
+                    state.config.capsule.cards = picked;
 
                     // 方向变了：先落到该方向的默认位置（竖条贴右缘 / 横条贴顶边），
                     // 免得横竖互相"卡"在对方的位置上；再统一应用布局
                     let want_v = state.config.capsule.orientation_hint() == Some(true);
-                    let cur_v = state.shared.read().unwrap().vertical;
+                    let cur_v = match state.shared.read() {
+                        Ok(g) => g.vertical,
+                        Err(e) => {
+                            eprintln!("[App] RwLock poisoned in settings_wndproc cur_v: {:?}", e);
+                            return LRESULT(0);
+                        }
+                    };
                     if want_v != cur_v {
                         let (cw, _) = collapsed_main_size(want_v);
                         let (dx, dy) = default_capsule_pos(cw as i32, want_v);
@@ -2999,10 +3624,17 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
 
                     // 立即生效：主题/掩码/主机名同步给渲染侧并强制重绘一帧
                     {
-                        let mut sh = state.shared.write().unwrap();
+                        let mut sh = match state.shared.write() {
+                            Ok(g) => g,
+                            Err(e) => {
+                                eprintln!("[App] RwLock poisoned in settings_wndproc final sync: {:?}", e);
+                                return LRESULT(0);
+                            }
+                        };
                         sh.nas_host = state.config.nas.host.clone();
                         sh.dark = state.config.capsule.theme_dark();
                         sh.cards = state.config.capsule.cards;
+                        sh.big = state.config.capsule.expand_big();
                         sh.bump_seq();
                     }
                     if state.config.capsule.taskbar_pin != was_pinned {
@@ -3047,7 +3679,9 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
                                 Ok(()) => "连接成功",
                                 Err(e) => Box::leak(e.into_boxed_str()),
                             };
-                            if let Ok(ctl) = GetDlgItem(HWND(hwnd_isize as *mut _), IDC_TEST_RESULT as i32) {
+                            if let Ok(ctl) =
+                                GetDlgItem(HWND(hwnd_isize as *mut _), IDC_TEST_RESULT as i32)
+                            {
                                 let wide: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
                                 let _ = SetWindowTextW(ctl, PCWSTR(wide.as_ptr()));
                             }
@@ -3077,7 +3711,12 @@ fn settings_wndproc_impl(state: &mut AppState, hwnd: HWND, msg: u32, wparam: WPA
     }
 }
 
-unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn settings_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_NCCREATE {
         let cs = lparam.0 as *const CREATESTRUCTW;
         if !cs.is_null() {

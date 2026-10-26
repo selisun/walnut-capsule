@@ -53,7 +53,21 @@ func NewAdmin(prefix string, d AdminDeps) http.Handler {
 	mux.HandleFunc("/api/logs", requireAdmin(a.handleLogs))
 	mux.HandleFunc("/api/icon", a.handleIcon)
 	mux.HandleFunc("/api/download", a.handleDownload)
-	return stripPrefix(prefix, mux)
+	return stripPrefix(prefix, securityHeaders(mux))
+}
+
+// securityHeaders 给管理页统一加基础安全响应头：
+// 禁止内容类型嗅探、不外带 Referer；`/api/` 下的响应一律不缓存（其中含令牌与实时数据）。
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // requireAdmin 校验网关转发的管理员身份；非管理员一律 403。
@@ -133,6 +147,7 @@ func (a *admin) handleState(w http.ResponseWriter, _ *http.Request) {
 		"ifaces":           a.Col.NetIfaces(),
 		"net_speeds":       a.Col.NetSpeeds(),         // 手动填写的协商速率（网卡名 → Mbps）
 		"speed_effective":  a.Col.NetSpeedEffective(), // 生效网卡的协商速率（0=未知）
+		"gpu_status":       a.Col.GPUStatus(),         // 显卡采集状态（正常/驱动未加载/设备未就绪…）
 		"service_port":     a.ServicePort,
 		"client_version":   a.ClientVersion,
 		"client_size":      a.ClientSize,
@@ -162,6 +177,8 @@ func (a *admin) handleIface(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ifaceReq
+	// 请求体只有一个小 JSON：限制 4KB，避免超大 body 占用内存（NAS 端内存限额 15MB）
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
@@ -205,6 +222,7 @@ func (a *admin) handleNetSpeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req netSpeedReq
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
@@ -252,6 +270,10 @@ func (a *admin) handleTokenReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "token": tok})
 }
 
+// maxLogTailBytes 单次最多读日志末尾 256KB：日志会长期累积，
+// 整份读入会按文件大小吃内存（NAS 端内存限额 15MB），这里只读尾部。
+const maxLogTailBytes = 256 << 10
+
 func (a *admin) handleLogs(w http.ResponseWriter, r *http.Request) {
 	n := 200
 	if v := r.URL.Query().Get("lines"); v != "" {
@@ -264,12 +286,33 @@ func (a *admin) handleLogs(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("(未配置日志路径)"))
 		return
 	}
-	b, err := os.ReadFile(a.LogPath)
+	f, err := os.Open(a.LogPath)
 	if err != nil {
 		_, _ = w.Write([]byte("(读取日志失败: " + err.Error() + ")"))
 		return
 	}
-	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		_, _ = w.Write([]byte("(读取日志失败: " + err.Error() + ")"))
+		return
+	}
+	size := st.Size()
+	start := int64(0)
+	if size > maxLogTailBytes {
+		start = size - maxLogTailBytes
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err != nil && size > start {
+		_, _ = w.Write([]byte("(读取日志失败: " + err.Error() + ")"))
+		return
+	}
+	text := strings.TrimRight(string(buf), "\n")
+	lines := strings.Split(text, "\n")
+	// 从文件中间截断时，第一行可能不完整，直接丢掉
+	if start > 0 && len(lines) > 1 {
+		lines = lines[1:]
+	}
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}

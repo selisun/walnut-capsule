@@ -27,7 +27,7 @@ header{display:flex;align-items:center;justify-content:space-between;gap:12px;ma
 .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 12px;border-radius:999px;background:#eef2f7;color:#475569;font-variant-numeric:tabular-nums}
 .chip .dot{color:#cbd5e1}
 /* 概览信息条 */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
 .stat{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
 .stat .k{font-size:12px;color:#9ca3af;margin-bottom:2px}
 .stat .v{font-size:15px;font-weight:600;color:#111827;word-break:break-all}
@@ -83,6 +83,7 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
   <div class="stat"><div class="k">版本</div><div class="v" id="stVer">—</div></div>
   <div class="stat"><div class="k">已运行</div><div class="v" id="stUp">—</div></div>
   <div class="stat"><div class="k">服务端口</div><div class="v" id="stPort">—</div></div>
+  <div class="stat"><div class="k">显卡采集</div><div class="v" id="stGpu">—</div></div>
 </div>
 
 <div class="grid">
@@ -202,6 +203,7 @@ function loadState(){
     document.getElementById('stVer').textContent = s.version || '—';
     document.getElementById('stUp').textContent = fmtDur(s.uptime_sec || 0);
     document.getElementById('stPort').textContent = s.service_port || '—';
+    document.getElementById('stGpu').textContent = s.gpu_status || '—';
     setTokenMasked(s.token_masked);
     var sel = document.getElementById('ifaceSel');
     sel.innerHTML = '';

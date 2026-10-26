@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"log"
 	"math"
 	"os"
 	"os/exec"
@@ -13,12 +14,20 @@ import (
 )
 
 // gpuSampler 采集显卡占用，独显优先、核显兜底（两者不同时展示）：
-//   - 独显：nvidia-smi（2~5s 间隔，由外层调度）；未安装或未插卡时自动跳过；
+//   - 独显：nvidia-smi（2~5s 间隔，由外层调度）；未安装、驱动未加载或执行失败时跳过；
 //   - 核显：/sys/class/drm 下的 Intel(i915) / AMD(amdgpu)，无需额外工具，
 //     仅在检测不到独显时才作为数据源。
 type gpuSampler struct {
 	path string
 	sys  string
+
+	// 采集状态：短文案给管理页展示，reason 给日志（只在变化时打一条）。
+	status string
+	reason string
+	// 连续失败次数与退避到期时间：nvidia-smi 执行失败后按 60s → 300s 退避，
+	// 不再每个采样周期都重试。
+	nvFails   int
+	nvNextTry time.Time
 
 	// 核显 RC6 基线：i915 不导出 gpu_busy_percent，用 rc6_residency_ms
 	// 的增量反推活跃度，需要保留上一次的读数与时间。
@@ -28,6 +37,24 @@ type gpuSampler struct {
 	mu   sync.RWMutex
 	gpus []GPU
 }
+
+// NVIDIA 驱动的两个判据（两者都要满足才会调用 nvidia-smi）：
+//   - /sys/module/nvidia：内核模块是否已加载；
+//   - /dev/nvidiactl：模块初始化后由 udev 创建的控制设备。
+const (
+	nvidiaModDir  = "/sys/module/nvidia"
+	nvidiaDevNode = "/dev/nvidiactl"
+)
+
+// 管理页展示的显卡采集状态（尽量短，表格一列放得下）。
+const (
+	gpuStatusPending = "检测中"
+	gpuStatusOK      = "正常"
+	gpuStatusNoTool  = "无驱动工具"
+	gpuStatusNoDrv   = "驱动未加载"
+	gpuStatusNoNode  = "设备未就绪"
+	gpuStatusFailed  = "采集异常"
+)
 
 func newGPUSampler(sys string) *gpuSampler {
 	path, _ := exec.LookPath("nvidia-smi")
@@ -61,10 +88,28 @@ func (s *gpuSampler) sample() {
 	s.mu.Unlock()
 }
 
-// sampleNvidia 经 nvidia-smi 采集独显信息；未安装或执行失败返回 nil。
+// sampleNvidia 经 nvidia-smi 采集独显信息；未安装、驱动未加载或执行失败返回 nil。
+//
+// 关键：先确认驱动真的加载了再调用 nvidia-smi。设备节点缺失时调用 nvidia-smi，
+// 它会连带触发 nvidia-modprobe → modprobe，把上百 MB 的 nvidia.ko 读进来尝试
+// insmod；在驱动被安全策略拒绝的机器上（老笔记本转 NAS 很常见）这每次要烧掉
+// 几百毫秒内核态 CPU，且 nvidia-smi 进程只活零点几秒，按秒采样的进程列表根本
+// 抓不到——表现为「查不到进程的持续 20~30% CPU 占用」。
 func (s *gpuSampler) sampleNvidia() []GPU {
 	if s.path == "" {
+		s.setState(gpuStatusNoTool, "未检测到 nvidia-smi（未安装 NVIDIA 驱动工具）")
 		return nil
+	}
+	if _, err := os.Stat(nvidiaModDir); err != nil {
+		s.setState(gpuStatusNoDrv, "NVIDIA 驱动未加载（缺少 "+nvidiaModDir+"）")
+		return nil
+	}
+	if _, err := os.Stat(nvidiaDevNode); err != nil {
+		s.setState(gpuStatusNoNode, "NVIDIA 驱动已加载，但缺少 "+nvidiaDevNode+"（udev 未创建或权限受限）")
+		return nil
+	}
+	if time.Now().Before(s.nvNextTry) {
+		return nil // 上次执行失败，退避中（状态保持「采集异常」）
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -72,8 +117,13 @@ func (s *gpuSampler) sampleNvidia() []GPU {
 		"--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
+		s.backoff()
+		s.setState(gpuStatusFailed, "nvidia-smi 执行失败："+err.Error()+"，已退避")
 		return nil
 	}
+	s.nvFails = 0
+	s.nvNextTry = time.Time{}
+	s.setState(gpuStatusOK, "")
 	var gpus []GPU
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		f := strings.Split(line, ",")
@@ -97,6 +147,43 @@ func (s *gpuSampler) sampleNvidia() []GPU {
 		})
 	}
 	return gpus
+}
+
+// Status 返回显卡采集状态短文案（管理页展示，说明为什么没有显卡数据）。
+func (s *gpuSampler) Status() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.status == "" {
+		return gpuStatusPending
+	}
+	return s.status
+}
+
+// setState 更新采集状态；reason 非空表示不可用/异常，仅在原因变化时记一条日志，
+// 避免老机器上日志刷屏。
+func (s *gpuSampler) setState(short, reason string) {
+	s.mu.Lock()
+	changed := s.status != short || s.reason != reason
+	s.status, s.reason = short, reason
+	s.mu.Unlock()
+	if !changed {
+		return
+	}
+	if reason == "" {
+		log.Printf("NVIDIA 驱动可用，开始通过 nvidia-smi 采集独显")
+		return
+	}
+	log.Printf("%s；已跳过独显采集，避免反复触发 nvidia-modprobe 加载驱动", reason)
+}
+
+// backoff 为执行失败的 nvidia-smi 设置退避：首次 60s，之后 300s。
+func (s *gpuSampler) backoff() {
+	s.nvFails++
+	d := 60 * time.Second
+	if s.nvFails >= 2 {
+		d = 300 * time.Second
+	}
+	s.nvNextTry = time.Now().Add(d)
 }
 
 // sampleIGPU 扫描 /sys/class/drm/card*，采集核显使用率与温度，编号从 0 起。

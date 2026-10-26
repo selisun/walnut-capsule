@@ -18,7 +18,8 @@ const RAM: &str = r#"<path d="M6 19v-3M10 19v-3M14 19v-3M18 19v-3M8 11V9M16 11V9
 const DISK: &str = r#"<line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/>"#;
 
 /// Lucide「arrow-up-down」：网络上下行速率。
-const NET: &str = r#"<path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>"#;
+const NET: &str =
+    r#"<path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>"#;
 
 /// 收起态药丸胶囊用的四个图标（按统一颜色一次性渲染）。
 pub struct Icons {
@@ -60,7 +61,11 @@ fn render(svg: String, size: u32) -> Option<Pixmap> {
     let mut pm = resvg::tiny_skia::Pixmap::new(size, size)?;
     pm.fill(resvg::tiny_skia::Color::TRANSPARENT);
     let s = size as f32 / tree.size().width();
-    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(s, s), &mut pm.as_mut());
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(s, s),
+        &mut pm.as_mut(),
+    );
     let mut out = Pixmap::new(size, size)?;
     out.data_mut().copy_from_slice(pm.data());
     Some(out)

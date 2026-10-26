@@ -24,6 +24,31 @@ pub fn bytes(b: u64) -> String {
     }
 }
 
+/// 字节 → 标准单位写法（1024 进制）："180 B" / "845 KB" / "1.4 MB" / "3.5 GB" / "1.2 TB"。
+/// 三位整数以上不带小数，避免 "999.9 GB" 这类读起来费劲的写法。
+pub fn bytes_unit(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if b < 1024 {
+        return format!("{b} B");
+    }
+    let mut v = b as f64;
+    let mut i = 0usize;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v >= 100.0 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// 标准单位速率："180 B/s" / "845 KB/s" / "1.4 MB/s"。
+pub fn rate_unit(bps: u64) -> String {
+    format!("{}/s", bytes_unit(bps))
+}
+
 /// 网卡协商速率（Mbps）→ "100 Mbps" / "1 Gbps" / "2.5 Gbps" / "10 Gbps"。
 /// 0（未知）返回空串，调用方据此不显示。
 pub fn link_speed(mbps: u32) -> String {

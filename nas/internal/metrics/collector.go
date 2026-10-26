@@ -21,19 +21,22 @@ type Collector struct {
 	disk     *diskSampler
 	gpu      *gpuSampler
 	net      *netSampler
+	traffic  *trafficStore
 	hostname string
 }
 
-func NewCollector() *Collector {
+func NewCollector(stateDir string) *Collector {
 	proc := getenvOr("HOST_PROC", "/proc")
 	sys := getenvOr("HOST_SYS", "/sys")
 	root := getenvOr("HOST_ROOT", "") // 宿主机根在容器内的挂载点（/host/root），用于还原宿主路径
+	traffic := newTrafficStore(stateDir)
 	c := &Collector{
 		cpu:      newCPUSampler(proc, sys),
 		mem:      newMemSampler(proc),
 		disk:     newDiskSampler(proc, sys, root),
 		gpu:      newGPUSampler(sys),
-		net:      newNetSampler(proc, sys),
+		net:      newNetSampler(proc, sys, traffic),
+		traffic:  traffic,
 		hostname: readHostname(proc),
 	}
 	// 启动时打一次温度源探测结果，便于用户报「CPU 温度不显示」时凭日志定位
@@ -90,21 +93,37 @@ func (c *Collector) Run() {
 // Snapshot 聚合当前各采样器的最新值。
 func (c *Collector) Snapshot() Snapshot {
 	usage, temp := c.cpu.snapshot()
-	memUsage, memUsed, memTotal := c.mem.snapshot()
+	l1, l5, l15, hasLoad, l30 := c.cpu.loadSnapshot()
+	memUsage, memUsed, memTotal, memCache, memFree := c.mem.snapshot()
+	cpu := CPU{Usage: usage, Temp: temp}
+	if hasLoad {
+		cpu.Load1, cpu.Load5, cpu.Load15 = &l1, &l5, &l15
+		cpu.Load30 = l30
+	}
 	return Snapshot{
 		Timestamp: time.Now().UnixMilli(),
 		Hostname:  c.hostname,
-		CPU:       CPU{Usage: usage, Temp: temp},
-		Memory:    Memory{Usage: memUsage, Used: memUsed, Total: memTotal},
-		Disks:     c.disk.snapshot(),
-		Volumes:   c.disk.snapshotVolumes(),
-		GPUs:      c.gpu.snapshot(),
-		Network:   c.net.snapshot(),
+		CPU:       cpu,
+		Memory: Memory{
+			Usage: memUsage,
+			Used:  memUsed,
+			Total: memTotal,
+			Cache: memCache,
+			Free:  memFree,
+		},
+		Disks:   c.disk.snapshot(),
+		Volumes: c.disk.snapshotVolumes(),
+		GPUs:    c.gpu.snapshot(),
+		Network: c.net.snapshot(),
+		Traffic: c.traffic.snapshot(),
 	}
 }
 
 // Hostname 返回宿主机名（启动时读取一次）。
 func (c *Collector) Hostname() string { return c.hostname }
+
+// GPUStatus 返回显卡采集状态短文案（管理页展示，说明为什么没有显卡数据）。
+func (c *Collector) GPUStatus() string { return c.gpu.Status() }
 
 // SetNetIface 运行时切换手动指定网卡（空串恢复自动选择）。
 func (c *Collector) SetNetIface(name string) { c.net.setTarget(name) }

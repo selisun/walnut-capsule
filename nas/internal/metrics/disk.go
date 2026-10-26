@@ -288,6 +288,11 @@ func readSMARTTemp(name string) *int {
 	defer cancel()
 	// smartctl 退出码非零也常带有效 JSON，忽略 err 直接解析 stdout。
 	out, _ := exec.CommandContext(ctx, "smartctl", "-n", "standby", "-a", "-j", "/dev/"+name).Output()
+	// 边界检查：SMART JSON 正常 5-15KB，限 256KB 防御异常输出
+	if len(out) > 262144 {
+		log.Printf("smartctl %s 输出过大 (%d 字节)，跳过", name, len(out))
+		return nil
+	}
 	var sj smartJSON
 	if err := json.Unmarshal(out, &sj); err != nil {
 		log.Printf("smartctl parse %s: %v", name, err)

@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "hetao-capsule"
-version = "0.1.29"
+version = "0.1.60"
 edition = "2021"
 
 [dependencies]
@@ -23,6 +23,7 @@ windows = { version = "0.58", features = [
     "Win32_Networking_WinSock",
     "Win32_Media",
     "Win32_System_Com",
+    "Win32_Security",
 ] }
 
 [profile.release]

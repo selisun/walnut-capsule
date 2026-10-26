@@ -229,6 +229,7 @@ func buildPayload(snap *metrics.Snapshot, prefixes map[string]bool) map[string]a
 	}
 	if full || prefixes["net"] {
 		out["network"] = snap.Network
+		out["traffic"] = snap.Traffic
 	}
 	return out
 }

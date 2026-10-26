@@ -35,18 +35,22 @@ type netSampler struct {
 	prev   map[string]netCounter
 	prevAt time.Time
 	seen   map[string]netCounter // 所有见过的非虚拟网卡累计流量（用于自动选主力）
+
+	// traffic 记录目标网卡的今日 / 本月 / 总量累计（可跨重启持久化）
+	traffic *trafficStore
 }
 
 type netCounter struct{ rx, tx uint64 }
 
-func newNetSampler(proc, sys string) *netSampler {
+func newNetSampler(proc, sys string, traffic *trafficStore) *netSampler {
 	return &netSampler{
-		proc:   proc,
-		sys:    sys,
-		target: getenvOr("NET_IFACE", ""),
-		speeds: map[string]int{},
-		prev:   map[string]netCounter{},
-		seen:   map[string]netCounter{},
+		proc:    proc,
+		sys:     sys,
+		target:  getenvOr("NET_IFACE", ""),
+		speeds:  map[string]int{},
+		prev:    map[string]netCounter{},
+		seen:    map[string]netCounter{},
+		traffic: traffic,
 	}
 }
 
@@ -164,6 +168,7 @@ func (s *netSampler) sample() {
 	}
 	now := time.Now()
 	cur := map[string]netCounter{}
+	seen := map[string]netCounter{} // 本次采样的累计流量快照
 	for _, line := range strings.Split(string(b), "\n") {
 		i := strings.IndexByte(line, ':')
 		if i < 0 {
@@ -182,9 +187,9 @@ func (s *netSampler) sample() {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		cur[name] = netCounter{rx: rx, tx: tx}
-		// 记录累计流量，供自动选择主力网卡用
-		s.seen[name] = netCounter{rx: rx, tx: tx}
+		cnt := netCounter{rx: rx, tx: tx}
+		cur[name] = cnt
+		seen[name] = cnt // 填本地副本，稍后一次性持锁更新 s.seen
 	}
 
 	// 选择目标网卡：手动指定 > 默认路由网卡 > 累计流量最大
@@ -195,6 +200,11 @@ func (s *netSampler) sample() {
 		target = defaultRouteIface(s.proc)
 	}
 	if target == "" {
+		// 拿写锁，同时更新 s.seen 并读取用于选择主力网卡
+		s.mu.Lock()
+		for name, c := range seen {
+			s.seen[name] = c
+		}
 		var best string
 		var bestTotal uint64
 		for name, c := range s.seen {
@@ -205,7 +215,20 @@ func (s *netSampler) sample() {
 				best = name
 			}
 		}
+		s.mu.Unlock()
 		target = best
+	} else {
+		// 已选定目标网卡，只需更新 s.seen
+		s.mu.Lock()
+		for name, c := range seen {
+			s.seen[name] = c
+		}
+		s.mu.Unlock()
+	}
+
+	// 累计流量：拿该网卡自开机起的计数推进「今日 / 本月 / 总量」
+	if c, ok := cur[target]; ok && s.traffic != nil {
+		s.traffic.add(target, c.rx, c.tx)
 	}
 
 	s.mu.Lock()

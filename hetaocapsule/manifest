@@ -1,5 +1,5 @@
-appname=hetaocapsule
-version=0.1.36
+﻿appname=hetaocapsule
+version=0.1.71
 display_name=核桃胶囊
 desc=<p>核桃胶囊是一款轻量 NAS 状态监控应用：在电脑桌面以悬浮胶囊实时显示 NAS 的 CPU、内存、网络速率、硬盘读写与存储卷用量。</p><p>应用内置管理页，可查看并复制配对令牌、选择监控网卡、手动设置网卡协商速率、查看运行日志，并直接下载 Windows 电脑客户端。数据仅在局域网内传输，不监听公网、不收集任何用户数据。</p>
 platform=x86
@@ -8,16 +8,17 @@ maintainer=蓝胖纸
 maintainer_url=https://github.com/selisun/walnut-capsule
 distributor=蓝胖纸
 distributor_url=https://blog.mzl.cc
+icon_url=https://raw.githubusercontent.com/selisun/walnut-capsule/main/hetaocapsule/ICON_256.PNG
 # service_port 仅是名义默认值：实际监听端口由安装向导填写并写入 ${TRIM_PKGVAR}/port，
 # 因此不开平台端口占用检查（checkport=false），否则会拿 8765 误判用户自选端口。
 service_port=8765
 desktop_uidir=ui
 desktop_applaunchname=hetaocapsule.Application
 checkport=false
-# 本应用不使用用户文件/目录授权功能，隐藏设置页里无意义的“授权目录”项
+# 本应用不使用用户文件/目录授权功能，隐藏设置页里无意义的"授权目录"项
 disable_authorization_path=true
 # 桌面管理页走飞牛统一网关（/app/hetaocapsule），需 1.1.3100+
 # 注意：appname 不能含点（如 com.hetao.capsule），否则 appcenter 不解析 gateway 字段导致桌面图标 404
 os_min_version=1.1.3100
 ctl_stop=true
-changelog=修复：暗色任务栏下三环内的 CPU / 内存文字看不清；电脑客户端更新至 0.1.29
+changelog=新增：1、展开样式新增大卡片样式；2、卡片顺序按勾选先后排列；3、安装端口可自定义。修复：1、一些设备 CPU 持续占用较高的问题；2、若干已知问题；3、安全加固若干功能。

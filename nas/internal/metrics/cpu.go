@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // cpuSampler 读取 /proc/stat 计算使用率；温度优先读 /sys/class/hwmon（AMD k10temp 只注册 hwmon），
@@ -20,9 +21,22 @@ type cpuSampler struct {
 	mu      sync.RWMutex
 	usage   float64
 	temp    *float64
-	prevAll uint64
-	prevIdl uint64
-	hasPrev bool
+	load    [3]float64
+	hasLoad bool
+	// 30 分钟平均负载：对 load1 的逐秒采样取均值（内核只给 1/5/15 分钟三档）
+	load30   *float64
+	loadHist []loadSample
+	prevAll  uint64
+	prevIdl  uint64
+	hasPrev  bool
+}
+
+// load30Window 是自算「30 分钟平均负载」的窗口长度；采样覆盖满整个窗口才给值。
+const load30Window = 30 * time.Minute
+
+type loadSample struct {
+	at int64 // Unix 秒
+	v  float64
 }
 
 func newCPUSampler(proc, sys string) *cpuSampler {
@@ -35,9 +49,68 @@ func (s *cpuSampler) snapshot() (float64, *float64) {
 	return s.usage, s.temp
 }
 
+// loadSnapshot 返回 1 / 5 / 15 分钟平均负载与自算的 30 分钟均值；读取失败时 ok=false。
+func (s *cpuSampler) loadSnapshot() (l1, l5, l15 float64, ok bool, l30 *float64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.load[0], s.load[1], s.load[2], s.hasLoad, s.load30
+}
+
 func (s *cpuSampler) sample() {
 	s.sampleUsage()
 	s.sampleTemp()
+	s.sampleLoad()
+}
+
+// sampleLoad 读 /proc/loadavg 的前三个字段（1/5/15 分钟平均负载）。无需 root、零 IO。
+func (s *cpuSampler) sampleLoad() {
+	b, err := os.ReadFile(filepath.Join(s.proc, "loadavg"))
+	if err != nil {
+		return
+	}
+	f := strings.Fields(string(b))
+	if len(f) < 3 {
+		return
+	}
+	var v [3]float64
+	for i := 0; i < 3; i++ {
+		n, err := strconv.ParseFloat(f[i], 64)
+		if err != nil {
+			return
+		}
+		v[i] = n
+	}
+	s.mu.Lock()
+	s.load = v
+	s.hasLoad = true
+	s.pushLoad(time.Now(), v[0])
+	s.mu.Unlock()
+}
+
+// pushLoad 记录一次 load1 采样并维护 30 分钟窗口（调用方需持有写锁）。
+// 窗口覆盖满 30 分钟才给 load30——刚启动时只有几分钟数据，不能当成"30 分钟平均"。
+func (s *cpuSampler) pushLoad(now time.Time, l1 float64) {
+	cut := now.Add(-load30Window).Unix()
+	s.loadHist = append(s.loadHist, loadSample{at: now.Unix(), v: l1})
+	// 丢掉窗口外的样本
+	drop := 0
+	for drop < len(s.loadHist) && s.loadHist[drop].at < cut {
+		drop++
+	}
+	if drop > 0 {
+		s.loadHist = s.loadHist[drop:]
+	}
+	// 最早样本还没到窗口边界（采样不足 30 分钟）→ 不给值
+	if len(s.loadHist) == 0 || s.loadHist[0].at > cut+2 {
+		s.load30 = nil
+		return
+	}
+	sum := 0.0
+	for _, e := range s.loadHist {
+		sum += e.v
+	}
+	m := sum / float64(len(s.loadHist))
+	s.load30 = &m
 }
 
 func (s *cpuSampler) sampleUsage() {

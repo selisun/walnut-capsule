@@ -19,6 +19,10 @@ read_pid() {
 case $1 in
 start)
     mkdir -p "${TRIM_PKGVAR}"
+    # 日志轮转：超过 4MB 就留一份 .1 覆盖旧档，避免长期累积写满数据盘
+    if [ -f "${LOG_FILE}" ] && [ "$(stat -c %s "${LOG_FILE}" 2>/dev/null || echo 0)" -gt 4194304 ]; then
+        mv -f "${LOG_FILE}" "${LOG_FILE}.1"
+    fi
     pid="$(read_pid)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         exit 0  # 已在运行，幂等

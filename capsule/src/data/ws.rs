@@ -23,13 +23,25 @@ impl DataSource for WsSource {
 
         loop {
             // 处理积压命令
-            match drain_cmds(&cx, &mut target, &mut token, &mut detail, &mut force_reconnect) {
+            match drain_cmds(
+                &cx,
+                &mut target,
+                &mut token,
+                &mut detail,
+                &mut force_reconnect,
+            ) {
                 CmdFlow::Continue => {}
                 CmdFlow::Shutdown => return,
             }
 
             set_status(&cx, ConnStatus::Connecting);
-            match session(&cx, &mut target, &mut token, &mut detail, &mut force_reconnect) {
+            match session(
+                &cx,
+                &mut target,
+                &mut token,
+                &mut detail,
+                &mut force_reconnect,
+            ) {
                 SessionEnd::Shutdown => return,
                 SessionEnd::Reconnect => {
                     if force_reconnect {
@@ -84,7 +96,13 @@ fn drain_cmds(
 }
 
 fn set_status(cx: &SourceCtx, status: ConnStatus) {
-    let mut st = cx.state.write().unwrap();
+    let mut st = match cx.state.write() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[WsSource] RwLock poisoned in set_status: {:?}", e);
+            return;
+        }
+    };
     st.conn = status;
     st.bump_seq();
     post_update(cx.hwnd);
@@ -92,7 +110,12 @@ fn set_status(cx: &SourceCtx, status: ConnStatus) {
 
 /// 可中断的睡眠：期间响应 Shutdown / SetTarget（提前醒来重连）。
 /// 收到 SetTarget 时写入新的地址与令牌并立即结束睡眠，返回 true 表示应退出线程。
-fn sleep_or_shutdown(cx: &SourceCtx, total: Duration, target: &mut String, token: &mut String) -> bool {
+fn sleep_or_shutdown(
+    cx: &SourceCtx,
+    total: Duration,
+    target: &mut String,
+    token: &mut String,
+) -> bool {
     let step = Duration::from_millis(100);
     let mut slept = Duration::ZERO;
     while slept < total {
@@ -211,7 +234,13 @@ fn handle_push(cx: &SourceCtx, txt: &str) {
         Ok(v) => v,
         Err(_) => return, // 坏包丢弃，等下一帧
     };
-    let mut st = cx.state.write().unwrap();
+    let mut st = match cx.state.write() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[WsSource] RwLock poisoned in handle_push: {:?}", e);
+            return;
+        }
+    };
     let mut next = (*st.snap).clone();
     next.merge(&inc);
     st.snap = Arc::new(next);

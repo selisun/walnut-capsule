@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"crypto/sha256"
@@ -27,11 +27,11 @@ const defaultPort = 8765
 
 // appVersion 仅作 TRIM_APPVER 缺失时的兜底显示，正常由 fpk 注入。
 // 需与 hetaocapsule/manifest 的 version 保持一致。
-const appVersion = "0.1.36"
+const appVersion = "0.1.71"
 
 // clientVersion 电脑端安装器版本，需与 capsule/installer/hetao-capsule.iss 的 AppVer 一致。
 // 版本策略：客户端与 fpk 各自独立计数——客户端每改一次递增；fpk 有改动也递增。
-const clientVersion = "0.1.29"
+const clientVersion = "0.1.60"
 
 func main() {
 	flagAddr := flag.String("addr", "", "监听地址（默认取安装时填写的端口，缺失回落 :8765）")
@@ -54,7 +54,7 @@ func main() {
 	tok.Ensure()
 	log.Printf("配对令牌已就绪：%s（完整值请在本应用管理页点「显示」查看/复制）", server.MaskToken(tok.Get()))
 
-	col := metrics.NewCollector()
+	col := metrics.NewCollector(stateDir)
 
 	// 网卡选择：状态目录里若存有 iface 且未用 NET_IFACE 环境变量强制指定，则应用之。
 	if stateDir != "" && os.Getenv("NET_IFACE") == "" {
@@ -68,13 +68,18 @@ func main() {
 	// 手动协商速率：WiFi 网卡不导出 sysfs speed，管理页填写的值存于状态目录，启动时恢复。
 	if stateDir != "" {
 		if b, err := os.ReadFile(filepath.Join(stateDir, "netspeed")); err == nil {
-			var m map[string]int
-			if err := json.Unmarshal(b, &m); err == nil {
-				for name, mbps := range m {
-					col.SetNetSpeed(name, mbps)
-				}
+			// 边界检查：正常应 <100 字节，限 4KB 防御异常写入
+			if len(b) > 4096 {
+				log.Printf("netspeed 文件过大 (%d 字节)，跳过", len(b))
 			} else {
-				log.Printf("解析 netspeed 失败：%v", err)
+				var m map[string]int
+				if err := json.Unmarshal(b, &m); err == nil {
+					for name, mbps := range m {
+						col.SetNetSpeed(name, mbps)
+					}
+				} else {
+					log.Printf("解析 netspeed 失败：%v", err)
+				}
 			}
 		}
 	}
@@ -95,6 +100,8 @@ func main() {
 		Addr:              listenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		// 只约束 keep-alive 的空闲连接；WebSocket 握手后连接被接管，不受此限
+		IdleTimeout: 120 * time.Second,
 	}
 	log.Printf("hetao-nas listening on %s", listenAddr)
 	log.Fatal(httpSrv.ListenAndServe())
@@ -215,7 +222,15 @@ func serveAdmin(appDest, stateDir string, col *metrics.Collector, tok *server.To
 		Start:         time.Now(),
 	})
 	go func() {
-		if err := (&http.Server{Handler: h}).Serve(ln); err != nil {
+		// 本机 unix socket 上的管理页：加超时，避免慢请求长期占住连接
+		s := &http.Server{
+			Handler:           h,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      120 * time.Second, // 安装包约 4MB，慢速局域网也要传完
+			IdleTimeout:       60 * time.Second,
+		}
+		if err := s.Serve(ln); err != nil {
 			log.Printf("admin socket serve: %v", err)
 		}
 	}()

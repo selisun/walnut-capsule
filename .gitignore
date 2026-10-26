@@ -66,3 +66,13 @@ nas/deploy/
 
 # ── 上架提交用的打包（不入库；发行包走 hetaocapsule_<版本>.fpk）──
 核桃胶囊_*.zip
+
+# ── 内部审计 / 用户反馈 / 临时素材（不入库）──────────────
+P2-审计报告.md
+用户反馈待解决.md
+err.txt
+gen_bgm*.cs
+docs/
+
+# ── 历史 fpk 构建产物（不入库）────────────────────────
+hetaocapsule/hetaocapsule_*.fpk

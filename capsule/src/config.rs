@@ -21,9 +21,6 @@ pub struct NasConfig {
     /// 配对令牌：与服务端 CAPSULE_TOKEN / 启动日志中的令牌一致
     #[serde(default)]
     pub token: String,
-    /// 数据源：ws（连 NAS）| fake（模拟数据）
-    #[serde(default = "default_source")]
-    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +45,9 @@ pub struct CapsuleConfig {
     /// 显示方向：auto（拖动到左右边缘自动竖排）| h（横向药丸）| v（竖向细长条）
     #[serde(default = "default_orientation")]
     pub orientation: String,
+    /// 展开样式：panel（320 小面板）| big（贴屏幕侧边滑出的超大卡片）
+    #[serde(default = "default_expand_style")]
+    pub expand_style: String,
     /// 展开面板各类卡片的显示开关（收起态与任务栏三环不受影响）
     #[serde(default)]
     pub cards: CardVis,
@@ -69,6 +69,7 @@ impl Default for CapsuleConfig {
             taskbar_pin: false,
             taskbar_x: None,
             orientation: default_orientation(),
+            expand_style: default_expand_style(),
             cards: CardVis::default(),
             click_outside_collapse: true,
             hide_on_fullscreen: true,
@@ -89,6 +90,16 @@ impl CapsuleConfig {
 /// 显示方向档位（与设置窗单选顺序一致）。
 pub const ORIENTATIONS: [&str; 3] = ["auto", "h", "v"];
 
+/// 展开样式档位（与设置窗单选顺序一致）：小面板 / 超大卡片。
+pub const EXPAND_STYLES: [&str; 2] = ["panel", "big"];
+
+impl CapsuleConfig {
+    /// 是否使用超大卡片作为展开形态（"big" 之外都按小面板处理）。
+    pub fn expand_big(&self) -> bool {
+        self.expand_style == EXPAND_STYLES[1]
+    }
+}
+
 impl CapsuleConfig {
     /// 方向偏好：Some(true)=竖排，Some(false)=横排，None=自动。
     pub fn orientation_hint(&self) -> Option<bool> {
@@ -98,6 +109,17 @@ impl CapsuleConfig {
             _ => None,
         }
     }
+}
+
+/// 展开面板的卡片数量：CPU / 内存 / 显卡 / 网络 / 硬盘读写 / 存储。
+/// 下标与 `CardVis::all()`、设置窗复选框顺序一致。
+pub const CARD_COUNT: usize = 6;
+
+/// 卡片默认显示顺序（下标即默认次序）。
+pub const DEFAULT_CARD_ORDER: [u8; CARD_COUNT] = [0, 1, 2, 3, 4, 5];
+
+fn default_card_order() -> [u8; CARD_COUNT] {
+    DEFAULT_CARD_ORDER
 }
 
 /// 展开面板的卡片显示开关。缺字段一律视为显示，旧配置零迁移。
@@ -117,11 +139,23 @@ pub struct CardVis {
     /// 存储状态（卷用量 / 盘用量）
     #[serde(default = "default_true")]
     pub storage: bool,
+    /// 显示顺序：`CARD_COUNT` 个卡片下标的一个排列，记录用户在设置里的勾选先后
+    /// （最近勾选的排最后）。缺字段时用默认顺序。
+    #[serde(default = "default_card_order")]
+    pub order: [u8; CARD_COUNT],
 }
 
 impl Default for CardVis {
     fn default() -> Self {
-        Self { cpu: true, memory: true, gpu: true, network: true, disk_io: true, storage: true }
+        Self {
+            cpu: true,
+            memory: true,
+            gpu: true,
+            network: true,
+            disk_io: true,
+            storage: true,
+            order: DEFAULT_CARD_ORDER,
+        }
     }
 }
 
@@ -132,7 +166,14 @@ impl CardVis {
     }
     /// 按设置界面的顺序返回各项当前值，供复选框初始化与"至少保留一项"判定。
     pub fn all(&self) -> [bool; 6] {
-        [self.cpu, self.memory, self.gpu, self.network, self.disk_io, self.storage]
+        [
+            self.cpu,
+            self.memory,
+            self.gpu,
+            self.network,
+            self.disk_io,
+            self.storage,
+        ]
     }
     /// 按设置界面的顺序写入各项。
     pub fn set_all(&mut self, v: [bool; 6]) {
@@ -143,6 +184,43 @@ impl CardVis {
         self.disk_io = v[4];
         self.storage = v[5];
     }
+    /// 按用户勾选先后返回**已勾选**卡片的绘制顺序（其余未勾选的跳过）。
+    /// `order` 里出现重复或越界下标时自动跳过，缺项按默认顺序补在后面。
+    pub fn ordered(&self) -> Vec<usize> {
+        let on = self.all();
+        let mut seen = [false; CARD_COUNT];
+        let mut out = Vec::with_capacity(CARD_COUNT);
+        for &raw in self.order.iter() {
+            let i = raw as usize;
+            if i < CARD_COUNT && on[i] && !seen[i] {
+                seen[i] = true;
+                out.push(i);
+            }
+        }
+        for i in 0..CARD_COUNT {
+            if on[i] && !seen[i] {
+                out.push(i);
+            }
+        }
+        out
+    }
+}
+
+/// 把第 `idx` 张卡片挪到顺序末尾并补全成完整排列（记录勾选先后用）。
+pub fn touch_order(order: &mut [u8; CARD_COUNT], idx: usize) {
+    let mut v: Vec<u8> = order
+        .iter()
+        .copied()
+        .filter(|&x| x as usize != idx)
+        .collect();
+    v.push(idx as u8);
+    // 补全缺失下标，保证仍是 0..CARD_COUNT 的完整排列
+    for i in 0..CARD_COUNT {
+        if !v.contains(&(i as u8)) {
+            v.push(i as u8);
+        }
+    }
+    order.copy_from_slice(&v[..CARD_COUNT]);
 }
 
 impl Default for NasConfig {
@@ -151,21 +229,15 @@ impl Default for NasConfig {
             host: default_host(),
             port: default_port(),
             token: String::new(),
-            source: default_source(),
         }
     }
 }
-
-
 
 fn default_host() -> String {
     "192.168.1.100".to_string()
 }
 fn default_port() -> u16 {
     8765
-}
-fn default_source() -> String {
-    "ws".to_string()
 }
 fn default_opacity() -> f32 {
     1.0
@@ -175,6 +247,9 @@ fn default_true() -> bool {
 }
 fn default_orientation() -> String {
     ORIENTATIONS[0].to_string()
+}
+fn default_expand_style() -> String {
+    EXPAND_STYLES[0].to_string()
 }
 fn default_theme() -> String {
     THEMES[0].to_string()
@@ -232,7 +307,14 @@ pub fn config_path() -> PathBuf {
 pub fn load() -> Config {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
+        Ok(text) => match toml::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // 配置损坏：记录错误并回退到默认值（避免启动失败）
+                eprintln!("警告：配置文件解析失败（{}），使用默认配置", e);
+                Config::default()
+            }
+        },
         Err(_) => {
             // 首次运行：写一份默认配置方便用户手改
             let cfg = Config::default();

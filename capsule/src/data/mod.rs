@@ -1,10 +1,8 @@
 //! 数据源抽象层。
-//! DataSource trait：当前实现 WsSource（连 NAS）与 FakeSource（测试用）。
+//! DataSource trait：当前实现 WsSource（连 NAS）。
 
-pub mod fake;
 pub mod ws;
 
-pub use fake::FakeSource;
 pub use ws::WsSource;
 
 use serde::Deserialize;
@@ -40,6 +38,9 @@ pub struct Snapshot {
     pub gpus: Option<Vec<Gpu>>,
     #[serde(default)]
     pub network: Option<Vec<NetIf>>,
+    /// 目标网卡的累计流量（今日 / 本月 / 总量）
+    #[serde(default)]
+    pub traffic: Option<Traffic>,
 }
 
 impl Snapshot {
@@ -69,6 +70,9 @@ impl Snapshot {
         if inc.network.is_some() {
             self.network = inc.network.clone();
         }
+        if inc.traffic.is_some() {
+            self.traffic = inc.traffic.clone();
+        }
     }
 }
 
@@ -78,6 +82,16 @@ pub struct Cpu {
     pub usage: Option<f64>,
     #[serde(default)]
     pub temp: Option<f64>,
+    /// 平均负载（1 / 5 / 15 分钟），老服务端没有这三个字段
+    #[serde(default)]
+    pub load1: Option<f64>,
+    #[serde(default)]
+    pub load5: Option<f64>,
+    #[serde(default)]
+    pub load15: Option<f64>,
+    /// 30 分钟平均负载（服务端对 load1 采样自算，采样覆盖满 30 分钟才有值）
+    #[serde(default)]
+    pub load30: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +102,12 @@ pub struct Memory {
     pub used: Option<u64>,
     #[serde(default)]
     pub total: Option<u64>,
+    /// 缓存（Buffers + Cached）
+    #[serde(default)]
+    pub cache: Option<u64>,
+    /// 可用（真正的空闲内存）
+    #[serde(default)]
+    pub free: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +164,35 @@ pub struct NetIf {
     pub speed_mbps: Option<u32>,
 }
 
+/// 目标网卡的累计流量（字节）：今日 / 昨日 / 最近 7 日 / 最近 30 日，均含当天，收发分开。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Traffic {
+    #[serde(default)]
+    pub rx_today: u64,
+    #[serde(default)]
+    pub tx_today: u64,
+    #[serde(default)]
+    pub rx_yesterday: u64,
+    #[serde(default)]
+    pub tx_yesterday: u64,
+    #[serde(default)]
+    pub rx_days7: u64,
+    #[serde(default)]
+    pub tx_days7: u64,
+    #[serde(default)]
+    pub rx_days30: u64,
+    #[serde(default)]
+    pub tx_days30: u64,
+    /// 最近 30 天按天序列（旧 → 新），供右栏柱状图
+    #[serde(default)]
+    pub days_rx: Vec<u64>,
+    #[serde(default)]
+    pub days_tx: Vec<u64>,
+    /// 与序列一一对应的日期（"10-25"），悬停提示用
+    #[serde(default)]
+    pub dates: Vec<String>,
+}
+
 /// 连接状态，供 UI 显示。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnStatus {
@@ -191,6 +240,8 @@ pub struct SharedState {
     pub vertical: bool,
     /// 竖排且面板在竖条左侧（胶囊贴屏幕右缘）时为 true：窗口右缘固定、面板向左推。
     pub panel_left: bool,
+    /// 展开样式为超大卡片（贴屏幕侧边滑出，尺寸由 app 计算后通过 View::set_big_geometry 下发）。
+    pub big: bool,
     /// 展开面板卡片显示开关：UI 线程算窗口高度、构建线程画卡片必须共用这一份。
     pub cards: CardVis,
     seq: AtomicU64,
@@ -209,6 +260,7 @@ impl Default for SharedState {
             expand_up: false,
             vertical: false,
             panel_left: false,
+            big: false,
             cards: CardVis::default(),
             seq: AtomicU64::new(0),
         }
@@ -239,6 +291,8 @@ pub struct Frame<'a> {
     pub vertical: bool,
     /// 竖排且面板在竖条左侧。
     pub panel_left: bool,
+    /// 展开样式为超大卡片。
+    pub big: bool,
     /// 展开面板卡片显示开关。
     pub cards: CardVis,
 }
@@ -256,6 +310,7 @@ pub struct OwnedFrame {
     pub expand_up: bool,
     pub vertical: bool,
     pub panel_left: bool,
+    pub big: bool,
     pub cards: CardVis,
 }
 
@@ -274,6 +329,7 @@ impl OwnedFrame {
             expand_up: self.expand_up,
             vertical: self.vertical,
             panel_left: self.panel_left,
+            big: self.big,
             cards: self.cards,
         }
     }
@@ -300,6 +356,7 @@ impl SharedState {
             expand_up: self.expand_up,
             vertical: self.vertical,
             panel_left: self.panel_left,
+            big: self.big,
             cards: self.cards,
         }
     }
