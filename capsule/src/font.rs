@@ -18,10 +18,10 @@ use std::ffi::c_void;
 use tiny_skia::{Color, Pixmap};
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateFontIndirectW, GetGlyphOutlineW, GetTextExtentPoint32W,
-    GetTextMetricsW, SelectObject, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, FF_DONTCARE, FIXED, FW_BOLD, FW_NORMAL, GGO_GRAY8_BITMAP, GLYPHMETRICS, HDC,
-    HFONT, HGDIOBJ, LOGFONTW, MAT2, OUT_TT_PRECIS, TEXTMETRICW,
+    CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, GetGlyphOutlineW,
+    GetTextExtentPoint32W, GetTextMetricsW, SelectObject, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FIXED, FW_BOLD, FW_NORMAL, GGO_GRAY8_BITMAP,
+    GLYPHMETRICS, HDC, HFONT, HGDIOBJ, LOGFONTW, MAT2, OUT_TT_PRECIS, TEXTMETRICW,
 };
 
 /// 界面字体：微软雅黑（粗体由 GDI 按 `FW_BOLD` 自动选 msyhbd）。
@@ -350,6 +350,22 @@ impl Font {
             sz.cx as f32
         } else {
             size * 0.5
+        }
+    }
+}
+
+impl Drop for Font {
+    fn drop(&mut self) {
+        unsafe {
+            // 先销毁 DC，HFONT 才会被换出选中态，随后 DeleteObject 才能成功。
+            if !self.dc.0.is_null() {
+                let _ = DeleteDC(self.dc);
+            }
+            for (_, hf) in self.fonts.borrow().iter() {
+                if !hf.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(hf.0));
+                }
+            }
         }
     }
 }

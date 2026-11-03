@@ -2,12 +2,19 @@
 
 use super::*;
 use std::io::ErrorKind;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
+use tungstenite::client::client as ws_client;
+use tungstenite::handshake::HandshakeError;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message};
+use tungstenite::Message;
 
 const BACKOFF: &[u64] = &[1, 2, 5, 10];
+/// TCP 连接超时：NAS 不可达时避免 Windows SYN 重试拖到 20 秒~2 分钟。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 握手超时：NAS 接受了 TCP 但不回 HTTP 响应时，避免 read 无限阻塞导致退出卡死。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 读超时：兼顾“空闲近 0 CPU”与命令响应延迟。
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -153,6 +160,21 @@ fn subscribe_msg(detail: Detail) -> String {
     }
 }
 
+/// 带超时的 TCP 连接：逐个解析地址尝试，避免 NAS 不可达时 Windows SYN 重试拖到 20 秒~2 分钟。
+/// 握手阶段的读/写超时也在这里先设好，NAS 接受连接但不回 HTTP 时不会无限阻塞。
+fn tcp_connect(target: &str) -> Option<TcpStream> {
+    let addrs = target.to_socket_addrs().ok()?;
+    for addr in addrs {
+        if let Ok(s) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            let _ = s.set_nodelay(true);
+            let _ = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+            let _ = s.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// 单次连接会话。返回时连接已断开或收到命令。
 fn session(
     cx: &SourceCtx,
@@ -163,9 +185,13 @@ fn session(
 ) -> SessionEnd {
     // 令牌为 base64 RawURLEncoding 字符集（A-Za-z0-9-_），query 安全无需编码
     let url = format!("ws://{target}/ws?token={token}");
-    let (mut ws, _) = match connect(&url) {
+    let stream = match tcp_connect(target.as_str()) {
+        Some(s) => s,
+        None => return SessionEnd::Reconnect,
+    };
+    let (mut ws, _) = match ws_client(&url, MaybeTlsStream::Plain(stream)) {
         Ok(v) => v,
-        Err(tungstenite::Error::Http(resp)) => {
+        Err(HandshakeError::Failure(tungstenite::Error::Http(resp))) => {
             let code = resp.status().as_u16();
             if code == 401 || code == 403 {
                 set_status(cx, ConnStatus::AuthFailed);

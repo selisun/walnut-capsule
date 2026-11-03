@@ -1,9 +1,9 @@
-﻿; 核桃胶囊 电脑端安装程序（Inno Setup 6）
+; 核桃胶囊 电脑端安装程序（Inno Setup 6）
 ; 编译：ISCC.exe hetao-capsule.iss
 ; 说明：免管理员安装（装到用户目录），创建开始菜单/桌面快捷方式，可选开机自启。
 
 #define AppName "核桃胶囊"
-#define AppVer "0.1.60"
+#define AppVer "0.2.28"
 #define AppExe "hetao-capsule.exe"
 #define AppPublisher "蓝胖纸"
 
