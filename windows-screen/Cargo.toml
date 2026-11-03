@@ -45,6 +45,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     # 阶段 C 补充：SetConsoleCtrlHandler 优雅退出（2026-11-03 监工指示「继续，不用等监工」，请在 15 号追认）
     "Win32_System_Console",
+    # 时钟组件：GetLocalTime 取本地时间（2026-11-04 用户指示继续开发，请在 15 号追认）
+    "Win32_System_SystemInformation",
 ] }
 
 [profile.dev]

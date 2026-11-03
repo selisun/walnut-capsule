@@ -329,6 +329,12 @@ fn render_config(cfg: &ScreenConfig) -> String {
     if cfg.storage {
         visible.push("storage");
     }
+    if cfg.temp {
+        visible.push("temp");
+    }
+    if cfg.clock {
+        visible.push("clock");
+    }
     let list = visible
         .iter()
         .map(|v| format!("\"{v}\""))
@@ -478,6 +484,15 @@ mod tests {
         let text = render_config(&c);
         assert!(text.contains("\"storage\""));
         assert!(text.contains("visible = [\"cpu\", \"memory\", \"network\", \"storage\"]"));
+    }
+
+    #[test]
+    fn temp_and_clock_cards_append_in_order() {
+        let mut c = cfg("portrait", 1);
+        c.temp = true;
+        c.clock = true;
+        let text = render_config(&c);
+        assert!(text.contains("visible = [\"cpu\", \"memory\", \"network\", \"temp\", \"clock\"]"));
     }
 
     #[test]

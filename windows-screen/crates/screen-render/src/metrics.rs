@@ -36,6 +36,24 @@ pub enum MetricView {
         used: Option<u64>,
         total: Option<u64>,
     },
+    /// 温度：CPU / GPU 中至少一个存在；主数值优先 CPU。
+    Temp { cpu: Option<f32>, gpu: Option<f32> },
+    /// 本地时钟（不依赖胶囊数据）。
+    Clock {
+        hour: u8,
+        minute: u8,
+        month: u8,
+        day: u8,
+    },
+}
+
+/// 本地时间的显示分量。由平台层取本地时间，格式化保持纯函数便于测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockParts {
+    pub hour: u8,
+    pub minute: u8,
+    pub month: u8,
+    pub day: u8,
 }
 
 impl MetricView {
@@ -47,6 +65,8 @@ impl MetricView {
             MetricView::Network { .. } => ComponentKind::Network,
             MetricView::Disk { .. } => ComponentKind::Disk,
             MetricView::Storage { .. } => ComponentKind::Storage,
+            MetricView::Temp { .. } => ComponentKind::Temp,
+            MetricView::Clock { .. } => ComponentKind::Clock,
         }
     }
 
@@ -70,6 +90,8 @@ impl MetricView {
                 }
             }
             MetricView::Storage { used, total, .. } => format_pct(pct_of(*used, *total)),
+            MetricView::Temp { cpu, gpu } => format_temp(cpu.or(*gpu)),
+            MetricView::Clock { hour, minute, .. } => format!("{:02}:{:02}", hour, minute),
         }
     }
 
@@ -109,6 +131,15 @@ impl MetricView {
                     None => pair,
                 }
             }
+            MetricView::Temp { cpu, gpu } => {
+                // 主数值已用 CPU（缺则用 GPU）；副信息补另一个来源，避免重复
+                if cpu.is_some() && gpu.is_some() {
+                    format!("显卡 {}", format_temp(*gpu))
+                } else {
+                    String::new()
+                }
+            }
+            MetricView::Clock { month, day, .. } => format!("{:02}-{:02}", month, day),
         }
     }
 }
@@ -129,6 +160,15 @@ pub fn default_label(kind: ComponentKind) -> &'static str {
 
 /// 按 `visible` 顺序绑定；对应 `Metrics` 项为 `None` 时不产出视图。
 pub fn bind(metrics: &Metrics, visible: &[ComponentKind]) -> Vec<(ComponentKind, MetricView)> {
+    bind_with_clock(metrics, visible, None)
+}
+
+/// 与 `bind` 相同，但可注入本地时间以显示时钟卡（`None` 时忽略 `Clock`）。
+pub fn bind_with_clock(
+    metrics: &Metrics,
+    visible: &[ComponentKind],
+    clock: Option<ClockParts>,
+) -> Vec<(ComponentKind, MetricView)> {
     let mut out = Vec::new();
     for kind in visible {
         let view = match kind {
@@ -161,7 +201,13 @@ pub fn bind(metrics: &Metrics, visible: &[ComponentKind]) -> Vec<(ComponentKind,
                 write: disk.write_bps,
             }),
             ComponentKind::Storage => storage_view(metrics),
-            ComponentKind::Temp | ComponentKind::Clock => None,
+            ComponentKind::Temp => temp_view(metrics),
+            ComponentKind::Clock => clock.map(|c| MetricView::Clock {
+                hour: c.hour,
+                minute: c.minute,
+                month: c.month,
+                day: c.day,
+            }),
         };
         if let Some(view) = view {
             out.push((*kind, view));
@@ -219,6 +265,34 @@ fn pct_of(used: Option<u64>, total: Option<u64>) -> Option<f32> {
         (Some(u), Some(t)) if t > 0 => Some(((u as f64 / t as f64) * 100.0) as f32),
         _ => None,
     }
+}
+
+/// 温度视图：CPU / GPU 至少一个存在才出卡。
+fn temp_view(metrics: &Metrics) -> Option<MetricView> {
+    let cpu = metrics.cpu.as_ref().and_then(|c| c.temp_c);
+    let gpu = metrics.gpu.as_ref().and_then(|g| g.temp_c);
+    if cpu.is_none() && gpu.is_none() {
+        return None;
+    }
+    Some(MetricView::Temp { cpu, gpu })
+}
+
+/// 本地时间（Windows）。取不到时返回 `None`，时钟卡不显示，绝不回退到 UTC 硬编码。
+#[cfg(windows)]
+pub fn local_clock() -> Option<ClockParts> {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let now = unsafe { GetLocalTime() };
+    Some(ClockParts {
+        hour: now.wHour as u8,
+        minute: now.wMinute as u8,
+        month: now.wMonth as u8,
+        day: now.wDay as u8,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn local_clock() -> Option<ClockParts> {
+    None
 }
 
 /// 百分比；`None` 或非有限值一律 `--`，绝不显示 0%。
@@ -564,5 +638,132 @@ mod tests {
         let view = &bound[0].1;
         assert_eq!(view.primary(), "--");
         assert_eq!(view.secondary(), "vol1 -- / 1000 B");
+    }
+
+    fn cpu_with_temp(temp: Option<f32>) -> CpuMetrics {
+        CpuMetrics {
+            temp_c: temp,
+            ..CpuMetrics::default()
+        }
+    }
+
+    fn gpu_with_temp(temp: Option<f32>) -> GpuMetrics {
+        GpuMetrics {
+            temp_c: temp,
+            ..GpuMetrics::default()
+        }
+    }
+
+    #[test]
+    fn temp_hidden_when_no_sensor() {
+        let metrics = Metrics {
+            cpu: Some(cpu_with_temp(None)),
+            gpu: Some(gpu_with_temp(None)),
+            ..Metrics::default()
+        };
+        assert!(bind(&metrics, &[ComponentKind::Temp]).is_empty());
+        assert!(bind(&Metrics::default(), &[ComponentKind::Temp]).is_empty());
+    }
+
+    #[test]
+    fn temp_cpu_only_shows_cpu_reading() {
+        let metrics = Metrics {
+            cpu: Some(cpu_with_temp(Some(45.0))),
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Temp]);
+        let view = &bound[0].1;
+        assert_eq!(view.kind(), ComponentKind::Temp);
+        assert_eq!(view.primary(), "45°C");
+        assert_eq!(view.secondary(), "");
+    }
+
+    #[test]
+    fn temp_gpu_only_falls_back_to_gpu_reading() {
+        let metrics = Metrics {
+            gpu: Some(gpu_with_temp(Some(60.0))),
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Temp]);
+        let view = &bound[0].1;
+        assert_eq!(view.primary(), "60°C");
+        assert_eq!(view.secondary(), "");
+    }
+
+    #[test]
+    fn temp_both_sensors_show_gpu_in_secondary() {
+        let metrics = Metrics {
+            cpu: Some(cpu_with_temp(Some(45.0))),
+            gpu: Some(gpu_with_temp(Some(60.0))),
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Temp]);
+        let view = &bound[0].1;
+        assert_eq!(view.primary(), "45°C");
+        assert_eq!(view.secondary(), "显卡 60°C");
+    }
+
+    fn clock(hour: u8, minute: u8, month: u8, day: u8) -> ClockParts {
+        ClockParts {
+            hour,
+            minute,
+            month,
+            day,
+        }
+    }
+
+    #[test]
+    fn clock_formats_time_and_date() {
+        let parts = clock(9, 5, 11, 4);
+        let view = MetricView::Clock {
+            hour: parts.hour,
+            minute: parts.minute,
+            month: parts.month,
+            day: parts.day,
+        };
+        assert_eq!(view.primary(), "09:05");
+        assert_eq!(view.secondary(), "11-04");
+    }
+
+    #[test]
+    fn clock_hidden_without_local_time() {
+        let metrics = Metrics::default();
+        assert!(bind(&metrics, &[ComponentKind::Clock]).is_empty());
+        assert!(bind_with_clock(&metrics, &[ComponentKind::Clock], None).is_empty());
+    }
+
+    #[test]
+    fn bind_with_clock_respects_visible_order_and_metrics() {
+        let metrics = Metrics {
+            cpu: Some(cpu_with_temp(Some(45.0))),
+            ..Metrics::default()
+        };
+        let parts = clock(23, 59, 12, 31);
+        let bound = bind_with_clock(
+            &metrics,
+            &[
+                ComponentKind::Clock,
+                ComponentKind::Cpu,
+                ComponentKind::Temp,
+            ],
+            Some(parts),
+        );
+        assert_eq!(
+            bound.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            vec![
+                ComponentKind::Clock,
+                ComponentKind::Cpu,
+                ComponentKind::Temp
+            ]
+        );
+        assert_eq!(bound[0].1.primary(), "23:59");
+        assert_eq!(bound[0].1.secondary(), "12-31");
+        assert_eq!(bound[2].1.primary(), "45°C");
+    }
+
+    #[test]
+    fn temp_and_clock_labels_are_chinese() {
+        assert_eq!(default_label(ComponentKind::Temp), "温度");
+        assert_eq!(default_label(ComponentKind::Clock), "时钟");
     }
 }

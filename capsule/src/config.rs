@@ -50,6 +50,12 @@ pub struct ScreenConfig {
     /// 逻辑卷（NAS storage[]）卡片：默认关闭，开启后多出一张「存储」卡
     #[serde(default)]
     pub storage: bool,
+    /// 温度卡（CPU/GPU 温度）：默认关闭
+    #[serde(default)]
+    pub temp: bool,
+    /// 时钟卡（本机时间）：默认关闭
+    #[serde(default)]
+    pub clock: bool,
 }
 
 impl Default for ScreenConfig {
@@ -67,6 +73,8 @@ impl Default for ScreenConfig {
             network: true,
             disk: true,
             storage: false,
+            temp: false,
+            clock: false,
         }
     }
 }

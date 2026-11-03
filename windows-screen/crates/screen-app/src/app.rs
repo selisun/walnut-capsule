@@ -13,7 +13,8 @@ use screen_ipc::{ConnectionState, Message, MessageKind};
 use screen_layout::{build, TemplateKind};
 use screen_protocol::rgba_to_rgb565le;
 use screen_render::{
-    bind, create_text_renderer, render, render_notice, render_with_metrics, FontSpec,
+    bind_with_clock, create_text_renderer, local_clock, render, render_notice, render_with_metrics,
+    FontSpec,
 };
 use screen_theme::{load_dir, load_str, ThemeStore};
 use screen_transport_cdc::CdcTransport;
@@ -314,7 +315,11 @@ impl ScreenApp {
             .snapshot
             .as_ref()
             .ok_or_else(|| AppError::Data("无客户端快照，不能渲染指标".into()))?;
-        let bound = bind(&snapshot.metrics, &self.config.components.visible);
+        let bound = bind_with_clock(
+            &snapshot.metrics,
+            &self.config.components.visible,
+            local_clock(),
+        );
         let direction = self.direction(physical)?;
         let plan = direction.plan(physical, Some(&self.config.display.layout_template))?;
         let tree = if bound.is_empty() {

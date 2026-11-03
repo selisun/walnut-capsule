@@ -14,7 +14,7 @@ pub mod transform;
 
 pub use canvas::Canvas;
 pub use error::RenderError;
-pub use metrics::{bind, MetricView};
+pub use metrics::{bind, bind_with_clock, local_clock, ClockParts, MetricView};
 pub use pipeline::{render, render_notice, render_with_metrics};
 pub use text::{create_text_renderer, FontSpec, TextRenderer, UnavailableTextRenderer};
 pub use transform::{invert, mirror_horizontal, orient, rotate180, rotate270, rotate90};
