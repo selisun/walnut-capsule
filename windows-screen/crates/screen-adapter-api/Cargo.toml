@@ -1,0 +1,9 @@
+[package]
+name = "screen-adapter-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "设备适配器/传输抽象与错误（无设备 IO）"
+
+[dependencies]
+screen-core = { path = "../screen-core" }

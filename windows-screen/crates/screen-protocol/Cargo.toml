@@ -1,0 +1,8 @@
+[package]
+name = "screen-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "3.5 英寸基线协议纯函数（帧头/RGB565/命令/分块；不依赖任何 IO）"
+
+[dependencies]

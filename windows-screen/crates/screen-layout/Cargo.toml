@@ -1,0 +1,9 @@
+[package]
+name = "screen-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "布局引擎：按 Profile 选择模板、计算卡片网格、缩放与边界校验"
+
+[dependencies]
+screen-core = { path = "../screen-core" }

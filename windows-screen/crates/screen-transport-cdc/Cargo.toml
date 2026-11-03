@@ -1,0 +1,11 @@
+[package]
+name = "screen-transport-cdc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows CDC/串口传输（SetupAPI 枚举 + CreateFile/DCB/超时/同步读写）"
+
+[dependencies]
+screen-core = { path = "../screen-core" }
+screen-adapter-api = { path = "../screen-adapter-api" }
+windows.workspace = true

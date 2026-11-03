@@ -1,0 +1,12 @@
+[package]
+name = "screen-adapter-turzx-cdc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "图灵智显 3.5 英寸 CDC 适配器（基线协议编排，不含主题/布局）"
+
+[dependencies]
+screen-core = { path = "../../screen-core" }
+screen-adapter-api = { path = "../../screen-adapter-api" }
+screen-protocol = { path = "../../screen-protocol" }
+screen-transport-cdc = { path = "../../screen-transport-cdc" }

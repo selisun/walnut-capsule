@@ -1,0 +1,11 @@
+[package]
+name = "turzx-probe"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+screen-adapter-api = { path = "../../crates/screen-adapter-api" }
+screen-protocol = { path = "../../crates/screen-protocol" }
+screen-transport-cdc = { path = "../../crates/screen-transport-cdc" }

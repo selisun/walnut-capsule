@@ -1,0 +1,30 @@
+{
+  "schema": "hetao.theme/1",
+  "id": "default",
+  "name": "默认深色",
+  "author": "hetao",
+  "version": "1.0.0",
+  "palette": {
+    "bg": "#101418",
+    "card": "#1B2028",
+    "text": "#E8EDF2",
+    "dim": "#8A94A6",
+    "accent": "#37D67A",
+    "warn": "#FFB020",
+    "danger": "#FF5A5F"
+  },
+  "typography": {
+    "family": "Microsoft YaHei",
+    "base_px": 14,
+    "scale": 1.0
+  },
+  "background": {
+    "fallback_color": "#101418"
+  },
+  "components": {
+    "visible": ["cpu", "memory", "gpu", "network", "disk"]
+  },
+  "layout": {
+    "template": "auto"
+  }
+}

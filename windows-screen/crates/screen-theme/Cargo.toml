@@ -1,0 +1,11 @@
+[package]
+name = "screen-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "声明式 JSON 主题加载与校验（禁止任何脚本/可执行资源）"
+
+[dependencies]
+screen-core = { path = "../screen-core" }
+serde.workspace = true
+serde_json.workspace = true

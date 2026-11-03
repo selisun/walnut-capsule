@@ -1,0 +1,10 @@
+[package]
+name = "screen-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "快照接收与新鲜度状态机（不连接 NAS、不保存任何凭据）"
+
+[dependencies]
+screen-core = { path = "../screen-core" }
+serde.workspace = true

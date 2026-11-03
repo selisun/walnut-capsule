@@ -1,0 +1,15 @@
+[package]
+name = "screen-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "小屏与主客户端的本地 IPC 协议（消息结构/版本/校验；不含 Windows 管道实现）"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+windows.workspace = true
+
+[dev-dependencies]
+# 端到端测试：真实 Snapshot JSON 走真实管道（不构成循环依赖，screen-core 不依赖本 crate）
+screen-core = { path = "../screen-core" }

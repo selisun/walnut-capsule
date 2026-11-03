@@ -1,0 +1,12 @@
+[package]
+name = "screen-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "小屏系统核心领域模型（无设备 IO、无 NAS、无 Token）"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

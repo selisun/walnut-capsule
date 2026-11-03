@@ -1,0 +1,4 @@
+# 与现有客户端一致：本机无 MinGW gcc / MSVC link.exe，
+# 使用 Rust 自带 rust-lld + self-contained 链接 windows-gnu 目标。
+[build]
+rustflags = ["-C", "linker=rust-lld", "-C", "link-self-contained=yes"]

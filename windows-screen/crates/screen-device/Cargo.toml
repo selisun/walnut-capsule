@@ -1,0 +1,10 @@
+[package]
+name = "screen-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "设备适配抽象与单设备生命周期（本阶段不打开真实设备）"
+
+[dependencies]
+screen-core = { path = "../screen-core" }
+screen-adapter-api = { path = "../screen-adapter-api" }

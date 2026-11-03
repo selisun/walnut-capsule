@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/screen-core",
+    "crates/screen-adapter-api",
+    "crates/screen-protocol",
+    "crates/screen-transport-cdc",
+    "crates/screen-data",
+    "crates/screen-device",
+    "crates/screen-ipc",
+    "crates/screen-layout",
+    "crates/screen-theme",
+    "crates/screen-render",
+    "crates/screen-app",
+    "crates/screen-adapters/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tiny-skia = "0.11"
+# 阶段 A（CDC）已批准：七项 feature（用户 2026-10-31 批准补充 Security/System_IO，见 docs/windows-screen/15）
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_Communication",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Security",
+    "Win32_System_IO",
+    # 阶段 B 之 GDI 字体子项（2026-11-02 监工批准，见 docs/windows-screen/15）：
+    # GetGlyphOutlineW / CreateFontW / GetTextExtentPoint32W → 字形轮廓转 tiny-skia 路径
+    "Win32_Graphics_Gdi",
+    # 阶段 C：命名管道 IPC（2026-11-02 监工批准，见 docs/windows-screen/15）：
+    # CreateNamedPipeW/PeekNamedPipe、SDDL DACL、GetNamedPipeClientProcessId + OpenProcess 身份校验
+    "Win32_System_Pipes",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    # 阶段 C 补充：SetConsoleCtrlHandler 优雅退出（2026-11-03 监工指示「继续，不用等监工」，请在 15 号追认）
+    "Win32_System_Console",
+] }
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+strip = true

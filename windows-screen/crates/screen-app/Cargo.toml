@@ -1,0 +1,27 @@
+[package]
+name = "screen-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "小屏独立进程入口：配置加载、模块初始化、生命周期（无设备/无客户端时安全退出）"
+
+[[bin]]
+name = "hetao-screen"
+path = "src/main.rs"
+
+[dependencies]
+screen-core = { path = "../screen-core" }
+screen-ipc = { path = "../screen-ipc" }
+screen-data = { path = "../screen-data" }
+screen-device = { path = "../screen-device" }
+screen-layout = { path = "../screen-layout" }
+screen-theme = { path = "../screen-theme" }
+screen-render = { path = "../screen-render" }
+screen-adapter-api = { path = "../screen-adapter-api" }
+screen-protocol = { path = "../screen-protocol" }
+screen-transport-cdc = { path = "../screen-transport-cdc" }
+screen-adapter-turzx-cdc = { path = "../screen-adapters/turzx-cdc" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+windows.workspace = true

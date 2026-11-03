@@ -1,0 +1,12 @@
+[package]
+name = "snapshot-pusher"
+version = "0.1.0"
+edition = "2021"
+
+# T5 真机回归专用推送模拟器：独立 workspace，不属于生产 crates。
+# 仅复用 screen-core（数据模型）与 screen-ipc（帧格式），不引入任何第三方 crate。
+[workspace]
+
+[dependencies]
+screen-core = { path = "../../crates/screen-core" }
+screen-ipc = { path = "../../crates/screen-ipc" }
