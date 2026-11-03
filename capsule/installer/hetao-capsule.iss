@@ -6,6 +6,11 @@
 #define AppVer "0.2.28"
 #define AppExe "hetao-capsule.exe"
 #define AppPublisher "蓝胖纸"
+; 小屏进程必须随安装包一起分发，缺失时直接让编译失败，避免静默产出「没有小屏」的安装包
+#define ScreenExe "..\..\windows-screen\target\release\hetao-screen.exe"
+#if FileExists(ScreenExe) == 0
+  #error "缺少 hetao-screen.exe：请先在 windows-screen 目录执行 cargo build --release -p screen-app"
+#endif
 
 [Setup]
 AppId={{B7C3E2A1-5D4F-4A9B-9C1E-7F2A6D8B3E04}
@@ -45,8 +50,8 @@ Name: "startup"; Description: "开机自动启动（推荐）"; GroupDescription
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
-; B-10 native 引擎的小屏进程，必须与主 exe 同目录（缺失时自动回退旧 PowerShell）
-Source: "..\..\windows-screen\target\release\hetao-screen.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; B-10 native 引擎的小屏进程，必须与主 exe 同目录；缺失时编译期已报错，不再静默跳过
+Source: "{#ScreenExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
