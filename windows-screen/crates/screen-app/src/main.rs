@@ -85,6 +85,11 @@ fn check_theme(path: &Path) -> Result<(), String> {
 
 fn run(path: Option<&Path>, run_seconds: Option<u64>) -> Result<(), String> {
     let mut app = ScreenApp::init(path).map_err(|e| e.to_string())?;
+    // 日志按配置落盘：与 config.toml 同级的 hetao-screen.log
+    let log_file = app
+        .config_path()
+        .and_then(|p| p.parent().map(|dir| dir.join("hetao-screen.log")));
+    screen_app::logging::init(&app.config().logging.level, log_file);
     let options = screen_app::RunOptions {
         run_seconds,
         ..Default::default()

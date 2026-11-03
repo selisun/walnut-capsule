@@ -15,7 +15,7 @@ use screen_protocol::rgba_to_rgb565le;
 use screen_render::{
     bind, create_text_renderer, render, render_notice, render_with_metrics, FontSpec,
 };
-use screen_theme::{load_str, ThemeStore};
+use screen_theme::{load_dir, load_str, ThemeStore};
 use screen_transport_cdc::CdcTransport;
 
 use crate::config::{Config, ConfigError};
@@ -96,13 +96,35 @@ impl ScreenApp {
         themes
             .register(theme.clone(), true)
             .map_err(|e| AppError::Theme(e.to_string()))?;
+
+        // 用户主题目录：与 config.toml 同级的 themes/（可选；坏文件只跳过并记录）
+        if let Some(dir) = resolved
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.join("themes"))
+        {
+            let (loaded, errors) = load_dir(&dir);
+            for user_theme in loaded {
+                if let Err(err) = themes.register(user_theme, false) {
+                    eprintln!("用户主题注册失败：{err}");
+                }
+            }
+            for (path, err) in errors {
+                eprintln!("用户主题已跳过 {}：{err}", path.display());
+            }
+        }
+
         let current_theme = if config.display.theme.is_empty() || config.display.theme == "default"
         {
             theme
         } else {
-            themes
-                .switch(&config.display.theme)
-                .unwrap_or_else(|_| theme)
+            match themes.switch(&config.display.theme) {
+                Ok(selected) => selected,
+                Err(err) => {
+                    eprintln!("主题切换失败（{err}），回退默认主题");
+                    theme
+                }
+            }
         };
 
         let period_ms = (config.display.refresh_secs as i64).saturating_mul(1_000);
@@ -126,6 +148,11 @@ impl ScreenApp {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 实际使用的配置文件路径（未找到默认路径时为 `None`）。
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     pub fn theme(&self) -> &ThemeConfig {
@@ -559,6 +586,54 @@ mod tests {
 
     fn physical_profile() -> ScreenProfile {
         ScreenProfile::new("3.5-physical", 320, 480, Orientation::Portrait, true).expect("profile")
+    }
+
+    const CUSTOM_THEME: &str = r##"{
+        "schema":"hetao.theme/1","id":"custom","name":"用户主题","version":"1.0.0",
+        "palette":{"bg":"#000000","card":"#111111","text":"#FFFFFF","dim":"#888888","accent":"#00FF00","warn":"#FFB020","danger":"#FF5A5F"}
+    }"##;
+
+    fn theme_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hetao-screen-theme-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("themes")).expect("mkdir themes");
+        dir
+    }
+
+    #[test]
+    fn user_theme_directory_is_loaded_and_selected() {
+        let dir = theme_test_dir("pick");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "version = 1\n[display]\ntheme = \"custom\"\n")
+            .expect("write config");
+        std::fs::write(dir.join("themes").join("custom.json"), CUSTOM_THEME).expect("write theme");
+
+        let app = ScreenApp::init(Some(&config_path)).expect("app");
+        assert_eq!(app.theme().id, "custom");
+        assert!(app.theme_store().ids().any(|id| id == "custom"));
+        assert!(app.theme_store().is_builtin("default"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_theme_falls_back_to_default() {
+        let dir = theme_test_dir("missing");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "version = 1\n[display]\ntheme = \"not-exist\"\n",
+        )
+        .expect("write config");
+
+        let app = ScreenApp::init(Some(&config_path)).expect("app");
+        assert_eq!(app.theme().id, "default", "未知主题回退默认而不是报错");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod device_cmd;
+pub mod logging;
 pub mod orientation;
 pub mod pattern;
 pub mod runtime;

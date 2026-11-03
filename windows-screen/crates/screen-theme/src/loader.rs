@@ -1,6 +1,7 @@
 //! 主题加载与校验。
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use screen_core::{ResourceKind, ThemeConfig};
 
@@ -31,6 +32,39 @@ pub fn load_str(json: &str) -> Result<ThemeConfig, ThemeError> {
         serde_json::from_str(json).map_err(|e| ThemeError::Parse(e.to_string()))?;
     validate(&theme)?;
     Ok(theme)
+}
+
+/// 扫描目录下全部 `*.json` 主题（按文件名排序，忽略子目录与其他扩展名）。
+///
+/// 目录不存在或不可读时返回空列表、无错误：用户主题是可选增强，不能因此阻断启动。
+/// 单个文件失败只影响该文件，错误连同路径返回给调用方记录。
+pub fn load_dir(dir: &Path) -> (Vec<ThemeConfig>, Vec<(PathBuf, ThemeError)>) {
+    let mut loaded = Vec::new();
+    let mut errors = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (loaded, errors);
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    files.sort();
+    for path in files {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match load_str(&text) {
+                Ok(theme) => loaded.push(theme),
+                Err(err) => errors.push((path, err)),
+            },
+            Err(err) => errors.push((path, ThemeError::Parse(err.to_string()))),
+        }
+    }
+    (loaded, errors)
 }
 
 pub fn validate(theme: &ThemeConfig) -> Result<(), ThemeError> {
@@ -341,5 +375,42 @@ mod tests {
     #[test]
     fn default_visible_components_are_non_empty() {
         assert_eq!(default_visible_components().len(), 5);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hetao-theme-{}-{}-{tag}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn load_dir_reads_json_and_reports_bad_files() {
+        let dir = temp_dir("dir");
+        std::fs::write(dir.join("a.json"), BASE).expect("write a");
+        std::fs::write(dir.join("b.json"), BASE.replace("\"test\"", "\"test2\"")).expect("write b");
+        std::fs::write(dir.join("bad.json"), "{not json").expect("write bad");
+        std::fs::write(dir.join("note.txt"), BASE).expect("write txt");
+
+        let (loaded, errors) = load_dir(&dir);
+        assert_eq!(loaded.len(), 2, "只加载合法 json");
+        assert_eq!(errors.len(), 1, "坏文件只影响自身");
+        assert_eq!(loaded[0].id, "test", "按文件名排序");
+        assert_eq!(loaded[1].id, "test2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_dir_missing_directory_is_not_an_error() {
+        let dir = std::env::temp_dir().join("hetao-theme-definitely-missing");
+        let (loaded, errors) = load_dir(&dir);
+        assert!(loaded.is_empty());
+        assert!(errors.is_empty());
     }
 }

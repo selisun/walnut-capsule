@@ -30,6 +30,12 @@ pub enum MetricView {
         read: Option<u64>,
         write: Option<u64>,
     },
+    /// 逻辑卷（NAS 的 storage[]）。单卷时显示卷名；多卷且容量齐全时按合计显示。
+    Storage {
+        name: Option<String>,
+        used: Option<u64>,
+        total: Option<u64>,
+    },
 }
 
 impl MetricView {
@@ -40,6 +46,7 @@ impl MetricView {
             MetricView::Gpu { .. } => ComponentKind::Gpu,
             MetricView::Network { .. } => ComponentKind::Network,
             MetricView::Disk { .. } => ComponentKind::Disk,
+            MetricView::Storage { .. } => ComponentKind::Storage,
         }
     }
 
@@ -62,6 +69,7 @@ impl MetricView {
                     format!("读 {}", format_rate_opt(*read))
                 }
             }
+            MetricView::Storage { used, total, .. } => format_pct(pct_of(*used, *total)),
         }
     }
 
@@ -92,6 +100,13 @@ impl MetricView {
                     String::new()
                 } else {
                     format!("写 {}", format_rate_opt(*write))
+                }
+            }
+            MetricView::Storage { name, used, total } => {
+                let pair = format_pair(*used, *total);
+                match name.as_deref().filter(|n| !n.is_empty()) {
+                    Some(name) => format!("{name} {pair}"),
+                    None => pair,
                 }
             }
         }
@@ -145,13 +160,65 @@ pub fn bind(metrics: &Metrics, visible: &[ComponentKind]) -> Vec<(ComponentKind,
                 read: disk.read_bps,
                 write: disk.write_bps,
             }),
-            ComponentKind::Storage | ComponentKind::Temp | ComponentKind::Clock => None,
+            ComponentKind::Storage => storage_view(metrics),
+            ComponentKind::Temp | ComponentKind::Clock => None,
         };
         if let Some(view) = view {
             out.push((*kind, view));
         }
     }
     out
+}
+
+/// 逻辑卷视图：单卷用自身数值；多卷且容量齐全时按合计；否则回退首卷。
+fn storage_view(metrics: &Metrics) -> Option<MetricView> {
+    let first = metrics.storage.first()?;
+    if metrics.storage.len() == 1 {
+        return Some(MetricView::Storage {
+            name: non_empty(&first.name),
+            used: first.used_bytes,
+            total: first.total_bytes,
+        });
+    }
+    let all_complete = metrics
+        .storage
+        .iter()
+        .all(|v| v.used_bytes.is_some() && v.total_bytes.is_some());
+    if all_complete {
+        let used = metrics
+            .storage
+            .iter()
+            .fold(0u64, |acc, v| acc.saturating_add(v.used_bytes.unwrap_or(0)));
+        let total = metrics.storage.iter().fold(0u64, |acc, v| {
+            acc.saturating_add(v.total_bytes.unwrap_or(0))
+        });
+        Some(MetricView::Storage {
+            name: None,
+            used: Some(used),
+            total: Some(total),
+        })
+    } else {
+        Some(MetricView::Storage {
+            name: non_empty(&first.name),
+            used: first.used_bytes,
+            total: first.total_bytes,
+        })
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn pct_of(used: Option<u64>, total: Option<u64>) -> Option<f32> {
+    match (used, total) {
+        (Some(u), Some(t)) if t > 0 => Some(((u as f64 / t as f64) * 100.0) as f32),
+        _ => None,
+    }
 }
 
 /// 百分比；`None` 或非有限值一律 `--`，绝不显示 0%。
@@ -218,7 +285,9 @@ pub fn format_temp(value: Option<f32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use screen_core::{CpuMetrics, DiskMetrics, GpuMetrics, MemoryMetrics, NetworkMetrics};
+    use screen_core::{
+        CpuMetrics, DiskMetrics, GpuMetrics, MemoryMetrics, NetworkMetrics, StorageVolume,
+    };
 
     fn all_visible() -> Vec<ComponentKind> {
         vec![
@@ -400,5 +469,100 @@ mod tests {
         assert_eq!(default_label(ComponentKind::Memory), "内存");
         assert_eq!(default_label(ComponentKind::Network), "网络");
         assert_eq!(default_label(ComponentKind::Disk), "磁盘");
+        assert_eq!(default_label(ComponentKind::Storage), "存储");
+    }
+
+    fn volume(name: &str, used: Option<u64>, total: Option<u64>) -> StorageVolume {
+        StorageVolume {
+            name: name.to_string(),
+            used_bytes: used,
+            total_bytes: total,
+        }
+    }
+
+    #[test]
+    fn storage_hidden_when_absent() {
+        let metrics = Metrics::default();
+        assert!(bind(&metrics, &[ComponentKind::Storage]).is_empty());
+    }
+
+    #[test]
+    fn single_volume_shows_name_and_capacity() {
+        let metrics = Metrics {
+            storage: vec![volume(
+                "vol1",
+                Some(9 * 1024 * 1024 * 1024),
+                Some(20 * 1024 * 1024 * 1024),
+            )],
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Storage]);
+        assert_eq!(bound.len(), 1);
+        let view = &bound[0].1;
+        assert_eq!(view.kind(), ComponentKind::Storage);
+        assert_eq!(view.primary(), "45%");
+        assert_eq!(view.secondary(), "vol1 9.0 GB / 20.0 GB");
+    }
+
+    #[test]
+    fn multiple_complete_volumes_are_summed() {
+        let metrics = Metrics {
+            storage: vec![
+                volume(
+                    "vol1",
+                    Some(3 * 1024 * 1024 * 1024),
+                    Some(10 * 1024 * 1024 * 1024),
+                ),
+                volume(
+                    "vol2",
+                    Some(7 * 1024 * 1024 * 1024),
+                    Some(10 * 1024 * 1024 * 1024),
+                ),
+            ],
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Storage]);
+        let view = &bound[0].1;
+        assert_eq!(view.primary(), "50%");
+        assert_eq!(view.secondary(), "10.0 GB / 20.0 GB");
+    }
+
+    #[test]
+    fn incomplete_multiple_volumes_fall_back_to_first() {
+        let metrics = Metrics {
+            storage: vec![
+                volume("vol1", Some(1_000_000_000), Some(2_000_000_000)),
+                volume("vol2", None, None),
+            ],
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Storage]);
+        let view = &bound[0].1;
+        assert_eq!(view.primary(), "50%");
+        assert!(view.secondary().starts_with("vol1 "));
+    }
+
+    #[test]
+    fn storage_zero_total_shows_dash_not_zero_percent() {
+        let metrics = Metrics {
+            storage: vec![volume("vol1", Some(0), Some(0))],
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Storage]);
+        let view = &bound[0].1;
+        assert_eq!(view.primary(), "--");
+        assert_eq!(view.secondary(), "vol1 0 B / 0 B");
+    }
+
+    #[test]
+    fn storage_without_capacity_shows_dash() {
+        let metrics = Metrics {
+            storage: vec![volume("vol1", None, Some(1_000))],
+            ..Metrics::default()
+        };
+        let bound = bind(&metrics, &[ComponentKind::Storage]);
+        let view = &bound[0].1;
+        assert_eq!(view.primary(), "--");
+        assert_eq!(view.secondary(), "vol1 -- / 1000 B");
     }
 }

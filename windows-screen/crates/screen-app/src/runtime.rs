@@ -124,7 +124,7 @@ pub fn run_loop(
                 Some(DeviceEvent::Removal) => {
                     if let Some(mut session) = device.take() {
                         session.close();
-                        eprintln!("设备已移除，关闭 Session");
+                        crate::logging::warn("设备已移除，关闭 Session");
                     }
                     next_retry_ms = now.saturating_add(retry_i64);
                 }
@@ -144,14 +144,17 @@ pub fn run_loop(
                 Ok(Some(session)) => {
                     report.connect_successes += 1;
                     device = Some(session);
-                    eprintln!("设备已连接并初始化（仅一次）");
+                    crate::logging::info("设备已连接并初始化（仅一次）");
                 }
                 Ok(None) => {
-                    eprintln!("未发现设备，{}s 后重试", retry_ms / 1_000);
+                    crate::logging::warn(&format!("未发现设备，{}s 后重试", retry_ms / 1_000));
                     next_retry_ms = now.saturating_add(retry_i64);
                 }
                 Err(err) => {
-                    eprintln!("设备不可用：{err}，{}s 后重试", retry_ms / 1_000);
+                    crate::logging::warn(&format!(
+                        "设备不可用：{err}，{}s 后重试",
+                        retry_ms / 1_000
+                    ));
                     next_retry_ms = now.saturating_add(retry_i64);
                 }
             }
@@ -166,7 +169,7 @@ pub fn run_loop(
                         Ok(_) => report.ipc_messages += 1,
                         Err(err) => {
                             report.ipc_rejects += 1;
-                            eprintln!("IPC 消息被拒绝：{err}");
+                            crate::logging::warn(&format!("IPC 消息被拒绝：{err}"));
                         }
                     },
                     Ok(None) => {
@@ -174,13 +177,13 @@ pub fn run_loop(
                             && ipc.state() == ConnectionState::WaitingClient
                         {
                             app.handle_client_disconnected();
-                            eprintln!("IPC 客户端断开，已清除旧快照");
+                            crate::logging::info("IPC 客户端断开，已清除旧快照");
                         }
                         break;
                     }
                     Err(err) => {
                         report.ipc_rejects += 1;
-                        eprintln!("IPC 读取失败：{err}");
+                        crate::logging::error(&format!("IPC 读取失败：{err}"));
                         break;
                     }
                 }
@@ -208,7 +211,7 @@ pub fn run_loop(
             Ok(frame) => Some(frame),
             Err(err) => {
                 report.render_failures += 1;
-                eprintln!("渲染失败：{err}");
+                crate::logging::error(&format!("渲染失败：{err}"));
                 None
             }
         };
@@ -220,7 +223,7 @@ pub fn run_loop(
                     Ok(()) => report.frames_sent += 1,
                     Err(err) => {
                         report.send_failures += 1;
-                        eprintln!("发送失败：{err}");
+                        crate::logging::error(&format!("发送失败：{err}"));
                         session.close();
                     }
                 }
@@ -426,7 +429,7 @@ impl ProductionEvents {
         let watcher = match screen_transport_cdc::DeviceWatcher::register() {
             Ok(watcher) => Some(watcher),
             Err(err) => {
-                eprintln!("设备通知注册失败（仍可轮询发现）：{err}");
+                crate::logging::warn(&format!("设备通知注册失败（仍可轮询发现）：{err}"));
                 None
             }
         };
@@ -456,7 +459,7 @@ pub fn run_production(app: &mut ScreenApp, options: RunOptions) -> Result<RunRep
     let mut ipc = match WindowsIpcPoller::new(&pipe, &client_exe) {
         Ok(ipc) => Some(ipc),
         Err(err) => {
-            eprintln!("IPC 管道不可用：{err}");
+            crate::logging::error(&format!("IPC 管道不可用：{err}"));
             None
         }
     };

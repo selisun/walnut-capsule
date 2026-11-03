@@ -47,6 +47,9 @@ pub struct ScreenConfig {
     pub network: bool,
     #[serde(default = "default_true")]
     pub disk: bool,
+    /// 逻辑卷（NAS storage[]）卡片：默认关闭，开启后多出一张「存储」卡
+    #[serde(default)]
+    pub storage: bool,
 }
 
 impl Default for ScreenConfig {
@@ -63,6 +66,7 @@ impl Default for ScreenConfig {
             gpu: true,
             network: true,
             disk: true,
+            storage: false,
         }
     }
 }

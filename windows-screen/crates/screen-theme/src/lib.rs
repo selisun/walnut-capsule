@@ -9,5 +9,5 @@ pub mod loader;
 pub mod store;
 
 pub use error::ThemeError;
-pub use loader::{load_str, validate, MAX_THEME_BYTES};
+pub use loader::{load_dir, load_str, validate, MAX_THEME_BYTES};
 pub use store::ThemeStore;

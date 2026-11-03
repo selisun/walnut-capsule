@@ -326,6 +326,9 @@ fn render_config(cfg: &ScreenConfig) -> String {
     if cfg.disk {
         visible.push("disk");
     }
+    if cfg.storage {
+        visible.push("storage");
+    }
     let list = visible
         .iter()
         .map(|v| format!("\"{v}\""))
@@ -465,6 +468,16 @@ mod tests {
         assert!(text.contains("visible = [\"cpu\", \"memory\", \"network\"]"));
         assert!(!text.contains("\"gpu\""));
         assert!(!text.contains("\"disk\""));
+        assert!(!text.contains("\"storage\""), "storage 默认关闭");
+    }
+
+    #[test]
+    fn storage_card_can_be_enabled() {
+        let mut c = cfg("portrait", 1);
+        c.storage = true;
+        let text = render_config(&c);
+        assert!(text.contains("\"storage\""));
+        assert!(text.contains("visible = [\"cpu\", \"memory\", \"network\", \"storage\"]"));
     }
 
     #[test]
