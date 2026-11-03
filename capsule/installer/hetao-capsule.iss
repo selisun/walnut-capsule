@@ -45,6 +45,8 @@ Name: "startup"; Description: "开机自动启动（推荐）"; GroupDescription
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; B-10 native 引擎的小屏进程，必须与主 exe 同目录（缺失时自动回退旧 PowerShell）
+Source: "..\..\windows-screen\target\release\hetao-screen.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
