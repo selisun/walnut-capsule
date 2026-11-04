@@ -292,6 +292,7 @@ mod tests {
             background: Default::default(),
             components: Default::default(),
             layout: Default::default(),
+            render: None,
             resources: Vec::new(),
         }
     }

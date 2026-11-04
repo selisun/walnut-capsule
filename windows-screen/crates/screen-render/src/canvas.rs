@@ -66,6 +66,62 @@ impl Canvas {
         Ok(())
     }
 
+    /// 圆环扇区：从 `from_deg` 画到 `to_deg`（0° 在 12 点方向，顺时针）。
+    pub fn draw_ring(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        thickness: f32,
+        from_deg: f32,
+        to_deg: f32,
+        color: Color,
+    ) -> Result<(), RenderError> {
+        if !(radius > 0.0) || !(thickness > 0.0) || !radius.is_finite() {
+            return Err(RenderError::Canvas("圆环参数非法".to_string()));
+        }
+        let sweep = (to_deg - from_deg).clamp(0.0, 360.0);
+        if sweep <= 0.0 {
+            return Ok(());
+        }
+        let r_out = radius;
+        let r_in = (radius - thickness).max(0.5);
+        let steps = ((sweep / 4.0).ceil() as usize).max(6);
+        let mut builder = tiny_skia::PathBuilder::new();
+        for i in 0..=steps {
+            let deg = from_deg + sweep * (i as f32 / steps as f32);
+            let rad = (deg - 90.0).to_radians();
+            let (s, c) = rad.sin_cos();
+            let (x, y) = (cx + r_out * c, cy + r_out * s);
+            if i == 0 {
+                builder.move_to(x, y);
+            } else {
+                builder.line_to(x, y);
+            }
+        }
+        for i in (0..=steps).rev() {
+            let deg = from_deg + sweep * (i as f32 / steps as f32);
+            let rad = (deg - 90.0).to_radians();
+            let (s, c) = rad.sin_cos();
+            builder.line_to(cx + r_in * c, cy + r_in * s);
+        }
+        builder.close();
+        let path = builder
+            .finish()
+            .ok_or_else(|| RenderError::Canvas("圆环路径构造失败".to_string()))?;
+        let mut paint = Paint::default();
+        paint.set_color(to_color(color));
+        paint.anti_alias = true;
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::EvenOdd,
+            Transform::identity(),
+            None,
+        );
+        Ok(())
+    }
+
     pub fn into_frame(self) -> Result<FrameBuffer, RenderError> {
         let width = self.pixmap.width();
         let height = self.pixmap.height();

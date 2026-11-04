@@ -10,6 +10,7 @@ mod data;
 mod fmt;
 mod font;
 mod icons;
+mod pc_metrics;
 // B-10 P1：快照映射与 IPC 编码。P2 才接入管道，故先允许未使用告警。
 #[allow(dead_code)]
 mod screen_bridge;

@@ -13,8 +13,8 @@ use screen_ipc::{ConnectionState, Message, MessageKind};
 use screen_layout::{build, TemplateKind};
 use screen_protocol::rgba_to_rgb565le;
 use screen_render::{
-    bind_with_clock, create_text_renderer, local_clock, render_notice_bg, render_with_bg,
-    render_with_metrics_bg, BackgroundImage, FontSpec,
+    bind_with_clock, create_text_renderer, local_clock, render_legacy, render_notice_bg,
+    render_with_bg, render_with_metrics_bg, BackgroundImage, FontSpec, LegacyData,
 };
 use screen_theme::{load_dir, load_str, ThemeStore};
 use screen_transport_cdc::CdcTransport;
@@ -358,13 +358,37 @@ impl ScreenApp {
             .snapshot
             .as_ref()
             .ok_or_else(|| AppError::Data("无客户端快照，不能渲染指标".into()))?;
+        let direction = self.direction(physical)?;
+        let plan = direction.plan(physical, Some(&self.config.display.layout_template))?;
+
+        // 旧版四主题：走专用版式（顶栏 + 圆环 / 双列），与旧 screen.ps1 对齐
+        if self.current_theme.render.is_some() {
+            let data = legacy_data(snapshot);
+            let visible = &self.config.components.visible;
+            let set = create_text_renderer(&FontSpec {
+                family: self.current_theme.typography.family.clone(),
+                size_px: 16.0,
+                weight: theme_weight(&self.current_theme),
+            });
+            let logical = match set {
+                Ok(mut renderer) => render_legacy(
+                    &plan.logical,
+                    &self.current_theme,
+                    &data,
+                    visible,
+                    Some(renderer.as_mut()),
+                ),
+                Err(_) => render_legacy(&plan.logical, &self.current_theme, &data, visible, None),
+            }
+            .map_err(|e| AppError::State(e.to_string()))?;
+            return finish_frame(direction, physical, &logical);
+        }
+
         let bound = bind_with_clock(
             &snapshot.metrics,
             &self.config.components.visible,
             local_clock(),
         );
-        let direction = self.direction(physical)?;
-        let plan = direction.plan(physical, Some(&self.config.display.layout_template))?;
         let tree = if bound.is_empty() {
             LayoutTree {
                 profile_id: plan.logical.id.clone(),
@@ -402,19 +426,7 @@ impl ScreenApp {
             ),
         }
         .map_err(|e| AppError::State(e.to_string()))?;
-        let logical = direction
-            .oriented_frame(physical, &logical)
-            .map_err(AppError::from)?;
-        let pixels = rgba_to_rgb565le(logical.pixels(), logical.width(), logical.height())
-            .map_err(|e| AppError::State(e.to_string()))?;
-        Frame::new(
-            logical.width(),
-            logical.height(),
-            PixelFormat::Rgb565Le,
-            pixels,
-            Some(8192),
-        )
-        .map_err(|e| AppError::State(e.to_string()))
+        finish_frame(direction, physical, &logical)
     }
 
     /// 生成占位物理帧（等待客户端/数据过期/版本不兼容），不显示任何旧数值。
@@ -611,6 +623,50 @@ impl ScreenApp {
         self.devices.clear();
         self.ipc_state = ConnectionState::Disconnected;
         self.state = AppState::Shutdown;
+    }
+}
+
+/// 逻辑帧 → 按方向旋转 → RGB565LE 物理帧。
+fn finish_frame(
+    direction: Direction,
+    physical: &ScreenProfile,
+    logical: &FrameBuffer,
+) -> Result<Frame, AppError> {
+    let logical = direction
+        .oriented_frame(physical, logical)
+        .map_err(AppError::from)?;
+    let pixels = rgba_to_rgb565le(logical.pixels(), logical.width(), logical.height())
+        .map_err(|e| AppError::State(e.to_string()))?;
+    Frame::new(
+        logical.width(),
+        logical.height(),
+        PixelFormat::Rgb565Le,
+        pixels,
+        Some(8192),
+    )
+    .map_err(|e| AppError::State(e.to_string()))
+}
+
+/// 从快照提取旧版版式所需的数据（缺失一律留 None）。
+fn legacy_data(snapshot: &Snapshot) -> LegacyData {
+    let m = &snapshot.metrics;
+    LegacyData {
+        host: snapshot.nas.name.clone(),
+        addr: snapshot.nas.addr.clone(),
+        online: snapshot.nas.online.unwrap_or(false),
+        cpu: m.cpu.as_ref().and_then(|c| c.usage_pct),
+        cpu_temp: m.cpu.as_ref().and_then(|c| c.temp_c),
+        mem: m.memory.as_ref().and_then(|v| v.usage_pct),
+        mem_used: m.memory.as_ref().and_then(|v| v.used_bytes),
+        mem_total: m.memory.as_ref().and_then(|v| v.total_bytes),
+        gpu: m.gpu.as_ref().and_then(|v| v.usage_pct),
+        gpu_temp: m.gpu.as_ref().and_then(|v| v.temp_c),
+        up: m.network.as_ref().and_then(|v| v.up_bps),
+        down: m.network.as_ref().and_then(|v| v.down_bps),
+        read: m.disk.as_ref().and_then(|v| v.read_bps),
+        write: m.disk.as_ref().and_then(|v| v.write_bps),
+        pc_cpu: snapshot.pc.cpu_pct,
+        pc_mem: snapshot.pc.mem_pct,
     }
 }
 

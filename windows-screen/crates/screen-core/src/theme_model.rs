@@ -290,6 +290,9 @@ pub struct ThemeConfig {
     pub components: Components,
     #[serde(default)]
     pub layout: LayoutConfig,
+    /// 版式风格：`legacy-single`（单列卡片+圆环）| `legacy-dual`（左 NAS / 右电脑）。
+    #[serde(default)]
+    pub render: Option<String>,
     #[serde(default)]
     pub resources: Vec<ResourceRef>,
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hetao-capsule"
-version = "0.2.32"
+version = "0.2.33"
 edition = "2021"
 
 [dependencies]
@@ -16,6 +16,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    # 双显右列：GetSystemTimes / GlobalMemoryStatusEx 取本机 CPU/内存（请在 15 号追认）
+    "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",

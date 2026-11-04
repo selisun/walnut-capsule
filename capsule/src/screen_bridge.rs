@@ -41,6 +41,18 @@ pub struct OutNas {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub online: bool,
+    /// 顶栏显示的地址（host 或 host:port），不含凭据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+}
+
+/// 电脑本机指标（双显主题右列）。
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct OutPc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_pct: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
@@ -139,6 +151,8 @@ pub struct ScreenSnapshot {
     pub ts_ms: i64,
     pub nas: OutNas,
     pub metrics: OutMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pc: Option<OutPc>,
 }
 
 /// 把 capsule 的 NAS 指标映射为小屏快照。
@@ -153,6 +167,18 @@ pub struct ScreenSnapshot {
 /// 实测（P2 真机）NAS 侧时间戳与本机存在偏差，直接透传会让每帧都判「数据过期」。
 /// 上游断开时胶囊本身停止推送，故不会把旧数据当实时。
 pub fn map_snapshot(src: &data::Snapshot, online: bool, seq: u64, now_ms: i64) -> ScreenSnapshot {
+    map_snapshot_with(src, online, seq, now_ms, None, None)
+}
+
+/// 同 `map_snapshot`，额外带上电脑本机指标与 NAS 显示地址。
+pub fn map_snapshot_with(
+    src: &data::Snapshot,
+    online: bool,
+    seq: u64,
+    now_ms: i64,
+    pc: Option<OutPc>,
+    nas_addr: Option<&str>,
+) -> ScreenSnapshot {
     let ts_ms = now_ms;
 
     let cpu = src.cpu.as_ref().map(|c| OutCpu {
@@ -228,6 +254,7 @@ pub fn map_snapshot(src: &data::Snapshot, online: bool, seq: u64, now_ms: i64) -
         nas: OutNas {
             name: src.hostname.clone(),
             online,
+            addr: nas_addr.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         },
         metrics: OutMetrics {
             cpu,
@@ -237,6 +264,7 @@ pub fn map_snapshot(src: &data::Snapshot, online: bool, seq: u64, now_ms: i64) -
             disk,
             storage,
         },
+        pc,
     }
 }
 
@@ -359,6 +387,7 @@ pub fn run_push_loop(
     let mut sink: Option<Box<dyn PipeSink>> = None;
     let mut seq: u64 = 0;
     let refresh_ms = refresh_ms.max(1);
+    let mut sampler = crate::pc_metrics::PcSampler::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -391,17 +420,29 @@ pub fn run_push_loop(
             }
         }
 
-        let (snapshot, online, has_data) = match shared.read() {
+        let (snapshot, online, has_data, nas_host) = match shared.read() {
             Ok(guard) => {
                 let online = guard.conn == data::ConnStatus::Online;
-                (guard.snap.clone(), online, guard.has_data)
+                (
+                    guard.snap.clone(),
+                    online,
+                    guard.has_data,
+                    guard.nas_host.clone(),
+                )
             }
-            Err(_) => (Arc::new(data::Snapshot::default()), false, false),
+            Err(_) => (
+                Arc::new(data::Snapshot::default()),
+                false,
+                false,
+                String::new(),
+            ),
         };
 
         if online && has_data {
             seq += 1;
-            let mapped = map_snapshot(&snapshot, online, seq, now());
+            let (cpu_pct, mem_pct) = sampler.sample();
+            let pc = (cpu_pct.is_some() || mem_pct.is_some()).then_some(OutPc { cpu_pct, mem_pct });
+            let mapped = map_snapshot_with(&snapshot, online, seq, now(), pc, Some(&nas_host));
             if let Ok(bytes) = encode_snapshot(&mapped) {
                 if write_msg(&mut sink, &bytes) {
                     stats.snapshots += 1;
@@ -808,11 +849,18 @@ mod tests {
         assert_eq!(seq_of(&writes[2]), 2);
         assert_eq!(seq_of(&writes[3]), 3);
         assert_eq!(seq_of(&writes[4]), 4);
-        // 快照 payload 必须与映射结果逐字节一致（ts_ms 取本次采样时刻）
-        let expected = map_snapshot(&fixture_source(), true, 1, 1_700_000_123_000)
-            .payload_json()
-            .expect("json");
-        assert_eq!(&writes[1][HEADER_LEN..], expected.as_bytes());
+        // 快照 payload 必须与映射结果一致（ts_ms 取本次采样时刻）。
+        // `pc` 是本机实时采样（随机器变化），比对时剔除。
+        let expected: serde_json::Value = serde_json::from_str(
+            &map_snapshot(&fixture_source(), true, 1, 1_700_000_123_000)
+                .payload_json()
+                .expect("json"),
+        )
+        .expect("expected json");
+        let mut actual: serde_json::Value =
+            serde_json::from_slice(&writes[1][HEADER_LEN..]).expect("actual json");
+        actual.as_object_mut().expect("obj").remove("pc");
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod canvas;
 pub mod error;
 pub mod font;
 pub mod image;
+pub mod legacy;
 pub mod metrics;
 pub mod pipeline;
 pub mod text;
@@ -16,6 +17,7 @@ pub mod transform;
 pub use canvas::Canvas;
 pub use error::RenderError;
 pub use image::BackgroundImage;
+pub use legacy::{render_legacy, LegacyData};
 pub use metrics::{bind, bind_with_clock, local_clock, ClockParts, MetricView};
 pub use pipeline::{
     render, render_notice, render_notice_bg, render_with_bg, render_with_metrics,

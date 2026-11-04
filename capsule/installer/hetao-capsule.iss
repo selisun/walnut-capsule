@@ -3,7 +3,7 @@
 ; 说明：免管理员安装（装到用户目录），创建开始菜单/桌面快捷方式，可选开机自启。
 
 #define AppName "核桃胶囊"
-#define AppVer "0.2.32"
+#define AppVer "0.2.33"
 #define AppExe "hetao-capsule.exe"
 #define AppPublisher "蓝胖纸"
 ; 小屏进程必须随安装包一起分发，缺失时直接让编译失败，避免静默产出「没有小屏」的安装包

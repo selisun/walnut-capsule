@@ -24,8 +24,8 @@ pub use error::CoreError;
 pub use frame::{bytes_per_pixel, Frame, FrameBuffer};
 pub use layout_model::{LayoutItem, LayoutTree, Rect, ScreenProfile, SizeClass};
 pub use snapshot::{
-    CpuMetrics, DiskMetrics, GpuMetrics, MemoryMetrics, Metrics, NasInfo, NetworkMetrics, Snapshot,
-    StorageVolume,
+    CpuMetrics, DiskMetrics, GpuMetrics, MemoryMetrics, Metrics, NasInfo, NetworkMetrics,
+    PcMetrics, Snapshot, StorageVolume,
 };
 pub use theme_model::{
     Background, Color, ComponentKind, ComponentStyle, Components, ImageAnchor, ImageFit,

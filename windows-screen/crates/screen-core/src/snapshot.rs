@@ -55,6 +55,16 @@ pub struct StorageVolume {
 pub struct NasInfo {
     pub name: Option<String>,
     pub online: Option<bool>,
+    /// 显示用的地址（`host` 或 `host:port`），仅用于顶栏，不含凭据。
+    #[serde(default)]
+    pub addr: Option<String>,
+}
+
+/// 电脑本机（运行胶囊的这台机器）指标，供双显主题右列使用。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PcMetrics {
+    pub cpu_pct: Option<f32>,
+    pub mem_pct: Option<f32>,
 }
 
 /// 指标集合：`None` 表示该项缺失，渲染层必须整项隐藏（见 `06`/`09`）。
@@ -91,6 +101,9 @@ pub struct Snapshot {
     pub nas: NasInfo,
     #[serde(default)]
     pub metrics: Metrics,
+    /// 电脑本机指标；旧版客户端不推送时保持全空。
+    #[serde(default)]
+    pub pc: PcMetrics,
 }
 
 impl Snapshot {
@@ -100,6 +113,7 @@ impl Snapshot {
             ts_ms,
             nas: NasInfo::default(),
             metrics: Metrics::default(),
+            pc: PcMetrics::default(),
         }
     }
 

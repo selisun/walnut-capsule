@@ -166,6 +166,11 @@ pub fn validate(theme: &ThemeConfig) -> Result<(), ThemeError> {
     {
         return Err(ThemeError::InvalidField("layout.template".to_string()));
     }
+    if let Some(render) = &theme.render {
+        if !["legacy-single", "legacy-dual"].contains(&render.as_str()) {
+            return Err(ThemeError::InvalidField("render".to_string()));
+        }
+    }
     for (profile, template) in &theme.layout.overrides {
         if profile.trim().is_empty() {
             return Err(ThemeError::InvalidField("layout.overrides 键".to_string()));
