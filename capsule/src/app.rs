@@ -3603,16 +3603,36 @@ fn read_screen_engine(hwnd: HWND) -> String {
     crate::config::SCREEN_ENGINES[idx].to_string()
 }
 
+/// 推送桥跟随开关与引擎：只有 native + 启用时才推送快照，否则小屏只能显示「等待客户端」。
+fn sync_screen_bridge(
+    shared: &std::sync::Arc<std::sync::RwLock<SharedState>>,
+    cfg: &crate::config::ScreenConfig,
+) {
+    let want_push = cfg.enabled && cfg.engine == crate::config::SCREEN_ENGINE_NATIVE;
+    if want_push {
+        crate::screen_bridge::start(shared.clone(), cfg.interval);
+    } else {
+        crate::screen_bridge::stop();
+    }
+}
+
 /// 拉起当前引擎；native 失败时回退 PowerShell（与 main.rs 启动逻辑一致）。
-fn start_screen_engine(cfg: &crate::config::ScreenConfig) {
+fn start_screen_engine(
+    shared: &std::sync::Arc<std::sync::RwLock<SharedState>>,
+    cfg: &crate::config::ScreenConfig,
+) {
     if cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
         crate::screen_native::stop();
         if crate::screen_native::start(cfg) {
+            sync_screen_bridge(shared, cfg);
             return;
         }
+        // native 起不来时退回 PowerShell，同时停掉推送（旧引擎不读管道）
         crate::screen_host::start();
+        crate::screen_bridge::stop();
     } else {
         crate::screen_native::stop();
+        crate::screen_bridge::stop();
         crate::screen_host::start();
     }
 }
@@ -3620,13 +3640,19 @@ fn start_screen_engine(cfg: &crate::config::ScreenConfig) {
 fn stop_screen_engine() {
     crate::screen_native::stop();
     crate::screen_host::stop();
+    crate::screen_bridge::stop();
 }
 
 /// native 引擎只在启动时读配置，改主题/卡片/方向后必须重启才生效。
-fn restart_native_screen(cfg: &crate::config::ScreenConfig) {
+fn restart_native_screen(
+    shared: &std::sync::Arc<std::sync::RwLock<SharedState>>,
+    cfg: &crate::config::ScreenConfig,
+) {
     if cfg.enabled && cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
         crate::screen_native::stop();
-        let _ = crate::screen_native::start(cfg);
+        if crate::screen_native::start(cfg) {
+            sync_screen_bridge(shared, cfg);
+        }
     }
 }
 
@@ -5218,10 +5244,12 @@ fn settings_wndproc_impl(
                     let _ = crate::config::save(&state.config);
                     if state.config.screen.enabled {
                         if state.config.screen.engine != was_engine {
-                            start_screen_engine(&state.config.screen);
+                            start_screen_engine(&state.shared, &state.config.screen);
                         } else {
-                            restart_native_screen(&state.config.screen);
+                            restart_native_screen(&state.shared, &state.config.screen);
                         }
+                    } else {
+                        stop_screen_engine();
                     }
                     settings_update_screen_status(hwnd, &state.config.screen);
                     return LRESULT(0);
@@ -5233,7 +5261,7 @@ fn settings_wndproc_impl(
                         IDC_SCREEN_BTN_ON => {
                             state.config.screen.enabled = true;
                             state.config.screen.engine = read_screen_engine(hwnd);
-                            start_screen_engine(&state.config.screen);
+                            start_screen_engine(&state.shared, &state.config.screen);
                             let _ = crate::config::save(&state.config);
                             settings_refresh_screen_buttons(hwnd);
                             settings_update_screen_status(hwnd, &state.config.screen);
@@ -5252,9 +5280,11 @@ fn settings_wndproc_impl(
                             if state.config.screen.engine == crate::config::SCREEN_ENGINE_NATIVE {
                                 // native：重启进程即可重新打开串口并重做初始化
                                 state.config.screen.enabled = true;
-                                start_screen_engine(&state.config.screen);
+                                start_screen_engine(&state.shared, &state.config.screen);
                                 let _ = crate::config::save(&state.config);
                             } else {
+                                // 旧引擎不读管道，重连时顺手停掉推送，避免线程空转
+                                crate::screen_bridge::stop();
                                 // 脚本被占用卡住时靠这条指令重试；宿主没在跑就先拉起来
                                 if !crate::screen_host::is_running() {
                                     state.config.screen.enabled = true;
@@ -5426,9 +5456,9 @@ fn settings_wndproc_impl(
                     // 引擎切换或 native 配置变化：重启小屏进程才会读取新配置
                     if state.config.screen.enabled {
                         if state.config.screen.engine != was_engine {
-                            start_screen_engine(&state.config.screen);
+                            start_screen_engine(&state.shared, &state.config.screen);
                         } else {
-                            restart_native_screen(&state.config.screen);
+                            restart_native_screen(&state.shared, &state.config.screen);
                         }
                     } else if state.config.screen.engine != was_engine {
                         stop_screen_engine();

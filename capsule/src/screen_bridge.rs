@@ -290,7 +290,7 @@ pub fn encode_snapshot(snapshot: &ScreenSnapshot) -> Result<Vec<u8>, String> {
 // ---------------------------------------------------------------------------
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -434,9 +434,22 @@ pub fn run_push_loop(
 static PUSH_STOP: AtomicBool = AtomicBool::new(false);
 static PUSH_STARTED: AtomicBool = AtomicBool::new(false);
 static PUSH_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// 每轮推送后重新读取，设置里改刷新周期无需重启线程。
+static PUSH_INTERVAL_MS: AtomicU64 = AtomicU64::new(1_000);
+
+/// 推送线程是否在跑（供设置界面判断是否需要拉起）。
+pub fn is_running() -> bool {
+    PUSH_STARTED.load(Ordering::SeqCst)
+}
+
+/// 运行中修改刷新周期（秒）。线程下一轮生效，不重启、不阻塞 UI。
+pub fn set_interval_secs(refresh_secs: u32) {
+    PUSH_INTERVAL_MS.store(u64::from(refresh_secs.max(1)) * 1_000, Ordering::SeqCst);
+}
 
 /// 启动后台推送线程（幂等）。失败只写日志，不影响客户端主流程。
 pub fn start(shared: Arc<RwLock<data::SharedState>>, refresh_secs: u32) {
+    set_interval_secs(refresh_secs);
     if PUSH_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -445,7 +458,18 @@ pub fn start(shared: Arc<RwLock<data::SharedState>>, refresh_secs: u32) {
     let handle = std::thread::spawn(move || {
         let mut open = open_pipe;
         let mut now = epoch_ms;
-        let mut sleep = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+        // 分片休眠：改周期即时生效，且 stop 最多 100ms 就能返回，不卡 UI。
+        let mut sleep = |_ms: u64| {
+            let mut left = PUSH_INTERVAL_MS.load(Ordering::SeqCst).max(1);
+            while left > 0 {
+                if PUSH_STOP.load(Ordering::SeqCst) {
+                    return;
+                }
+                let step = left.min(100);
+                std::thread::sleep(Duration::from_millis(step));
+                left -= step;
+            }
+        };
         let stats = run_push_loop(
             &shared, refresh_ms, &PUSH_STOP, &mut open, &mut now, &mut sleep,
         );
@@ -460,7 +484,7 @@ pub fn start(shared: Arc<RwLock<data::SharedState>>, refresh_secs: u32) {
     }
 }
 
-/// 停止推送线程（最多等一个刷新周期），并让出锁避免阻塞退出。
+/// 停止推送线程（分片休眠下最多约 100ms 返回），并让出锁避免阻塞退出。
 pub fn stop() {
     if !PUSH_STARTED.swap(false, Ordering::SeqCst) {
         return;
@@ -469,6 +493,25 @@ pub fn stop() {
     let handle = PUSH_THREAD.lock().ok().and_then(|mut slot| slot.take());
     if let Some(handle) = handle {
         let _ = handle.join();
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn interval_is_clamped_and_stored() {
+        set_interval_secs(0);
+        assert_eq!(PUSH_INTERVAL_MS.load(Ordering::SeqCst), 1_000);
+        set_interval_secs(3);
+        assert_eq!(PUSH_INTERVAL_MS.load(Ordering::SeqCst), 3_000);
+        set_interval_secs(1);
+    }
+
+    #[test]
+    fn push_thread_is_not_running_before_start() {
+        assert!(!is_running());
     }
 }
 
