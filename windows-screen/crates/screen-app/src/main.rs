@@ -38,7 +38,8 @@ fn main() -> ExitCode {
         Command::Run {
             config,
             run_seconds,
-        } => run(config.as_deref(), run_seconds),
+            parent_pid,
+        } => run(config.as_deref(), run_seconds, parent_pid),
         Command::SetOrientation {
             orientation,
             config,
@@ -83,8 +84,16 @@ fn check_theme(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn run(path: Option<&Path>, run_seconds: Option<u64>) -> Result<(), String> {
+fn run(
+    path: Option<&Path>,
+    run_seconds: Option<u64>,
+    parent_pid: Option<u32>,
+) -> Result<(), String> {
     let mut app = ScreenApp::init(path).map_err(|e| e.to_string())?;
+    // 父进程（胶囊）被强杀时自行退出，避免残留进程占住串口与 hetao-screen.exe
+    if let Some(pid) = parent_pid {
+        screen_app::runtime::watch_parent(pid);
+    }
     // 日志按配置落盘：与 config.toml 同级的 hetao-screen.log
     let log_file = app
         .config_path()

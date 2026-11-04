@@ -3,11 +3,12 @@
 ; 说明：免管理员安装（装到用户目录），创建开始菜单/桌面快捷方式，可选开机自启。
 
 #define AppName "核桃胶囊"
-#define AppVer "0.2.30"
+#define AppVer "0.2.31"
 #define AppExe "hetao-capsule.exe"
 #define AppPublisher "蓝胖纸"
 ; 小屏进程必须随安装包一起分发，缺失时直接让编译失败，避免静默产出「没有小屏」的安装包
 #define ScreenExe "..\..\windows-screen\target\release\hetao-screen.exe"
+#define ScreenProc "hetao-screen.exe"
 #if FileExists(ScreenExe) == 0
   #error "缺少 hetao-screen.exe：请先在 windows-screen 目录执行 cargo build --release -p screen-app"
 #endif
@@ -72,11 +73,34 @@ var
   ResultCode: Integer;
 begin
   Exec('taskkill.exe', '/IM {#AppExe} /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // 主进程被强制结束后，托管的小屏进程会变成孤儿并锁住 hetao-screen.exe；
+  // 不杀它，覆盖安装会报「DeleteFile 失败：错误代码 5」。
+  Exec('taskkill.exe', '/IM {#ScreenProc} /F', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
+end;
+
+/// 部分机器上句柄释放有延迟，删不掉就重试几次，避免直接弹「错误代码 5」。
+procedure RemoveStaleFiles;
+var
+  I: Integer;
+  Target: String;
+begin
+  Target := ExpandConstant('{app}\{#ScreenProc}');
+  for I := 1 to 10 do
+  begin
+    if not FileExists(Target) then
+      Exit;
+    if DeleteFile(Target) then
+      Exit;
+    KillRunningInstances;
+    Sleep(300);
+  end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   KillRunningInstances;
+  RemoveStaleFiles;
   Result := '';
 end;
 

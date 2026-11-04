@@ -20,9 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    CREATE_NO_WINDOW, PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, STARTUPINFOW,
+    CreateProcessW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
+    QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW, PROCESS_INFORMATION,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
 };
 
 use crate::config::{ScreenConfig, SCREEN_ENGINE_NATIVE};
@@ -236,12 +236,22 @@ fn watchdog(exe: PathBuf, gen: u32) {
     }
 }
 
+/// 子进程命令行。`--parent-pid` 让子进程在我们被强杀时自行退出，
+/// 否则残留进程会一直占用串口，并锁住 hetao-screen.exe 导致覆盖安装失败。
+fn child_command(exe: &Path, config: &Path, parent_pid: u32) -> String {
+    format!(
+        "\"{}\" --config \"{}\" --parent-pid {parent_pid}",
+        exe.display(),
+        config.display()
+    )
+}
+
 fn spawn(exe: &Path) -> bool {
     if STOPPING.load(Ordering::SeqCst) {
         return false;
     }
-    let config = config_path();
-    let mut cmd: Vec<u16> = format!("\"{}\" --config \"{}\"", exe.display(), config.display())
+    let parent_pid = unsafe { GetCurrentProcessId() };
+    let mut cmd: Vec<u16> = child_command(exe, &config_path(), parent_pid)
         .encode_utf16()
         .collect();
     cmd.push(0);
@@ -505,6 +515,19 @@ mod tests {
         c.clock = true;
         let text = render_config(&c);
         assert!(text.contains("visible = [\"cpu\", \"memory\", \"network\", \"temp\", \"clock\"]"));
+    }
+
+    #[test]
+    fn child_command_passes_parent_pid() {
+        let cmd = child_command(
+            Path::new(r"C:\app\hetao-screen.exe"),
+            Path::new(r"C:\cfg\config.toml"),
+            4321,
+        );
+        assert_eq!(
+            cmd,
+            r#""C:\app\hetao-screen.exe" --config "C:\cfg\config.toml" --parent-pid 4321"#
+        );
     }
 
     #[test]

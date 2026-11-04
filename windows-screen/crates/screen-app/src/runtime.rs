@@ -342,6 +342,31 @@ mod console_ctrl {
         STOP_REQUESTED.load(Ordering::SeqCst)
     }
 
+    static PARENT_WATCHED: Once = Once::new();
+
+    /// 监视父进程句柄：父进程被强杀（托盘退出、任务管理器、安装器 taskkill）时，
+    /// 本进程能自行退出，不会变成孤儿长期占用串口和 hetao-screen.exe。
+    pub fn watch_parent(pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        PARENT_WATCHED.call_once(move || {
+            std::thread::spawn(move || {
+                use windows::Win32::Foundation::CloseHandle;
+                use windows::Win32::System::Threading::{
+                    OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+                };
+
+                // INFINITE：父进程不退出就一直等；拿不到句柄说明父进程已不在。
+                if let Ok(handle) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+                    let _ = unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
+                    let _ = unsafe { CloseHandle(handle) };
+                }
+                STOP_REQUESTED.store(true, Ordering::SeqCst);
+            });
+        });
+    }
+
     #[cfg(test)]
     mod tests {
         #[test]
@@ -356,6 +381,15 @@ mod console_ctrl {
         }
     }
 }
+
+/// 监视父进程：父进程消失时置停止标志，主循环下一拍清理退出。非 Windows 为空实现。
+#[cfg(windows)]
+pub fn watch_parent(pid: u32) {
+    console_ctrl::watch_parent(pid);
+}
+
+#[cfg(not(windows))]
+pub fn watch_parent(_pid: u32) {}
 
 #[cfg(windows)]
 pub struct TurzxDeviceProvider;

@@ -8,6 +8,8 @@ pub enum Command {
     Run {
         config: Option<PathBuf>,
         run_seconds: Option<u64>,
+        /// 父进程 PID：父进程消失时本进程自行退出，避免残留进程占住串口。
+        parent_pid: Option<u32>,
     },
     SetOrientation {
         orientation: String,
@@ -75,6 +77,7 @@ where
     let mut session: Option<u64> = None;
     let mut repeat: u32 = 1;
     let mut run_seconds: Option<u64> = None;
+    let mut parent_pid: Option<u32> = None;
     let mut set_orientation: Option<String> = None;
     let mut set_flip: Option<String> = None;
 
@@ -120,6 +123,14 @@ where
                     value
                         .parse::<u64>()
                         .map_err(|_| CliError::MissingValue("--device-session 需要秒数"))?,
+                );
+            }
+            "--parent-pid" => {
+                let value = iter.next().ok_or(CliError::MissingValue("--parent-pid"))?;
+                parent_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| CliError::MissingValue("--parent-pid 需要进程号"))?,
                 );
             }
             "--run-seconds" => {
@@ -264,6 +275,7 @@ where
     Ok(Command::Run {
         config,
         run_seconds,
+        parent_pid,
     })
 }
 
@@ -271,7 +283,8 @@ pub const HELP: &str = "\
 hetao-screen — 核桃胶囊小屏进程
 
 用法:
-  hetao-screen [--config <path>] [--run-seconds <N>]  启动常驻主循环（无设备/无客户端时等待，N 秒后退出）
+  hetao-screen [--config <path>] [--run-seconds <N>] [--parent-pid <PID>]
+                                                  启动常驻主循环（无设备/无客户端时等待；--parent-pid 让父进程消失时自动退出）
   hetao-screen --set-orientation <portrait|landscape> [--config <path>]  写配置后退出
   hetao-screen --set-flip <normal|flipped> [--config <path>]              写配置后退出
   hetao-screen --print-config [--config <path>]    打印生效配置
@@ -298,7 +311,8 @@ mod tests {
             cmd,
             Command::Run {
                 config: None,
-                run_seconds: None
+                run_seconds: None,
+                parent_pid: None
             }
         );
     }
@@ -310,11 +324,27 @@ mod tests {
             cmd,
             Command::Run {
                 config: None,
-                run_seconds: Some(10)
+                run_seconds: Some(10),
+                parent_pid: None
             }
         );
         assert!(parse(["--run-seconds", "0"]).is_err());
         assert!(parse(["--run-seconds", "999999"]).is_err());
+    }
+
+    #[test]
+    fn parent_pid_is_parsed() {
+        let cmd = parse(["--parent-pid", "4321"]).expect("cmd");
+        assert_eq!(
+            cmd,
+            Command::Run {
+                config: None,
+                run_seconds: None,
+                parent_pid: Some(4321)
+            }
+        );
+        assert!(parse(["--parent-pid", "abc"]).is_err());
+        assert!(parse(["--parent-pid"]).is_err());
     }
 
     #[test]
