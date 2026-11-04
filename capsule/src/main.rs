@@ -13,7 +13,6 @@ mod icons;
 // B-10 P1：快照映射与 IPC 编码。P2 才接入管道，故先允许未使用告警。
 #[allow(dead_code)]
 mod screen_bridge;
-mod screen_host;
 mod screen_native;
 mod ui;
 
@@ -26,29 +25,18 @@ fn main() {
 
     let config = config::load();
     screen_native::log_startup(&config.screen);
-    // 小屏脚本由客户端后台托管（无窗口 PowerShell），配置就绪后拉起（设置里「关闭小屏」后不再拉起）
-    if config.screen.enabled && config.screen.engine == config::SCREEN_ENGINE_NATIVE {
-        // B-10：native 引擎由胶囊负责写配置、拉起 hetao-screen.exe 并巡检；
-        // exe 缺失/拉起失败时回退旧 PowerShell，保证小屏不至于全黑。
-        screen_host::stop();
-        if !screen_native::start(&config.screen) {
-            screen_host::start();
-        }
-    } else if config.screen.enabled {
-        // 从 native 切回 powershell 时，必须先收掉 native 进程，否则它继续占着串口
-        screen_native::stop();
-        screen_host::start();
+    // 小屏由胶囊后台托管：写配置 → 拉起 hetao-screen.exe → 巡检重启。
+    // 兼容引擎（PowerShell）已下线，启用即走 native。
+    if config.screen.enabled {
+        screen_native::start(&config.screen);
     } else {
-        // 上次是被「关闭小屏」关掉的：顺手清掉升级/异常退出残留的脚本，
-        // 否则串口还被旧脚本占着，界面会显示「已连接」却关不掉
+        // 上次是「关闭小屏」关掉的：顺手清掉异常退出可能残留的进程
         screen_native::stop();
-        screen_host::stop();
     }
     app::run(config);
     // 经由非 WM_DESTROY 的异常返回路径也收尾：先停推送（发 Bye），再收进程，避免残留。
     screen_bridge::stop();
     screen_native::stop();
-    screen_host::stop();
 }
 
 /// 拿一个命名互斥体判断是否已有实例：已存在（ERROR_ALREADY_EXISTS）说明别人在跑。

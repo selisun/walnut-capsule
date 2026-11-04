@@ -33,7 +33,8 @@ pub struct ScreenConfig {
     /// 默认关闭；旧配置里已有该字段就沿用，升级不会改动用户原来的开关状态。
     #[serde(default)]
     pub enabled: bool,
-    /// 小屏引擎：powershell（默认，托管旧脚本）| native（Rust 小屏进程 + 快照推送）
+    /// 小屏引擎：固定 native（Rust 小屏进程 + 快照推送）。
+    /// 保留字段只为读旧配置；加载时 legacy 值会被强制归一。
     #[serde(default = "default_screen_engine")]
     pub engine: String,
     /// 小屏显示项目（与胶囊面板的卡片开关相互独立）
@@ -95,10 +96,8 @@ pub const SCREEN_THEMES: [&str; 4] = ["dark", "bignum-light", "light", "bignum-d
 /// 小屏刷新间隔档位（秒，与设置窗下拉框顺序一致）。
 pub const SCREEN_INTERVALS: [u32; 4] = [1, 2, 3, 5];
 
-/// 小屏引擎档位（B-10）。默认 powershell，升级后行为不变。
-pub const SCREEN_ENGINE_POWERSHELL: &str = "powershell";
+/// 小屏引擎（B-10）。兼容引擎（PowerShell）已下线，配置字段仅用于读取旧文件。
 pub const SCREEN_ENGINE_NATIVE: &str = "native";
-pub const SCREEN_ENGINES: [&str; 2] = [SCREEN_ENGINE_POWERSHELL, SCREEN_ENGINE_NATIVE];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NasConfig {
@@ -355,7 +354,7 @@ fn default_screen_interval() -> u32 {
     2
 }
 fn default_screen_engine() -> String {
-    SCREEN_ENGINE_POWERSHELL.to_string()
+    SCREEN_ENGINE_NATIVE.to_string()
 }
 
 impl NasConfig {
@@ -407,27 +406,30 @@ pub fn config_path() -> PathBuf {
     dir.join("config.toml")
 }
 
+/// 旧配置归一：已下线的主题名映射到现有主题；兼容引擎（PowerShell）一律升级为 native。
+fn migrate(cfg: &mut Config) {
+    // white→light、official（浅色）→bignum-light；forest、nas、tuning（黑绿）已下线，一律回 dark
+    if cfg.screen.theme == "white" {
+        cfg.screen.theme = "light".to_string();
+    } else if cfg.screen.theme == "official" {
+        cfg.screen.theme = "bignum-light".to_string();
+    } else if cfg.screen.theme == "tuning"
+        || cfg.screen.theme == "forest"
+        || cfg.screen.theme == "nas"
+    {
+        cfg.screen.theme = "dark".to_string();
+    }
+    if cfg.screen.engine != SCREEN_ENGINE_NATIVE {
+        cfg.screen.engine = SCREEN_ENGINE_NATIVE.to_string();
+    }
+}
+
 pub fn load() -> Config {
     let path = config_path();
     match std::fs::read_to_string(&path) {
         Ok(text) => match toml::from_str::<Config>(&text) {
             Ok(mut cfg) => {
-                // 旧版本的小屏主题值归一：white→light、official（浅色）→bignum-light，
-                // forest、nas、tuning（黑绿）已下线，一律回 dark
-                if cfg.screen.theme == "white" {
-                    cfg.screen.theme = "light".to_string();
-                } else if cfg.screen.theme == "official" {
-                    cfg.screen.theme = "bignum-light".to_string();
-                } else if cfg.screen.theme == "tuning"
-                    || cfg.screen.theme == "forest"
-                    || cfg.screen.theme == "nas"
-                {
-                    cfg.screen.theme = "dark".to_string();
-                }
-                // 小屏引擎归一：未知值一律回退 powershell（保持旧行为，不因配置笔误改变链路）
-                if cfg.screen.engine != SCREEN_ENGINE_NATIVE {
-                    cfg.screen.engine = SCREEN_ENGINE_POWERSHELL.to_string();
-                }
+                migrate(&mut cfg);
                 cfg
             }
             Err(e) => {
@@ -448,4 +450,47 @@ pub fn load() -> Config {
 pub fn save(cfg: &Config) -> std::io::Result<()> {
     let text = toml::to_string_pretty(cfg).unwrap_or_default();
     std::fs::write(config_path(), text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_powershell_engine_is_upgraded_to_native() {
+        let mut cfg = Config::default();
+        cfg.screen.engine = "powershell".to_string();
+        migrate(&mut cfg);
+        assert_eq!(cfg.screen.engine, SCREEN_ENGINE_NATIVE);
+    }
+
+    #[test]
+    fn unknown_engine_is_upgraded_to_native() {
+        let mut cfg = Config::default();
+        cfg.screen.engine = "whatever".to_string();
+        migrate(&mut cfg);
+        assert_eq!(cfg.screen.engine, SCREEN_ENGINE_NATIVE);
+    }
+
+    #[test]
+    fn legacy_theme_names_are_mapped() {
+        for (input, expected) in [
+            ("white", "light"),
+            ("official", "bignum-light"),
+            ("tuning", "dark"),
+            ("forest", "dark"),
+            ("nas", "dark"),
+            ("dark", "dark"),
+        ] {
+            let mut cfg = Config::default();
+            cfg.screen.theme = input.to_string();
+            migrate(&mut cfg);
+            assert_eq!(cfg.screen.theme, expected, "输入 {input}");
+        }
+    }
+
+    #[test]
+    fn default_config_uses_native_engine() {
+        assert_eq!(Config::default().screen.engine, SCREEN_ENGINE_NATIVE);
+    }
 }

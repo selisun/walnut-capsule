@@ -322,9 +322,7 @@ pub fn run(config: Config) {
         sh.big = config.capsule.expand_big();
     }
     // B-10 P2：config 会被移交 AppState，先把 native 推送参数取出
-    let bridge_interval = (config.screen.enabled
-        && config.screen.engine == crate::config::SCREEN_ENGINE_NATIVE)
-        .then_some(config.screen.interval);
+    let bridge_interval = config.screen.enabled.then_some(config.screen.interval);
     let (cmd_tx, cmd_rx) = channel::<SourceCmd>();
 
     let hwnd = create_window(instance, (initial_w(&config), CAPSULE_H));
@@ -383,8 +381,6 @@ pub fn run(config: Config) {
         pin_check_at: None,
         net_peak: (0, 0),
         fs_hidden: false,
-        screen_poll: 0,
-        screen_busy_shown: false,
     };
 
     let raw = Box::into_raw(Box::new(state));
@@ -511,10 +507,6 @@ struct AppState {
     net_peak: (u64, u64),
     /// 因全屏应用（游戏 / 放映）而临时隐藏了悬浮窗
     fs_hidden: bool,
-    /// 小屏串口状态轮询计数（每 4 个 500ms 定时器查一次心跳）
-    screen_poll: u8,
-    /// 本轮「串口被占用」是否已经弹过提示（恢复后清零）
-    screen_busy_shown: bool,
 }
 
 /// 任务栏内的三环子窗口：归属任务栏（owner = Shell_TrayWnd），常驻其上方。
@@ -1400,24 +1392,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER if wparam.0 == IDT_FS => {
             sync_fullscreen_state(state);
-            // 小屏串口被占用：状态刚变成 busy 时弹一次提示，恢复后清零
-            state.screen_poll = state.screen_poll.wrapping_add(1);
-            if state.screen_poll % 4 == 0 {
-                let busy = screen_state_code().as_deref() == Some("busy");
-                if busy && !state.screen_busy_shown {
-                    state.screen_busy_shown = true;
-                    unsafe {
-                        let _ = MessageBoxW(
-                            state.hwnd,
-                            pcwstr("小屏串口被其他程序占用，已停止自动重连。\n\n请关闭占用串口的程序（例如屏幕官方软件），再到 设置 → 小屏 点「重新连接」。"),
-                            pcwstr("核桃胶囊"),
-                            MB_OK | MB_ICONWARNING,
-                        );
-                    }
-                } else if !busy {
-                    state.screen_busy_shown = false;
-                }
-            }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -1600,8 +1574,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             rings_destroy(state);
             // 清理全局鼠标钩子（规范做法：虽然进程结束时系统会自动清理，但应主动释放）
             mouse_hook_remove();
-            // 结束后台托管的小屏脚本，避免残留 PowerShell
-            crate::screen_host::stop();
+            // 结束后台托管的小屏进程，避免残留占串口
+            crate::screen_native::stop();
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -3123,8 +3097,6 @@ const IDC_SCREEN_APPLY: usize = 274;
 /// 小屏刷新频率：标题 + 下拉框
 const IDC_SCREEN_LBL_REFRESH: usize = 275;
 const IDC_SCREEN_REFRESH_COMBO: usize = 276;
-/// 小屏引擎：标题（277/278 为两个单选，279 为标题）
-const IDC_SCREEN_LBL_ENGINE: usize = 279;
 /// 组合框消息 / 通知码（windows crate 未导出时自己给值）
 const CB_ADDSTRING_MSG: u32 = 0x0143;
 const CB_GETCURSEL_MSG: u32 = 0x0147;
@@ -3144,9 +3116,6 @@ const SCREEN_ITEM_COUNT: usize = 8;
 const SCREEN_ITEM_LABELS: [&str; SCREEN_ITEM_COUNT] = [
     "CPU", "内存", "显卡", "网络", "硬盘", "存储", "温度", "时钟",
 ];
-/// 小屏引擎单选：兼容（PowerShell）/ 新引擎（native），顺序同 config::SCREEN_ENGINES
-const IDC_SCREEN_ENGINE_BASE: usize = 277;
-const SCREEN_ENGINE_LABELS: [&str; 2] = ["兼容引擎", "新引擎"];
 
 /// 设置窗口客户区尺寸（左侧导航 + 页内容 + 底部按钮）
 const SETTINGS_CLIENT_W: i32 = 560;
@@ -3238,7 +3207,7 @@ const PAGE_CAP_IDS: [usize; 28] = [
     IDC_TASKBAR_CHK,
     IDC_FS_CHK,
 ];
-const PAGE_SCREEN_IDS: [usize; 31] = [
+const PAGE_SCREEN_IDS: [usize; 28] = [
     IDC_SCREEN_BTN_ON,
     IDC_SCREEN_BTN_OFF,
     IDC_SCREEN_LBL_STATUS,
@@ -3266,9 +3235,6 @@ const PAGE_SCREEN_IDS: [usize; 31] = [
     IDC_SCREEN_PREVIEW,
     IDC_SCREEN_LBL_REFRESH,
     IDC_SCREEN_REFRESH_COMBO,
-    IDC_SCREEN_LBL_ENGINE,
-    IDC_SCREEN_ENGINE_BASE,
-    IDC_SCREEN_ENGINE_BASE + 1,
     IDC_SCREEN_APPLY,
 ];
 const PAGE_ABOUT_IDS: [usize; 6] = [
@@ -3595,64 +3561,42 @@ fn read_screen_items(hwnd: HWND) -> [bool; SCREEN_ITEM_COUNT] {
     std::array::from_fn(|i| is_checked(hwnd, IDC_SCREEN_ITEM_BASE + i))
 }
 
-/// 读取小屏引擎单选（顺序同 config::SCREEN_ENGINES）。
-fn read_screen_engine(hwnd: HWND) -> String {
-    let idx = (0..SCREEN_ENGINE_LABELS.len())
-        .find(|&i| is_checked(hwnd, IDC_SCREEN_ENGINE_BASE + i))
-        .unwrap_or(0);
-    crate::config::SCREEN_ENGINES[idx].to_string()
-}
-
-/// 推送桥跟随开关与引擎：只有 native + 启用时才推送快照，否则小屏只能显示「等待客户端」。
+/// 推送桥跟随开关：只有小屏启用时才推送快照，否则小屏只能显示「等待客户端」。
 fn sync_screen_bridge(
     shared: &std::sync::Arc<std::sync::RwLock<SharedState>>,
     cfg: &crate::config::ScreenConfig,
 ) {
-    let want_push = cfg.enabled && cfg.engine == crate::config::SCREEN_ENGINE_NATIVE;
-    if want_push {
+    if cfg.enabled {
         crate::screen_bridge::start(shared.clone(), cfg.interval);
     } else {
         crate::screen_bridge::stop();
     }
 }
 
-/// 拉起当前引擎；native 失败时回退 PowerShell（与 main.rs 启动逻辑一致）。
+/// 拉起小屏进程并同步推送桥。
 fn start_screen_engine(
     shared: &std::sync::Arc<std::sync::RwLock<SharedState>>,
     cfg: &crate::config::ScreenConfig,
 ) {
-    if cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
-        crate::screen_native::stop();
-        if crate::screen_native::start(cfg) {
-            sync_screen_bridge(shared, cfg);
-            return;
-        }
-        // native 起不来时退回 PowerShell，同时停掉推送（旧引擎不读管道）
-        crate::screen_host::start();
-        crate::screen_bridge::stop();
-    } else {
-        crate::screen_native::stop();
-        crate::screen_bridge::stop();
-        crate::screen_host::start();
-    }
+    crate::screen_native::stop();
+    crate::screen_native::start(cfg);
+    sync_screen_bridge(shared, cfg);
 }
 
 fn stop_screen_engine() {
     crate::screen_native::stop();
-    crate::screen_host::stop();
     crate::screen_bridge::stop();
 }
 
-/// native 引擎只在启动时读配置，改主题/卡片/方向后必须重启才生效。
+/// 小屏进程只在启动时读配置，改主题/卡片/方向后必须重启才生效。
 fn restart_native_screen(
     shared: &std::sync::Arc<std::sync::RwLock<SharedState>>,
     cfg: &crate::config::ScreenConfig,
 ) {
-    if cfg.enabled && cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
+    if cfg.enabled {
         crate::screen_native::stop();
-        if crate::screen_native::start(cfg) {
-            sync_screen_bridge(shared, cfg);
-        }
+        crate::screen_native::start(cfg);
+        sync_screen_bridge(shared, cfg);
     }
 }
 
@@ -3682,96 +3626,13 @@ struct SettingsDrawItem {
     rc_item: RECT,
 }
 
-/// 小屏脚本心跳文件：screen.ps1 每帧覆盖写一份 {state, port, ts}。
-fn screen_status_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("APPDATA").map(|appdata| {
-        std::path::PathBuf::from(appdata)
-            .join("hetao-capsule")
-            .join("screen.status.json")
-    })
-}
-
-/// 心跳转成给用户看的一句话；超过 20 秒没更新就认为脚本没在跑。
-fn screen_status_text(enabled: bool) -> String {
-    if !enabled {
-        return "已关闭".to_string();
-    }
-    let Some(path) = screen_status_path() else {
-        return "状态未知".to_string();
-    };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return "未运行（客户端会自动拉起）".to_string();
-    };
-    // 脚本每帧覆盖写，极小概率读到写了一半的内容：稍等再读一次
-    let v = match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(v) => v,
-        Err(_) => {
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            let Ok(raw2) = std::fs::read_to_string(&path) else {
-                return "状态未知".to_string();
-            };
-            match serde_json::from_str::<serde_json::Value>(&raw2) {
-                Ok(v) => v,
-                Err(_) => return "状态未知".to_string(),
-            }
-        }
-    };
-    let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
-    let port = v.get("port").and_then(|x| x.as_str()).unwrap_or("");
-    let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let age = now.saturating_sub(ts);
-    if age > 20 {
-        return "未运行（心跳已停止）".to_string();
-    }
-    match state {
-        "streaming" if !port.is_empty() => format!("已连接（{}）", port),
-        "streaming" => "已连接".to_string(),
-        "connecting" => "未检测到屏幕，正在重试串口…".to_string(),
-        "busy" if !port.is_empty() => format!("{} 被占用，已停止重试", port),
-        "busy" => "串口被占用，已停止重试".to_string(),
-        "error" => {
-            let msg = v.get("msg").and_then(|x| x.as_str()).unwrap_or("未知错误");
-            format!("连接异常（{}）", msg)
-        }
-        _ => "正在启动…".to_string(),
-    }
-}
-
 fn settings_update_screen_status(hwnd: HWND, cfg: &crate::config::ScreenConfig) {
-    // native 引擎不写 PowerShell 的心跳文件，直接显示启用状态，避免误报「未运行」
-    let text = if cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
-        if cfg.enabled {
-            "已启用（新引擎）".to_string()
-        } else {
-            "未启用".to_string()
-        }
+    let text = if cfg.enabled {
+        "已启用"
     } else {
-        screen_status_text(cfg.enabled)
+        "未启用"
     };
-    set_dlg_text(hwnd, IDC_SCREEN_STATUS as i32, &text);
-}
-
-/// 读心跳里的状态码（streaming / connecting / busy / error）。
-/// 超过 20 秒没更新视为脚本没在跑，返回 None。
-fn screen_state_code() -> Option<String> {
-    let path = screen_status_path()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if now.saturating_sub(ts) > 20 {
-        return None;
-    }
-    v.get("state")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+    set_dlg_text(hwnd, IDC_SCREEN_STATUS as i32, text);
 }
 
 /// 圆角按钮子类化：保存原窗口过程，子类过程里转发消息。
@@ -3962,9 +3823,9 @@ unsafe fn font_face_is(font: HFONT, want: &str) -> bool {
     String::from_utf16_lossy(&buf[..len]) == want
 }
 
-/// 「开启 / 关闭」按钮按小屏宿主是否在跑切换可用态。
+/// 「开启 / 关闭」按钮按小屏进程是否在跑切换可用态。
 fn settings_refresh_screen_buttons(hwnd: HWND) {
-    let running = crate::screen_host::is_running();
+    let running = crate::screen_native::is_running();
     unsafe {
         if let Ok(b) = GetDlgItem(hwnd, IDC_SCREEN_BTN_ON as i32) {
             let _ = EnableWindow(b, !running);
@@ -4759,36 +4620,6 @@ fn settings_wndproc_impl(
                     WPARAM(refresh_idx),
                     LPARAM(0),
                 );
-                // 引擎：兼容引擎（PowerShell）/ 新引擎（native Rust），切换后需重启小屏进程
-                mk_child(
-                    "STATIC",
-                    "小屏引擎",
-                    WINDOW_STYLE(0),
-                    PAD,
-                    s0 + 214,
-                    60,
-                    22,
-                    IDC_SCREEN_LBL_ENGINE,
-                );
-                let engine_idx = crate::config::SCREEN_ENGINES
-                    .iter()
-                    .position(|v| *v == state.config.screen.engine)
-                    .unwrap_or(0);
-                for (i, label) in SCREEN_ENGINE_LABELS.iter().enumerate() {
-                    mk_child(
-                        "BUTTON",
-                        label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        PAD + 60 + i as i32 * 64,
-                        s0 + 214,
-                        64,
-                        22,
-                        IDC_SCREEN_ENGINE_BASE + i,
-                    );
-                    set_check(IDC_SCREEN_ENGINE_BASE + i, i == engine_idx);
-                }
                 settings_refresh_screen_buttons(hwnd);
 
                 // ---- 页四：关于（logo + 名称 + 版本/作者 + 标语 + 博客）----
@@ -5229,8 +5060,6 @@ fn settings_wndproc_impl(
                         0
                     };
                     state.config.screen.theme = crate::config::SCREEN_THEMES[theme_idx].to_string();
-                    let was_engine = state.config.screen.engine.clone();
-                    state.config.screen.engine = read_screen_engine(hwnd);
                     let items = read_screen_items(hwnd);
                     state.config.screen.cpu = items[0];
                     state.config.screen.memory = items[1];
@@ -5243,11 +5072,7 @@ fn settings_wndproc_impl(
                     state.config.screen.interval = read_screen_interval(hwnd);
                     let _ = crate::config::save(&state.config);
                     if state.config.screen.enabled {
-                        if state.config.screen.engine != was_engine {
-                            start_screen_engine(&state.shared, &state.config.screen);
-                        } else {
-                            restart_native_screen(&state.shared, &state.config.screen);
-                        }
+                        restart_native_screen(&state.shared, &state.config.screen);
                     } else {
                         stop_screen_engine();
                     }
@@ -5260,7 +5085,6 @@ fn settings_wndproc_impl(
                     match id as usize {
                         IDC_SCREEN_BTN_ON => {
                             state.config.screen.enabled = true;
-                            state.config.screen.engine = read_screen_engine(hwnd);
                             start_screen_engine(&state.shared, &state.config.screen);
                             let _ = crate::config::save(&state.config);
                             settings_refresh_screen_buttons(hwnd);
@@ -5276,23 +5100,10 @@ fn settings_wndproc_impl(
                             return LRESULT(0);
                         }
                         IDC_SCREEN_BTN_RE => {
-                            state.config.screen.engine = read_screen_engine(hwnd);
-                            if state.config.screen.engine == crate::config::SCREEN_ENGINE_NATIVE {
-                                // native：重启进程即可重新打开串口并重做初始化
-                                state.config.screen.enabled = true;
-                                start_screen_engine(&state.shared, &state.config.screen);
-                                let _ = crate::config::save(&state.config);
-                            } else {
-                                // 旧引擎不读管道，重连时顺手停掉推送，避免线程空转
-                                crate::screen_bridge::stop();
-                                // 脚本被占用卡住时靠这条指令重试；宿主没在跑就先拉起来
-                                if !crate::screen_host::is_running() {
-                                    state.config.screen.enabled = true;
-                                    crate::screen_host::start();
-                                    let _ = crate::config::save(&state.config);
-                                }
-                                crate::screen_host::request_reconnect();
-                            }
+                            // 重启小屏进程即可重新打开串口并重做初始化
+                            state.config.screen.enabled = true;
+                            start_screen_engine(&state.shared, &state.config.screen);
+                            let _ = crate::config::save(&state.config);
                             settings_refresh_screen_buttons(hwnd);
                             settings_update_screen_status(hwnd, &state.config.screen);
                             return LRESULT(0);
@@ -5399,9 +5210,7 @@ fn settings_wndproc_impl(
                     } else if state.config.screen.mode == crate::config::SCREEN_MODE_SCREEN {
                         state.config.capsule.taskbar_pin = false;
                     }
-                    // 小屏引擎与显示项目：独立于 config.capsule.cards，单独读写
-                    let was_engine = state.config.screen.engine.clone();
-                    state.config.screen.engine = read_screen_engine(hwnd);
+                    // 小屏显示项目：独立于 config.capsule.cards，单独读写
                     let items = read_screen_items(hwnd);
                     state.config.screen.cpu = items[0];
                     state.config.screen.memory = items[1];
@@ -5453,14 +5262,10 @@ fn settings_wndproc_impl(
                     }
                     let _ = crate::config::save(&state.config);
 
-                    // 引擎切换或 native 配置变化：重启小屏进程才会读取新配置
+                    // 小屏配置变化：重启进程才会读取新配置（未启用时收掉残留进程）
                     if state.config.screen.enabled {
-                        if state.config.screen.engine != was_engine {
-                            start_screen_engine(&state.shared, &state.config.screen);
-                        } else {
-                            restart_native_screen(&state.shared, &state.config.screen);
-                        }
-                    } else if state.config.screen.engine != was_engine {
+                        restart_native_screen(&state.shared, &state.config.screen);
+                    } else {
                         stop_screen_engine();
                     }
 

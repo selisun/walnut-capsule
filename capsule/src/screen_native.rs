@@ -57,7 +57,12 @@ pub fn log_startup(cfg: &ScreenConfig) {
     ));
 }
 
-/// 启动托管。返回 `false` 表示无法使用 native 引擎（调用方应回退 PowerShell）。
+/// 是否处于托管状态（设置界面用它切换「开启 / 关闭 / 重连」按钮可用性）。
+pub fn is_running() -> bool {
+    STARTED.load(Ordering::SeqCst)
+}
+
+/// 启动托管。返回 `false` 表示无法拉起小屏进程（exe 缺失或创建失败）。
 pub fn start(cfg: &ScreenConfig) -> bool {
     if cfg.engine != SCREEN_ENGINE_NATIVE {
         return false;
@@ -68,20 +73,20 @@ pub fn start(cfg: &ScreenConfig) -> bool {
     STOPPING.store(false, Ordering::SeqCst);
 
     let Some(exe) = exe_path() else {
-        log("无法定位自身目录，回退 PowerShell");
+        log("无法定位自身目录，小屏未启动");
         STARTED.store(false, Ordering::SeqCst);
         return false;
     };
     if !exe.exists() {
         log(&format!(
-            "未找到 {}，回退 PowerShell（安装器需一并分发）",
+            "未找到 {}，小屏未启动（安装器需一并分发）",
             exe.display()
         ));
         STARTED.store(false, Ordering::SeqCst);
         return false;
     }
     // 配置生成为 best-effort：写不进去（受限环境/权限异常）时小屏仍可凭内置默认值运行，
-    // 不能因为一个非关键写失败就整体回退 PowerShell。
+    // 不能因为一个非关键写失败就不启动。
     if let Err(e) = write_config(cfg) {
         log(&format!(
             "生成小屏配置失败：{e}（继续启动，小屏使用内置默认配置）"
