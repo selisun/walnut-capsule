@@ -53,6 +53,10 @@ pub struct OutPc {
     pub cpu_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_temp: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
@@ -440,8 +444,13 @@ pub fn run_push_loop(
 
         if online && has_data {
             seq += 1;
-            let (cpu_pct, mem_pct) = sampler.sample();
-            let pc = (cpu_pct.is_some() || mem_pct.is_some()).then_some(OutPc { cpu_pct, mem_pct });
+            let sample = sampler.sample();
+            let pc = (!sample.is_empty()).then_some(OutPc {
+                cpu_pct: sample.cpu_pct,
+                mem_pct: sample.mem_pct,
+                gpu_pct: sample.gpu_pct,
+                gpu_temp: sample.gpu_temp,
+            });
             let mapped = map_snapshot_with(&snapshot, online, seq, now(), pc, Some(&nas_host));
             if let Ok(bytes) = encode_snapshot(&mapped) {
                 if write_msg(&mut sink, &bytes) {

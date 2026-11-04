@@ -29,6 +29,8 @@ pub struct LegacyData {
     /// 电脑本机（双显右列）
     pub pc_cpu: Option<f32>,
     pub pc_mem: Option<f32>,
+    pub pc_gpu: Option<f32>,
+    pub pc_gpu_temp: Option<f32>,
 }
 
 /// 旧版版式入口。`dual` 由主题 `render` 字段决定。
@@ -352,6 +354,7 @@ fn draw_dual_card(
         match kind {
             ComponentKind::Cpu => (data.pc_cpu, None),
             ComponentKind::Memory => (data.pc_mem, None),
+            ComponentKind::Gpu => (data.pc_gpu, data.pc_gpu_temp),
             _ => (None, None),
         }
     } else {
@@ -787,6 +790,8 @@ mod tests {
             write: Some(2048),
             pc_cpu: Some(20.0),
             pc_mem: Some(50.0),
+            pc_gpu: Some(35.0),
+            pc_gpu_temp: Some(52.0),
         }
     }
 

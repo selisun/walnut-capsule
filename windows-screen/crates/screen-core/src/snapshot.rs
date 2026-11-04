@@ -65,6 +65,9 @@ pub struct NasInfo {
 pub struct PcMetrics {
     pub cpu_pct: Option<f32>,
     pub mem_pct: Option<f32>,
+    /// 显卡使用率 / 温度（NVIDIA 经 `nvidia-smi`，其他显卡为空）
+    pub gpu_pct: Option<f32>,
+    pub gpu_temp: Option<f32>,
 }
 
 /// 指标集合：`None` 表示该项缺失，渲染层必须整项隐藏（见 `06`/`09`）。

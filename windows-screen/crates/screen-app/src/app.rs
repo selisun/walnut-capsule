@@ -667,6 +667,8 @@ fn legacy_data(snapshot: &Snapshot) -> LegacyData {
         write: m.disk.as_ref().and_then(|v| v.write_bps),
         pc_cpu: snapshot.pc.cpu_pct,
         pc_mem: snapshot.pc.mem_pct,
+        pc_gpu: snapshot.pc.gpu_pct,
+        pc_gpu_temp: snapshot.pc.gpu_temp,
     }
 }
 
