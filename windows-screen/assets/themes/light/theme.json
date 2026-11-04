@@ -1,0 +1,39 @@
+{
+  "schema": "hetao.theme/1",
+  "id": "light",
+  "name": "Light 浅色",
+  "author": "hetao",
+  "version": "1.0.0",
+  "palette": {
+    "bg": "#F4F6F8",
+    "card": "#FFFFFF",
+    "text": "#1B2430",
+    "dim": "#7C8698",
+    "accent": "#12A26B",
+    "warn": "#D9820B",
+    "danger": "#DC2626"
+  },
+  "typography": {
+    "family": "Microsoft YaHei",
+    "base_px": 15,
+    "scale": 1.0,
+    "weights": {
+      "title": 600,
+      "value": 700
+    }
+  },
+  "background": {
+    "fallback_color": "#F4F6F8"
+  },
+  "components": {
+    "visible": ["cpu", "memory", "gpu", "network", "disk", "storage", "temp", "clock"],
+    "styles": {
+      "temp": { "accent": "warn" },
+      "storage": { "accent": "warn" },
+      "clock": { "accent": "text" }
+    }
+  },
+  "layout": {
+    "template": "auto"
+  }
+}

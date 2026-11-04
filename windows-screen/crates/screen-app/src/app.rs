@@ -13,8 +13,8 @@ use screen_ipc::{ConnectionState, Message, MessageKind};
 use screen_layout::{build, TemplateKind};
 use screen_protocol::rgba_to_rgb565le;
 use screen_render::{
-    bind_with_clock, create_text_renderer, local_clock, render, render_notice, render_with_metrics,
-    FontSpec,
+    bind_with_clock, create_text_renderer, local_clock, render_notice_bg, render_with_bg,
+    render_with_metrics_bg, BackgroundImage, FontSpec,
 };
 use screen_theme::{load_dir, load_str, ThemeStore};
 use screen_transport_cdc::CdcTransport;
@@ -25,6 +25,21 @@ use crate::runtime::RunOptions;
 use crate::session::{DeviceSession, SessionState};
 
 pub const BUILTIN_DEFAULT_THEME: &str = include_str!("../../../assets/themes/default/theme.json");
+pub const BUILTIN_DARK_THEME: &str = include_str!("../../../assets/themes/dark/theme.json");
+pub const BUILTIN_LIGHT_THEME: &str = include_str!("../../../assets/themes/light/theme.json");
+pub const BUILTIN_BIGNUM_DARK_THEME: &str =
+    include_str!("../../../assets/themes/bignum-dark/theme.json");
+pub const BUILTIN_BIGNUM_LIGHT_THEME: &str =
+    include_str!("../../../assets/themes/bignum-light/theme.json");
+
+/// 内置主题（首项为默认回退）。
+pub const BUILTIN_THEMES: [&str; 5] = [
+    BUILTIN_DEFAULT_THEME,
+    BUILTIN_DARK_THEME,
+    BUILTIN_LIGHT_THEME,
+    BUILTIN_BIGNUM_DARK_THEME,
+    BUILTIN_BIGNUM_LIGHT_THEME,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
@@ -74,6 +89,7 @@ pub struct ScreenApp {
     config_used_defaults: bool,
     themes: ThemeStore,
     current_theme: ThemeConfig,
+    background_image: Option<BackgroundImage>,
     devices: DeviceManager,
     gate: SnapshotGate,
     ipc_state: ConnectionState,
@@ -94,9 +110,12 @@ impl ScreenApp {
 
         let theme = load_str(BUILTIN_DEFAULT_THEME).map_err(|e| AppError::Theme(e.to_string()))?;
         let mut themes = ThemeStore::new();
-        themes
-            .register(theme.clone(), true)
-            .map_err(|e| AppError::Theme(e.to_string()))?;
+        for json in BUILTIN_THEMES {
+            let builtin = load_str(json).map_err(|e| AppError::Theme(e.to_string()))?;
+            themes
+                .register(builtin, true)
+                .map_err(|e| AppError::Theme(e.to_string()))?;
+        }
 
         // 用户主题目录：与 config.toml 同级的 themes/（可选；坏文件只跳过并记录）
         if let Some(dir) = resolved
@@ -132,12 +151,19 @@ impl ScreenApp {
         let gate = SnapshotGate::new(config.integration.stale_ms, period_ms)
             .map_err(|e| AppError::Config(e.to_string()))?;
 
+        let background_image = load_background_image(
+            &current_theme,
+            resolved.as_deref(),
+            themes.is_builtin(&current_theme.id),
+        );
+
         Ok(Self {
             config,
             config_path: resolved,
             config_used_defaults: used_defaults,
             themes,
             current_theme,
+            background_image,
             devices: DeviceManager::single_device(),
             gate,
             ipc_state: ConnectionState::WaitingClient,
@@ -162,6 +188,11 @@ impl ScreenApp {
 
     pub fn theme_store(&self) -> &ThemeStore {
         &self.themes
+    }
+
+    /// 当前主题与用户配置合成的字号缩放。
+    pub fn font_scale(&self) -> f32 {
+        effective_font_scale(&self.current_theme, self.config.theme.font_scale)
     }
 
     pub fn devices(&self) -> &DeviceManager {
@@ -258,11 +289,17 @@ impl ScreenApp {
             profile,
             &self.config.components.visible,
             template,
-            self.config.theme.font_scale,
+            self.font_scale(),
         )
         .map_err(|e| AppError::State(e.to_string()))?;
-        render(profile, &self.current_theme, &layout, None)
-            .map_err(|e| AppError::State(e.to_string()))
+        render_with_bg(
+            profile,
+            &self.current_theme,
+            &layout,
+            None,
+            self.background_image.as_ref(),
+        )
+        .map_err(|e| AppError::State(e.to_string()))
     }
 
     /// 解析当前配置的方向（orientation + flip），以物理 Profile 的原生方向为 auto 默认。
@@ -283,11 +320,17 @@ impl ScreenApp {
             &plan.logical,
             &self.config.components.visible,
             plan.template,
-            self.config.theme.font_scale,
+            self.font_scale(),
         )
         .map_err(|e| AppError::State(e.to_string()))?;
-        let logical = render(&plan.logical, &self.current_theme, &layout, None)
-            .map_err(|e| AppError::State(e.to_string()))?;
+        let logical = render_with_bg(
+            &plan.logical,
+            &self.current_theme,
+            &layout,
+            None,
+            self.background_image.as_ref(),
+        )
+        .map_err(|e| AppError::State(e.to_string()))?;
         direction
             .oriented_frame(physical, &logical)
             .map_err(AppError::from)
@@ -332,28 +375,31 @@ impl ScreenApp {
             }
         } else {
             let kinds: Vec<_> = bound.iter().map(|(kind, _)| *kind).collect();
-            build(
-                &plan.logical,
-                &kinds,
-                plan.template,
-                self.config.theme.font_scale,
-            )
-            .map_err(|e| AppError::State(e.to_string()))?
+            build(&plan.logical, &kinds, plan.template, self.font_scale())
+                .map_err(|e| AppError::State(e.to_string()))?
         };
 
         let logical = match create_text_renderer(&FontSpec {
             family: self.current_theme.typography.family.clone(),
             size_px: tree.font_px,
-            weight: 400,
+            weight: theme_weight(&self.current_theme),
         }) {
-            Ok(mut renderer) => render_with_metrics(
+            Ok(mut renderer) => render_with_metrics_bg(
                 &plan.logical,
                 &self.current_theme,
                 &tree,
                 &bound,
                 Some(renderer.as_mut()),
+                self.background_image.as_ref(),
             ),
-            Err(_) => render_with_metrics(&plan.logical, &self.current_theme, &tree, &bound, None),
+            Err(_) => render_with_metrics_bg(
+                &plan.logical,
+                &self.current_theme,
+                &tree,
+                &bound,
+                None,
+                self.background_image.as_ref(),
+            ),
         }
         .map_err(|e| AppError::State(e.to_string()))?;
         let logical = direction
@@ -382,15 +428,22 @@ impl ScreenApp {
         let logical = match create_text_renderer(&FontSpec {
             family: self.current_theme.typography.family.clone(),
             size_px: (plan.logical.short_edge as f32 * 0.08).max(14.0),
-            weight: 400,
+            weight: theme_weight(&self.current_theme),
         }) {
-            Ok(mut renderer) => render_notice(
+            Ok(mut renderer) => render_notice_bg(
                 &plan.logical,
                 &self.current_theme,
                 notice,
                 Some(renderer.as_mut()),
+                self.background_image.as_ref(),
             ),
-            Err(_) => render_notice(&plan.logical, &self.current_theme, notice, None),
+            Err(_) => render_notice_bg(
+                &plan.logical,
+                &self.current_theme,
+                notice,
+                None,
+                self.background_image.as_ref(),
+            ),
         }
         .map_err(|e| AppError::State(e.to_string()))?;
         let logical = direction
@@ -561,6 +614,63 @@ impl ScreenApp {
     }
 }
 
+/// 主题字号 = 主题 base_px/14 × 主题 scale × 用户 font_scale，限幅到布局允许区间。
+fn effective_font_scale(theme: &ThemeConfig, user_scale: f32) -> f32 {
+    let ratio = theme.typography.base_px / 14.0;
+    let combined = ratio * theme.typography.scale * user_scale;
+    if combined.is_finite() {
+        combined.clamp(0.5, 3.0)
+    } else {
+        1.0
+    }
+}
+
+/// 主题字重：优先 `value`，其次 `regular`，最后取第一个声明的字重；默认 400。
+fn theme_weight(theme: &ThemeConfig) -> u16 {
+    theme
+        .typography
+        .weights
+        .get("value")
+        .or_else(|| theme.typography.weights.get("regular"))
+        .or_else(|| theme.typography.weights.values().next())
+        .copied()
+        .unwrap_or(400)
+        .clamp(100, 900)
+}
+
+/// 加载主题背景图。内置主题不携带图片资源；用户主题从 `<config 目录>/themes/` 读取 PNG。
+fn load_background_image(
+    theme: &ThemeConfig,
+    config_path: Option<&Path>,
+    is_builtin: bool,
+) -> Option<BackgroundImage> {
+    let rel = theme.background.image.as_deref()?;
+    if is_builtin {
+        eprintln!("内置主题不支持图片背景，已忽略：{rel}");
+        return None;
+    }
+    let Some(path) = config_path
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join("themes").join(rel))
+    else {
+        return None;
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("背景图读取失败 {}：{err}", path.display());
+            return None;
+        }
+    };
+    match BackgroundImage::from_png(&bytes) {
+        Ok(image) => Some(image),
+        Err(err) => {
+            eprintln!("背景图已跳过 {}：{err}", path.display());
+            None
+        }
+    }
+}
+
 pub fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|base| {
         PathBuf::from(base)
@@ -609,6 +719,37 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("themes")).expect("mkdir themes");
         dir
+    }
+
+    #[test]
+    fn builtin_legacy_themes_are_registered() {
+        let app = ScreenApp::init(Some(&temp_config("builtin-themes"))).expect("app");
+        for id in ["default", "dark", "light", "bignum-dark", "bignum-light"] {
+            assert!(
+                app.theme_store().ids().any(|v| v == id),
+                "缺少内置主题 {id}"
+            );
+        }
+        assert_eq!(app.theme().id, "default");
+    }
+
+    #[test]
+    fn legacy_theme_can_be_selected_and_scales_font() {
+        let path = temp_config("legacy-theme");
+        std::fs::write(&path, "version = 1\n[display]\ntheme = \"bignum-light\"\n")
+            .expect("write config");
+        let app = ScreenApp::init(Some(&path)).expect("app");
+        assert_eq!(app.theme().id, "bignum-light");
+        assert_eq!(
+            app.theme().palette.bg,
+            screen_core::Color::rgb(255, 255, 255)
+        );
+        // 18/14 × 1.1 ≈ 1.414
+        assert!(
+            (app.font_scale() - 1.414).abs() < 0.02,
+            "{}",
+            app.font_scale()
+        );
     }
 
     #[test]

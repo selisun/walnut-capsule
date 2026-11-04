@@ -340,11 +340,13 @@ fn render_config(cfg: &ScreenConfig) -> String {
         .map(|v| format!("\"{v}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let theme = native_theme_id(&cfg.theme);
     format!(
         "# 由核桃胶囊自动生成（B-10 native 引擎），请勿手改；改胶囊设置即可。\n\
          version = 1\n\
          \n\
          [display]\n\
+         theme = \"{theme}\"\n\
          orientation = \"{orientation}\"\n\
          flip = \"{flip}\"\n\
          refresh_secs = {interval}\n\
@@ -360,6 +362,16 @@ fn render_config(cfg: &ScreenConfig) -> String {
          client_exe = \"hetao-capsule.exe\"\n",
         interval = cfg.interval.clamp(1, 10),
     )
+}
+
+/// 胶囊主题名 → 小屏内置主题 id。旧名（white/official 等）按既有迁移规则归一。
+fn native_theme_id(theme: &str) -> &'static str {
+    match theme {
+        "light" | "white" => "light",
+        "bignum-light" | "official" => "bignum-light",
+        "bignum-dark" => "bignum-dark",
+        _ => "dark",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +505,27 @@ mod tests {
         c.clock = true;
         let text = render_config(&c);
         assert!(text.contains("visible = [\"cpu\", \"memory\", \"network\", \"temp\", \"clock\"]"));
+    }
+
+    #[test]
+    fn theme_name_is_mapped_for_native_engine() {
+        for (input, expected) in [
+            ("dark", "dark"),
+            ("light", "light"),
+            ("white", "light"),
+            ("bignum-light", "bignum-light"),
+            ("official", "bignum-light"),
+            ("bignum-dark", "bignum-dark"),
+            ("unknown", "dark"),
+        ] {
+            let mut c = cfg("portrait", 1);
+            c.theme = input.to_string();
+            let text = render_config(&c);
+            assert!(
+                text.contains(&format!("theme = \"{expected}\"")),
+                "输入 {input} 应映射为 {expected}"
+            );
+        }
     }
 
     #[test]

@@ -2,10 +2,13 @@
 //!
 //! 缺失指标不画卡、不画假数据；数值格式化由 `metrics` 模块负责。
 
-use screen_core::{ComponentKind, FrameBuffer, LayoutTree, ScreenProfile, ThemeConfig};
+use screen_core::{
+    ComponentKind, FrameBuffer, ImageAnchor, ImageFit, LayoutTree, ScreenProfile, ThemeConfig,
+};
 
 use crate::canvas::Canvas;
 use crate::error::RenderError;
+use crate::image::BackgroundImage;
 use crate::metrics::{default_label, MetricView};
 use crate::text::TextRenderer;
 
@@ -13,7 +16,17 @@ pub fn render(
     profile: &ScreenProfile,
     theme: &ThemeConfig,
     layout: &LayoutTree,
+    text: Option<&mut dyn TextRenderer>,
+) -> Result<FrameBuffer, RenderError> {
+    render_with_bg(profile, theme, layout, text, None)
+}
+
+pub fn render_with_bg(
+    profile: &ScreenProfile,
+    theme: &ThemeConfig,
+    layout: &LayoutTree,
     mut text: Option<&mut dyn TextRenderer>,
+    background: Option<&BackgroundImage>,
 ) -> Result<FrameBuffer, RenderError> {
     if layout.profile_id != profile.id {
         return Err(RenderError::InvalidLayout(format!(
@@ -25,8 +38,7 @@ pub fn render(
         .validate(profile.width as f32, profile.height as f32)
         .map_err(|e| RenderError::InvalidLayout(e.to_string()))?;
 
-    let mut canvas = Canvas::new(profile.width, profile.height)?;
-    canvas.clear(theme.background.fallback_color);
+    let mut canvas = paint_background(profile, theme, background)?;
 
     for item in &layout.items {
         canvas.fill_rect(item.rect, theme.palette.card)?;
@@ -68,7 +80,18 @@ pub fn render_with_metrics(
     theme: &ThemeConfig,
     layout: &LayoutTree,
     metrics: &[(ComponentKind, MetricView)],
+    text: Option<&mut dyn TextRenderer>,
+) -> Result<FrameBuffer, RenderError> {
+    render_with_metrics_bg(profile, theme, layout, metrics, text, None)
+}
+
+pub fn render_with_metrics_bg(
+    profile: &ScreenProfile,
+    theme: &ThemeConfig,
+    layout: &LayoutTree,
+    metrics: &[(ComponentKind, MetricView)],
     mut text: Option<&mut dyn TextRenderer>,
+    background: Option<&BackgroundImage>,
 ) -> Result<FrameBuffer, RenderError> {
     if layout.profile_id != profile.id {
         return Err(RenderError::InvalidLayout(format!(
@@ -80,8 +103,7 @@ pub fn render_with_metrics(
         .validate(profile.width as f32, profile.height as f32)
         .map_err(|e| RenderError::InvalidLayout(e.to_string()))?;
 
-    let mut canvas = Canvas::new(profile.width, profile.height)?;
-    canvas.clear(theme.background.fallback_color);
+    let mut canvas = paint_background(profile, theme, background)?;
 
     for (kind, view) in metrics {
         let Some(item) = layout.items.iter().find(|item| item.component == *kind) else {
@@ -156,8 +178,17 @@ pub fn render_notice(
     notice: &str,
     text: Option<&mut dyn TextRenderer>,
 ) -> Result<FrameBuffer, RenderError> {
-    let mut canvas = Canvas::new(profile.width, profile.height)?;
-    canvas.clear(theme.background.fallback_color);
+    render_notice_bg(profile, theme, notice, text, None)
+}
+
+pub fn render_notice_bg(
+    profile: &ScreenProfile,
+    theme: &ThemeConfig,
+    notice: &str,
+    text: Option<&mut dyn TextRenderer>,
+    background: Option<&BackgroundImage>,
+) -> Result<FrameBuffer, RenderError> {
+    let mut canvas = paint_background(profile, theme, background)?;
     if let Some(renderer) = text {
         let size = (profile.short_edge as f32 * 0.08).max(14.0);
         let y = profile.height as f32 / 2.0 - size / 2.0;
@@ -172,6 +203,46 @@ pub fn render_notice(
         )?;
     }
     canvas.into_frame()
+}
+
+/// 背景：无图时用 fallback_color；有图时按 fit/anchor 缩放，再按主题 dim 压暗。
+fn paint_background(
+    profile: &ScreenProfile,
+    theme: &ThemeConfig,
+    background: Option<&BackgroundImage>,
+) -> Result<Canvas, RenderError> {
+    let mut canvas = Canvas::new(profile.width, profile.height)?;
+    let Some(image) = background else {
+        canvas.clear(theme.background.fallback_color);
+        return Ok(canvas);
+    };
+    let src_w = image.width() as f32;
+    let src_h = image.height() as f32;
+    let sx = profile.width as f32 / src_w;
+    let sy = profile.height as f32 / src_h;
+    let scale = match theme.background.fit {
+        ImageFit::Cover => sx.max(sy),
+        ImageFit::Contain => sx.min(sy),
+    };
+    let drawn_w = src_w * scale;
+    let drawn_h = src_h * scale;
+    let dx = (profile.width as f32 - drawn_w) / 2.0;
+    let dy = match theme.background.anchor {
+        ImageAnchor::Center => (profile.height as f32 - drawn_h) / 2.0,
+        ImageAnchor::Top => 0.0,
+        ImageAnchor::Bottom => profile.height as f32 - drawn_h,
+    };
+    canvas.draw_pixmap_scaled(image.pixmap(), dx, dy, scale)?;
+
+    let dim = theme.background.dim.clamp(0.0, 1.0);
+    if dim > 0.0 {
+        let overlay = screen_core::Color::new(0, 0, 0, (dim * 255.0).round() as u8);
+        canvas.fill_rect(
+            screen_core::Rect::new(0.0, 0.0, profile.width as f32, profile.height as f32),
+            overlay,
+        )?;
+    }
+    Ok(canvas)
 }
 
 fn component_accent(theme: &ThemeConfig, kind: &ComponentKind) -> screen_core::Color {
@@ -253,6 +324,44 @@ mod tests {
         ) -> Result<(), RenderError> {
             Err(RenderError::TextUnavailable)
         }
+    }
+
+    fn solid_background(w: u32, h: u32, rgb: (u8, u8, u8)) -> BackgroundImage {
+        let mut pixmap = tiny_skia::Pixmap::new(w, h).expect("pixmap");
+        pixmap.fill(tiny_skia::Color::from_rgba8(rgb.0, rgb.1, rgb.2, 255));
+        let png = pixmap.encode_png().expect("encode");
+        BackgroundImage::from_png(&png).expect("decode")
+    }
+
+    #[test]
+    fn background_image_covers_canvas_without_cards() {
+        let p = profile();
+        let bg = solid_background(2, 3, (200, 10, 10));
+        let mut theme = theme();
+        theme.background.dim = 0.0;
+        let frame =
+            render_with_metrics_bg(&p, &theme, &layout(&p), &[], None, Some(&bg)).expect("render");
+        assert_eq!(&frame.pixels()[0..4], &[200, 10, 10, 255]);
+    }
+
+    #[test]
+    fn background_dim_darkens_image() {
+        let p = profile();
+        let bg = solid_background(2, 3, (200, 10, 10));
+        let mut theme = theme();
+        theme.background.dim = 0.5;
+        let frame =
+            render_with_metrics_bg(&p, &theme, &layout(&p), &[], None, Some(&bg)).expect("render");
+        let px = &frame.pixels()[0..4];
+        assert!(px[0] >= 95 && px[0] <= 105, "实际 {px:?}");
+        assert!(px[1] <= 10 && px[2] <= 10, "实际 {px:?}");
+    }
+
+    #[test]
+    fn empty_background_uses_fallback_color() {
+        let p = profile();
+        let frame = render(&p, &theme(), &layout(&p), None).expect("render");
+        assert_eq!(&frame.pixels()[0..4], &[16, 20, 24, 255]);
     }
 
     #[test]

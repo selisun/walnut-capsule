@@ -1,0 +1,39 @@
+{
+  "schema": "hetao.theme/1",
+  "id": "bignum-dark",
+  "name": "黑色双显",
+  "author": "hetao",
+  "version": "1.0.0",
+  "palette": {
+    "bg": "#0B0F14",
+    "card": "#151A21",
+    "text": "#E8EDF5",
+    "dim": "#6B7688",
+    "accent": "#3DDC97",
+    "warn": "#F59E0B",
+    "danger": "#EF4444"
+  },
+  "typography": {
+    "family": "Microsoft YaHei",
+    "base_px": 18,
+    "scale": 1.1,
+    "weights": {
+      "title": 600,
+      "value": 700
+    }
+  },
+  "background": {
+    "fallback_color": "#0B0F14"
+  },
+  "components": {
+    "visible": ["cpu", "memory", "gpu", "network", "disk", "storage", "temp", "clock"],
+    "styles": {
+      "temp": { "accent": "warn" },
+      "storage": { "accent": "warn" },
+      "clock": { "accent": "text" }
+    }
+  },
+  "layout": {
+    "template": "auto"
+  }
+}

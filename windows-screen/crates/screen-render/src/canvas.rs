@@ -1,7 +1,7 @@
 //! tiny-skia 画布封装。只暴露矩形/清屏等基础图元，文本与图片在后续阶段接入。
 
 use screen_core::{Color, FrameBuffer, Rect};
-use tiny_skia::{FillRule, Paint, Path, Pixmap, Transform};
+use tiny_skia::{FillRule, Paint, Path, Pixmap, PixmapPaint, Transform};
 
 use crate::error::RenderError;
 
@@ -45,6 +45,24 @@ impl Canvas {
         paint.anti_alias = true;
         self.pixmap
             .fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+        Ok(())
+    }
+
+    /// 按缩放与偏移绘制一张背景图（超出画布部分自动裁剪）。
+    pub fn draw_pixmap_scaled(
+        &mut self,
+        pixmap: &Pixmap,
+        dx: f32,
+        dy: f32,
+        scale: f32,
+    ) -> Result<(), RenderError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(RenderError::Canvas("背景图缩放非法".to_string()));
+        }
+        let paint = PixmapPaint::default();
+        let transform = Transform::from_translate(dx, dy).pre_scale(scale, scale);
+        self.pixmap
+            .draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None);
         Ok(())
     }
 

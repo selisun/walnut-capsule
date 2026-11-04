@@ -3123,6 +3123,8 @@ const IDC_SCREEN_APPLY: usize = 274;
 /// 小屏刷新频率：标题 + 下拉框
 const IDC_SCREEN_LBL_REFRESH: usize = 275;
 const IDC_SCREEN_REFRESH_COMBO: usize = 276;
+/// 小屏引擎：标题（277/278 为两个单选，279 为标题）
+const IDC_SCREEN_LBL_ENGINE: usize = 279;
 /// 组合框消息 / 通知码（windows crate 未导出时自己给值）
 const CB_ADDSTRING_MSG: u32 = 0x0143;
 const CB_GETCURSEL_MSG: u32 = 0x0147;
@@ -3138,8 +3140,13 @@ const IDC_SCREEN_BTN_RE: usize = 268;
 const IDT_SETTINGS_STATUS: usize = 0x4A14;
 /// 小屏显示项目复选（独立于胶囊面板的卡片开关，写在 config.screen 里）
 const IDC_SCREEN_ITEM_BASE: usize = 250;
-const SCREEN_ITEM_COUNT: usize = 5;
-const SCREEN_ITEM_LABELS: [&str; SCREEN_ITEM_COUNT] = ["CPU", "内存", "显卡", "网络", "硬盘"];
+const SCREEN_ITEM_COUNT: usize = 8;
+const SCREEN_ITEM_LABELS: [&str; SCREEN_ITEM_COUNT] = [
+    "CPU", "内存", "显卡", "网络", "硬盘", "存储", "温度", "时钟",
+];
+/// 小屏引擎单选：兼容（PowerShell）/ 新引擎（native），顺序同 config::SCREEN_ENGINES
+const IDC_SCREEN_ENGINE_BASE: usize = 277;
+const SCREEN_ENGINE_LABELS: [&str; 2] = ["兼容引擎", "新引擎"];
 
 /// 设置窗口客户区尺寸（左侧导航 + 页内容 + 底部按钮）
 const SETTINGS_CLIENT_W: i32 = 560;
@@ -3231,7 +3238,7 @@ const PAGE_CAP_IDS: [usize; 28] = [
     IDC_TASKBAR_CHK,
     IDC_FS_CHK,
 ];
-const PAGE_SCREEN_IDS: [usize; 25] = [
+const PAGE_SCREEN_IDS: [usize; 31] = [
     IDC_SCREEN_BTN_ON,
     IDC_SCREEN_BTN_OFF,
     IDC_SCREEN_LBL_STATUS,
@@ -3250,12 +3257,18 @@ const PAGE_SCREEN_IDS: [usize; 25] = [
     IDC_SCREEN_ITEM_BASE + 2,
     IDC_SCREEN_ITEM_BASE + 3,
     IDC_SCREEN_ITEM_BASE + 4,
+    IDC_SCREEN_ITEM_BASE + 5,
+    IDC_SCREEN_ITEM_BASE + 6,
+    IDC_SCREEN_ITEM_BASE + 7,
     IDC_SCREEN_THEME_SEP,
     IDC_SCREEN_LBL_THEME,
     IDC_SCREEN_THEME_COMBO,
     IDC_SCREEN_PREVIEW,
     IDC_SCREEN_LBL_REFRESH,
     IDC_SCREEN_REFRESH_COMBO,
+    IDC_SCREEN_LBL_ENGINE,
+    IDC_SCREEN_ENGINE_BASE,
+    IDC_SCREEN_ENGINE_BASE + 1,
     IDC_SCREEN_APPLY,
 ];
 const PAGE_ABOUT_IDS: [usize; 6] = [
@@ -3577,9 +3590,44 @@ fn read_opacity(hwnd: HWND) -> f32 {
         .map_or(OPACITY_STEPS[0], |i| OPACITY_STEPS[i])
 }
 
-/// 读取设置窗里小屏的 5 个显示项目开关（CPU / 内存 / 显卡 / 网络 / 硬盘）。
+/// 读取设置窗里小屏的 8 个显示项目开关（CPU/内存/显卡/网络/硬盘/存储/温度/时钟）。
 fn read_screen_items(hwnd: HWND) -> [bool; SCREEN_ITEM_COUNT] {
     std::array::from_fn(|i| is_checked(hwnd, IDC_SCREEN_ITEM_BASE + i))
+}
+
+/// 读取小屏引擎单选（顺序同 config::SCREEN_ENGINES）。
+fn read_screen_engine(hwnd: HWND) -> String {
+    let idx = (0..SCREEN_ENGINE_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_SCREEN_ENGINE_BASE + i))
+        .unwrap_or(0);
+    crate::config::SCREEN_ENGINES[idx].to_string()
+}
+
+/// 拉起当前引擎；native 失败时回退 PowerShell（与 main.rs 启动逻辑一致）。
+fn start_screen_engine(cfg: &crate::config::ScreenConfig) {
+    if cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
+        crate::screen_native::stop();
+        if crate::screen_native::start(cfg) {
+            return;
+        }
+        crate::screen_host::start();
+    } else {
+        crate::screen_native::stop();
+        crate::screen_host::start();
+    }
+}
+
+fn stop_screen_engine() {
+    crate::screen_native::stop();
+    crate::screen_host::stop();
+}
+
+/// native 引擎只在启动时读配置，改主题/卡片/方向后必须重启才生效。
+fn restart_native_screen(cfg: &crate::config::ScreenConfig) {
+    if cfg.enabled && cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
+        crate::screen_native::stop();
+        let _ = crate::screen_native::start(cfg);
+    }
 }
 
 /// 小屏刷新间隔（秒）：从下拉框当前选项映射到 config::SCREEN_INTERVALS。
@@ -3667,8 +3715,18 @@ fn screen_status_text(enabled: bool) -> String {
     }
 }
 
-fn settings_update_screen_status(hwnd: HWND, enabled: bool) {
-    set_dlg_text(hwnd, IDC_SCREEN_STATUS as i32, &screen_status_text(enabled));
+fn settings_update_screen_status(hwnd: HWND, cfg: &crate::config::ScreenConfig) {
+    // native 引擎不写 PowerShell 的心跳文件，直接显示启用状态，避免误报「未运行」
+    let text = if cfg.engine == crate::config::SCREEN_ENGINE_NATIVE {
+        if cfg.enabled {
+            "已启用（新引擎）".to_string()
+        } else {
+            "未启用".to_string()
+        }
+    } else {
+        screen_status_text(cfg.enabled)
+    };
+    set_dlg_text(hwnd, IDC_SCREEN_STATUS as i32, &text);
 }
 
 /// 读心跳里的状态码（streaming / connecting / busy / error）。
@@ -4552,15 +4610,18 @@ fn settings_wndproc_impl(
                     state.config.screen.gpu,
                     state.config.screen.network,
                     state.config.screen.disk,
+                    state.config.screen.storage,
+                    state.config.screen.temp,
+                    state.config.screen.clock,
                 ];
                 for (i, label) in SCREEN_ITEM_LABELS.iter().enumerate() {
-                    // 5 个项目排成一行勾选
+                    // 8 个项目分两行，每行 4 个勾选
                     mk_child(
                         "BUTTON",
                         label,
                         WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                        PAD + i as i32 * 78,
-                        s0 + 62,
+                        PAD + (i % 4) as i32 * 78,
+                        s0 + 62 + (i / 4) as i32 * 24,
                         78,
                         22,
                         IDC_SCREEN_ITEM_BASE + i,
@@ -4568,13 +4629,13 @@ fn settings_wndproc_impl(
                     set_check(IDC_SCREEN_ITEM_BASE + i, screen_items[i]);
                 }
 
-                // 主题：Dark / 白色大字 / Light / 黑色大字，保存后 screen.ps1 下一帧直接换配色
+                // 主题：Dark / 白色双显 / Light / 黑色双显，保存后下一帧直接换配色
                 mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
                     PAD,
-                    s0 + 92,
+                    s0 + 118,
                     CW,
                     2,
                     IDC_SCREEN_THEME_SEP,
@@ -4585,7 +4646,7 @@ fn settings_wndproc_impl(
                     "小屏幕主题",
                     WINDOW_STYLE(0),
                     PAD,
-                    s0 + 100,
+                    s0 + 126,
                     140,
                     22,
                     IDC_SCREEN_LBL_THEME,
@@ -4599,7 +4660,7 @@ fn settings_wndproc_impl(
                     "",
                     WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
                     PAD,
-                    s0 + 124,
+                    s0 + 150,
                     140,
                     140,
                     IDC_SCREEN_THEME_COMBO,
@@ -4619,7 +4680,7 @@ fn settings_wndproc_impl(
                     "",
                     WINDOW_STYLE(SS_BITMAP_STYLE | SS_CENTERIMAGE_STYLE),
                     PAD + 200,
-                    s0 + 100,
+                    s0 + 126,
                     192,
                     288,
                     IDC_SCREEN_PREVIEW,
@@ -4638,7 +4699,7 @@ fn settings_wndproc_impl(
                     "刷新频率",
                     WINDOW_STYLE(0),
                     PAD,
-                    s0 + 158,
+                    s0 + 184,
                     72,
                     22,
                     IDC_SCREEN_LBL_REFRESH,
@@ -4652,7 +4713,7 @@ fn settings_wndproc_impl(
                     "",
                     WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
                     PAD + 72,
-                    s0 + 154,
+                    s0 + 180,
                     80,
                     140,
                     IDC_SCREEN_REFRESH_COMBO,
@@ -4672,6 +4733,36 @@ fn settings_wndproc_impl(
                     WPARAM(refresh_idx),
                     LPARAM(0),
                 );
+                // 引擎：兼容引擎（PowerShell）/ 新引擎（native Rust），切换后需重启小屏进程
+                mk_child(
+                    "STATIC",
+                    "小屏引擎",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    s0 + 214,
+                    60,
+                    22,
+                    IDC_SCREEN_LBL_ENGINE,
+                );
+                let engine_idx = crate::config::SCREEN_ENGINES
+                    .iter()
+                    .position(|v| *v == state.config.screen.engine)
+                    .unwrap_or(0);
+                for (i, label) in SCREEN_ENGINE_LABELS.iter().enumerate() {
+                    mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(
+                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
+                        ),
+                        PAD + 60 + i as i32 * 64,
+                        s0 + 214,
+                        64,
+                        22,
+                        IDC_SCREEN_ENGINE_BASE + i,
+                    );
+                    set_check(IDC_SCREEN_ENGINE_BASE + i, i == engine_idx);
+                }
                 settings_refresh_screen_buttons(hwnd);
 
                 // ---- 页四：关于（logo + 名称 + 版本/作者 + 标语 + 博客）----
@@ -4794,13 +4885,13 @@ fn settings_wndproc_impl(
                 // 自绘按钮挂鼠标跟踪，补上悬停/按下的交互反馈
                 subclass_round_buttons(hwnd);
                 // 小屏连接状态：先填一次，再每秒刷新（脚本 2s 一帧心跳）
-                settings_update_screen_status(hwnd, state.config.screen.enabled);
+                settings_update_screen_status(hwnd, &state.config.screen);
                 let _ = SetTimer(hwnd, IDT_SETTINGS_STATUS, 1000, None);
                 LRESULT(0)
             }
             // 小屏连接状态：定时读脚本心跳刷新，切页时也立刻刷一次
             WM_TIMER if wparam.0 == IDT_SETTINGS_STATUS => {
-                settings_update_screen_status(hwnd, state.config.screen.enabled);
+                settings_update_screen_status(hwnd, &state.config.screen);
                 LRESULT(0)
             }
             // 背景：左侧浅灰导航栏 + 右侧白色内容卡 + 1px 分隔线
@@ -5029,7 +5120,7 @@ fn settings_wndproc_impl(
                     let page = id as usize - IDC_TAB_BASE;
                     state.settings_tab = page;
                     settings_show_page(hwnd, page);
-                    settings_update_screen_status(hwnd, state.config.screen.enabled);
+                    settings_update_screen_status(hwnd, &state.config.screen);
                     settings_refresh_screen_buttons(hwnd);
                     // 自绘标签按新选中项重画
                     for i in 0..TAB_LABELS.len() {
@@ -5112,15 +5203,27 @@ fn settings_wndproc_impl(
                         0
                     };
                     state.config.screen.theme = crate::config::SCREEN_THEMES[theme_idx].to_string();
+                    let was_engine = state.config.screen.engine.clone();
+                    state.config.screen.engine = read_screen_engine(hwnd);
                     let items = read_screen_items(hwnd);
                     state.config.screen.cpu = items[0];
                     state.config.screen.memory = items[1];
                     state.config.screen.gpu = items[2];
                     state.config.screen.network = items[3];
                     state.config.screen.disk = items[4];
+                    state.config.screen.storage = items[5];
+                    state.config.screen.temp = items[6];
+                    state.config.screen.clock = items[7];
                     state.config.screen.interval = read_screen_interval(hwnd);
                     let _ = crate::config::save(&state.config);
-                    settings_update_screen_status(hwnd, state.config.screen.enabled);
+                    if state.config.screen.enabled {
+                        if state.config.screen.engine != was_engine {
+                            start_screen_engine(&state.config.screen);
+                        } else {
+                            restart_native_screen(&state.config.screen);
+                        }
+                    }
+                    settings_update_screen_status(hwnd, &state.config.screen);
                     return LRESULT(0);
                 }
 
@@ -5129,30 +5232,39 @@ fn settings_wndproc_impl(
                     match id as usize {
                         IDC_SCREEN_BTN_ON => {
                             state.config.screen.enabled = true;
-                            crate::screen_host::start();
+                            state.config.screen.engine = read_screen_engine(hwnd);
+                            start_screen_engine(&state.config.screen);
                             let _ = crate::config::save(&state.config);
                             settings_refresh_screen_buttons(hwnd);
-                            settings_update_screen_status(hwnd, true);
+                            settings_update_screen_status(hwnd, &state.config.screen);
                             return LRESULT(0);
                         }
                         IDC_SCREEN_BTN_OFF => {
                             state.config.screen.enabled = false;
-                            crate::screen_host::stop();
+                            stop_screen_engine();
                             let _ = crate::config::save(&state.config);
                             settings_refresh_screen_buttons(hwnd);
-                            settings_update_screen_status(hwnd, false);
+                            settings_update_screen_status(hwnd, &state.config.screen);
                             return LRESULT(0);
                         }
                         IDC_SCREEN_BTN_RE => {
-                            // 脚本被占用卡住时靠这条指令重试；宿主没在跑就先拉起来
-                            if !crate::screen_host::is_running() {
+                            state.config.screen.engine = read_screen_engine(hwnd);
+                            if state.config.screen.engine == crate::config::SCREEN_ENGINE_NATIVE {
+                                // native：重启进程即可重新打开串口并重做初始化
                                 state.config.screen.enabled = true;
-                                crate::screen_host::start();
+                                start_screen_engine(&state.config.screen);
                                 let _ = crate::config::save(&state.config);
+                            } else {
+                                // 脚本被占用卡住时靠这条指令重试；宿主没在跑就先拉起来
+                                if !crate::screen_host::is_running() {
+                                    state.config.screen.enabled = true;
+                                    crate::screen_host::start();
+                                    let _ = crate::config::save(&state.config);
+                                }
+                                crate::screen_host::request_reconnect();
                             }
-                            crate::screen_host::request_reconnect();
                             settings_refresh_screen_buttons(hwnd);
-                            settings_update_screen_status(hwnd, state.config.screen.enabled);
+                            settings_update_screen_status(hwnd, &state.config.screen);
                             return LRESULT(0);
                         }
                         _ => {}
@@ -5257,13 +5369,18 @@ fn settings_wndproc_impl(
                     } else if state.config.screen.mode == crate::config::SCREEN_MODE_SCREEN {
                         state.config.capsule.taskbar_pin = false;
                     }
-                    // 小屏显示项目：独立于 config.capsule.cards，单独读写
+                    // 小屏引擎与显示项目：独立于 config.capsule.cards，单独读写
+                    let was_engine = state.config.screen.engine.clone();
+                    state.config.screen.engine = read_screen_engine(hwnd);
                     let items = read_screen_items(hwnd);
                     state.config.screen.cpu = items[0];
                     state.config.screen.memory = items[1];
                     state.config.screen.gpu = items[2];
                     state.config.screen.network = items[3];
                     state.config.screen.disk = items[4];
+                    state.config.screen.storage = items[5];
+                    state.config.screen.temp = items[6];
+                    state.config.screen.clock = items[7];
                     state.config.screen.interval = read_screen_interval(hwnd);
                     // 展开样式只影响展开形态：切换时先收起，避免旧面板几何残留
                     if was_big != state.config.capsule.expand_big() && state.view.expanded() {
@@ -5305,6 +5422,17 @@ fn settings_wndproc_impl(
                         );
                     }
                     let _ = crate::config::save(&state.config);
+
+                    // 引擎切换或 native 配置变化：重启小屏进程才会读取新配置
+                    if state.config.screen.enabled {
+                        if state.config.screen.engine != was_engine {
+                            start_screen_engine(&state.config.screen);
+                        } else {
+                            restart_native_screen(&state.config.screen);
+                        }
+                    } else if state.config.screen.engine != was_engine {
+                        stop_screen_engine();
+                    }
 
                     // "点击面板外自动收起"即时生效：面板正开着就立刻挂/撤全局鼠标钩子
                     if state.view.expanded() {
