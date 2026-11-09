@@ -4,7 +4,7 @@
   <p>
     <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
     <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20fnOS-lightgrey">
-    <img alt="version" src="https://img.shields.io/badge/version-0.1.71-green">
+    <img alt="version" src="https://img.shields.io/badge/version-0.1.77-green">
   </p>
 </div>
 
@@ -12,11 +12,12 @@
 
 ## 这是什么
 
-核桃胶囊是一款轻量 NAS 状态监控工具，由三部分组成：
+核桃胶囊是一款轻量 NAS 状态监控工具，由四部分组成：
 
 | 组成 | 说明 |
 |---|---|
 | **桌面客户端** | Windows 悬浮胶囊，实时显示 NAS 的 CPU、内存、硬盘读写、网络速率、存储用量 |
+| **小屏显示** | 把同一份 NAS 数据推到 3.5 英寸 USB 副屏（320×480），内置官方主题，按 NAS 硬件品牌自动选底图 |
 | **NAS 采集服务** | Go 单二进制（≤15MB 内存），采集指标并经 WebSocket 推送，附带管理页 |
 | **飞牛应用包** | 符合飞牛 fnOS 规范的 `.fpk`，可在应用中心安装/升级，非容器、非 root 运行 |
 
@@ -37,13 +38,23 @@
 - 竖排模式：拖到屏幕左右边缘自动变竖条（56×178）
 - 全屏应用自动隐藏：看视频、玩游戏时自动收起，退出全屏后恢复（默认开启）
 
+**小屏显示（3.5 英寸副屏）**
+
+- 独立进程 `hetao-screen.exe`，与主客户端一起安装，通过命名管道接收 NAS 快照
+- 物理帧恒 320×480（RGB565LE），竖屏 / 横屏各两套版式，横屏经软件旋转后发送
+- 内置官方主题（深色 / 白色 × 横 / 竖），按 **NAS 上报的 CPU / GPU 厂商**自动选择品牌底图
+- 双显卡机器优先展示独显；读不到的指标显示 `--`，不用 0 填充
+- 注：目前仅 **图灵智显 3.5 英寸（USB CDC）** 经真机验证，90°/270° 旋转尚未真机验证
+
 **NAS 采集服务**
 
-- CPU 使用率、温度与平均负载（1/5/15/30 分钟）、内存、GPU（独显优先，无独显时回退核显）、物理盘速率/电源状态/温度、卷与底层物理盘、网卡速率
+- CPU 使用率、温度与平均负载（1/5/15/30 分钟）、内存、物理盘速率/电源状态/温度、卷与底层物理盘、网卡速率
+- 显卡**多卡并列**采集：Intel / AMD 读 sysfs（核显、独显自动区分），NVIDIA 走 `nvidia-smi`；一路异常不影响其它卡
+- NVIDIA 调用前先检查驱动模块与设备节点，**绝不触发 `modprobe`**；失败按 60s→30min 指数退避
+- 指标读不到时字段留空（客户端显示 `--`），不伪造 0；认出 NVIDIA 实体卡但驱动未就绪时，仍上报厂商并提示「驱动未加载 / 无驱动工具」
 - WebSocket 实时推送 + HTTP `/metrics`，全部接口需配对令牌鉴权
 - 内置管理页：复制配对令牌、选择监控网卡、查看运行日志、下载 Windows 客户端、查看应用自身 CPU/内存占用
-- 管理页只挂在飞牛统一网关的 unix socket 上（复用平台登录态），不在局域网端口暴露
-- 管理类接口校验管理员身份；请求体限长，日志只读末尾并自动轮转
+- 管理页只挂在飞牛统一网关的 unix socket 上（复用平台登录态），不在局域网端口暴露；管理类接口另校验对端 UID 与管理员身份
 - 局域网监听端口在**安装时由用户填写**（默认 `8765`），端口被占用时可改；管理页会显示实际端口
 - **绝不主动唤醒休眠硬盘**：只用 `hdparm -C` 查电源状态，SMART 前加 `smartctl -n standby` 双保险，间隔 ≥30 分钟
 
@@ -53,9 +64,9 @@
 
 | 文件 | 用途 |
 |---|---|
-| `hetaocapsule_0.1.71.fpk` | 飞牛 fnOS 应用包（x86），在应用中心「手动安装」上传 |
+| `hetaocapsule_0.1.77.fpk` | 飞牛 fnOS 应用包（x86），在应用中心「手动安装」上传 |
 
-Windows 电脑客户端安装器（`hetao-capsule-setup-0.1.60.exe`）已内置在应用包中：装好应用后打开管理页，在「电脑客户端」处下载即可。
+Windows 电脑客户端安装器（`hetao-capsule-setup-0.3.12.exe`）已内置在应用包中：装好应用后打开管理页，在「电脑客户端」处下载即可。
 
 ## 安装与使用
 
@@ -64,7 +75,7 @@ Windows 电脑客户端安装器（`hetao-capsule-setup-0.1.60.exe`）已内置�
 3. 运行 Windows 客户端安装程序，填入 NAS 的 IP / 端口（安装时填写的端口，默认 `8765`）与配对令牌，点「测试连接」
 4. 连接成功后胶囊浮在屏幕右上角；单击展开、按住拖动、右键（托盘）进入设置
 
-> 系统要求：Windows 10/11 x64；飞牛 fnOS 1.1.3100 及以上。
+> 系统要求：Windows 10/11 x64；飞牛 fnOS 1.1.3100 及以上。小屏目前仅适配图灵智显 3.5 英寸（320×480，USB CDC）。
 
 ## 性能红线
 
@@ -93,9 +104,15 @@ Rust  →  tiny-skia（CPU 软渲染，RGBA）
 ```
 capsule/        Windows 客户端（Rust）
   src/ui/       全部界面渲染：药丸 / 三环 / 展开面板 / 动画
-  installer/    Inno Setup 打包脚本
+  src/bin/      自绘安装向导 setup_ui（内嵌 Inno 核心，产出单文件安装器）
+  installer/    Inno Setup 脚本、官方主题 JSON 与品牌底图
+windows-screen/ 小屏显示（Rust workspace）
+  crates/screen-app/      小屏主程序与运行时
+  crates/screen-render/   布局、文字与指标绑定
+  crates/screen-protocol/ 帧协议（320×480 RGB565LE）
+  crates/screen-adapters/ USB CDC 设备适配
 nas/            NAS 采集服务（Go）
-  internal/metrics/   各类指标采集
+  internal/metrics/   各类指标采集（含 GPU 多卡并列）
   internal/server/    WebSocket、/metrics、管理页、令牌
 hetaocapsule/   飞牛 fpk 应用包源码（manifest、cmd、wizard、config）
 ```
@@ -103,16 +120,25 @@ hetaocapsule/   飞牛 fpk 应用包源码（manifest、cmd、wizard、config）
 ## 从源码构建
 
 ```powershell
-# 客户端
-cd capsule; cargo build --release
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\hetao-capsule.iss
+# 1) 小屏进程（安装器依赖它存在）
+cd windows-screen; cargo build --release -p screen-app
 
-# NAS 二进制（交叉编译到 Linux）
-cd nas
+# 2) 客户端主程序
+cd ..\capsule; cargo build --release
+
+# 3) 生成 Inno 静默核心
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "installer\hetao-capsule.iss"
+
+# 4) 关键：重编一次，让 build.rs 把新核心嵌入 setup_ui
+cargo build --release
+Copy-Item target\release\setup_ui.exe "installer\output\hetao-capsule-setup-<版本>.exe" -Force
+
+# 5) NAS 二进制（交叉编译到 Linux）
+cd ..\nas
 $env:GOOS="linux"; $env:GOARCH="amd64"; $env:CGO_ENABLED="0"
 go build -trimpath -ldflags "-s -w" -o ../hetaocapsule/app/hetao-nas .
 
-# fpk 必须在 NAS 上用官方 fnpack 打包（勿手工 tar.gz，会缺 checksum 字段）
+# 6) fpk 必须在 NAS 上用官方 fnpack 打包（勿手工 tar.gz，会缺 checksum 字段）
 fnpack build -d /tmp/hetaocapsule
 ```
 
