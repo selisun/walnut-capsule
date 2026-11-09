@@ -5,7 +5,7 @@
   <p>
     <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
     <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20fnOS-lightgrey">
-    <img alt="version" src="https://img.shields.io/badge/version-0.2.0-green">
+    <img alt="version" src="https://img.shields.io/badge/version-0.2.1-green">
   </p>
 </div>
 
@@ -65,9 +65,9 @@
 
 | 文件 | 用途 |
 |---|---|
-| `hetaocapsule_0.2.0.fpk` | 飞牛 fnOS 应用包（x86），在应用中心「手动安装」上传 |
+| `hetaocapsule_0.2.1.fpk` | 飞牛 fnOS 应用包（x86），在应用中心「手动安装」上传 |
 
-Windows 电脑客户端安装器（`hetao-capsule-setup-0.3.12.exe`）已内置在应用包中：装好应用后打开管理页，在「电脑客户端」处下载即可。
+Windows 电脑客户端安装器（`hetao-capsule-setup-0.3.13.exe`）已内置在应用包中：装好应用后打开管理页，在「电脑客户端」处下载即可。
 
 ## 安装与使用
 

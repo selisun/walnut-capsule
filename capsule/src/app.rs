@@ -3274,6 +3274,8 @@ const IDC_TOOLTIP: usize = 303;
 const IDC_SCREEN_LBL_COLOR: usize = 304;
 /// 小屏页「亮度」标题
 const IDC_SCREEN_LBL_BRIGHT: usize = 305;
+/// 小屏页「亮度」下方的设备支持说明
+const IDC_SCREEN_LBL_SUPPORT: usize = 308;
 /// 主题页可滚动容器（子窗口，负责裁剪卡片）
 const IDC_THEME_VIEW: usize = 306;
 /// 主题页垂直滚动条
@@ -6475,6 +6477,17 @@ fn settings_wndproc_impl(
                     IDC_BRIGHT_VALUE,
                 );
                 subclass_slider(bright_slider, brightness_slider_proc);
+                // 亮度下方写明适配范围：避免用户以为任意 USB 副屏接上就能用
+                mk_child(
+                    "STATIC",
+                    "设备支持：图灵智显 3.5 英寸（320×480，USB CDC）",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    s0 + 272,
+                    528,
+                    18,
+                    IDC_SCREEN_LBL_SUPPORT,
+                );
                 settings_refresh_screen_buttons(hwnd);
 
                 // ---- 页四：小屏主题（2×2 卡片，选中蓝框 + 圆形对勾）----
