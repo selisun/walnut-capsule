@@ -27,7 +27,7 @@ const defaultPort = 8765
 
 // appVersion 仅作 TRIM_APPVER 缺失时的兜底显示，正常由 fpk 注入。
 // 需与 hetaocapsule/manifest 的 version 保持一致。
-const appVersion = "0.1.77"
+const appVersion = "0.2.0"
 
 // clientVersion 电脑端安装器版本，需与 capsule/installer/hetao-capsule.iss 的 AppVer 一致。
 // 版本策略：客户端与 fpk 各自独立计数——客户端每改一次递增；fpk 有改动也递增。
