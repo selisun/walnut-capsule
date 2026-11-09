@@ -1,4 +1,5 @@
 <div align="center">
+  <img alt="核桃胶囊" src="hetaocapsule/ICON_256.PNG" width="112">
   <h1>核桃胶囊 · Walnut Capsule</h1>
   <p>把 NAS 的运行状态，变成桌面右上角一颗胶囊。</p>
   <p>
@@ -17,7 +18,7 @@
 | 组成 | 说明 |
 |---|---|
 | **桌面客户端** | Windows 悬浮胶囊，实时显示 NAS 的 CPU、内存、硬盘读写、网络速率、存储用量 |
-| **小屏显示** | 把同一份 NAS 数据推到 3.5 英寸 USB 副屏（320×480），内置官方主题，按 NAS 硬件品牌自动选底图 |
+| **小屏显示** | 把同一份 NAS 数据推到 3.5 英寸 USB 副屏（320×480），内置**核桃胶囊自研主题**（非屏幕厂商提供），按 NAS 硬件品牌自动选底图 |
 | **NAS 采集服务** | Go 单二进制（≤15MB 内存），采集指标并经 WebSocket 推送，附带管理页 |
 | **飞牛应用包** | 符合飞牛 fnOS 规范的 `.fpk`，可在应用中心安装/升级，非容器、非 root 运行 |
 
@@ -42,7 +43,7 @@
 
 - 独立进程 `hetao-screen.exe`，与主客户端一起安装，通过命名管道接收 NAS 快照
 - 物理帧恒 320×480（RGB565LE），竖屏 / 横屏各两套版式，横屏经软件旋转后发送
-- 内置官方主题（深色 / 白色 × 横 / 竖），按 **NAS 上报的 CPU / GPU 厂商**自动选择品牌底图
+- 内置 **核桃胶囊自研主题**（PulseCore 深色 / 白色 × 横 / 竖，非屏幕厂商提供），按 **NAS 上报的 CPU / GPU 厂商**自动选择品牌底图
 - 双显卡机器优先展示独显；读不到的指标显示 `--`，不用 0 填充
 - 注：目前仅 **图灵智显 3.5 英寸（USB CDC）** 经真机验证，90°/270° 旋转尚未真机验证
 
@@ -105,7 +106,7 @@ Rust  →  tiny-skia（CPU 软渲染，RGBA）
 capsule/        Windows 客户端（Rust）
   src/ui/       全部界面渲染：药丸 / 三环 / 展开面板 / 动画
   src/bin/      自绘安装向导 setup_ui（内嵌 Inno 核心，产出单文件安装器）
-  installer/    Inno Setup 脚本、官方主题 JSON 与品牌底图
+  installer/    Inno Setup 脚本、自研主题 JSON 与品牌底图
 windows-screen/ 小屏显示（Rust workspace）
   crates/screen-app/      小屏主程序与运行时
   crates/screen-render/   布局、文字与指标绑定
