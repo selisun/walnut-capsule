@@ -18,11 +18,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, HANDLE};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
-    QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW, PROCESS_INFORMATION,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    STARTUPINFOW,
 };
 
 use crate::config::{ScreenConfig, SCREEN_ENGINE_NATIVE};
@@ -36,6 +37,18 @@ const STILL_ACTIVE: u32 = 259;
 struct Child {
     handle: isize,
     pid: u32,
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        // 进程句柄必须显式关闭：看门狗每次重启都会替换 Child，不关会持续泄漏内核句柄
+        if self.handle != 0 {
+            unsafe {
+                let _ = CloseHandle(HANDLE(self.handle as *mut c_void));
+            }
+            self.handle = 0;
+        }
+    }
 }
 
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
@@ -154,20 +167,31 @@ fn terminate(child: Child) {
         }
     }
     unsafe {
-        let _ = CloseHandle(handle);
+        // 必须等进程真正退出再返回：旧进程若还在往串口写帧尾，
+        // 紧接着拉起的新进程会同时写帧，两路字节交错 → 设备帧错位（切换主题花屏）。
+        let _ = WaitForSingleObject(handle, 3_000);
     }
+    // 句柄由 Child::drop 关闭，避免与手动 CloseHandle 重复
 }
 
 fn pid_alive(pid: u32) -> bool {
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
-    };
-    let mut code = 0u32;
-    let alive = unsafe { GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE };
-    unsafe {
-        let _ = CloseHandle(handle);
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            let mut code = 0u32;
+            let alive =
+                unsafe { GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE };
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            alive
+        }
+        // 打不开不等于死了：只有「进程不存在」才判 dead。
+        // 无权限/时序等原因一律保守视为存活，避免重复拉起导致两个屏端抢串口。
+        Err(_) => {
+            let code = unsafe { GetLastError() };
+            code != ERROR_INVALID_PARAMETER
+        }
     }
-    alive
 }
 
 /// 仅当该 PID 的映像路径与我们的 `hetao-screen.exe` 一致时才终止，避免误杀。
@@ -255,6 +279,11 @@ fn spawn(exe: &Path) -> bool {
     if STOPPING.load(Ordering::SeqCst) {
         return false;
     }
+    // 覆盖前先结束旧进程并关闭句柄：否则每次重启泄漏一个内核句柄，
+    // 极端情况下旧屏端还活着，两个进程会同时写串口造成帧错位。
+    if let Some(old) = lock().take() {
+        terminate(old);
+    }
     let parent_pid = unsafe { GetCurrentProcessId() };
     let mut cmd: Vec<u16> = child_command(exe, &config_path(), parent_pid)
         .encode_utf16()
@@ -307,6 +336,14 @@ fn spawn(exe: &Path) -> bool {
 // ---------------------------------------------------------------------------
 // 配置生成
 // ---------------------------------------------------------------------------
+
+/// 只重写配置文件，不拉起/重启进程。
+/// 亮度、刷新间隔走热更新：小屏运行期自己重读这两个值，避免重启导致屏幕初始化闪烁。
+pub fn rewrite_config(cfg: &ScreenConfig) {
+    if let Err(e) = write_config(cfg) {
+        log(&format!("生成小屏配置失败：{e}（小屏继续使用旧值）"));
+    }
+}
 
 fn write_config(cfg: &ScreenConfig) -> Result<(), String> {
     let path = config_path();
@@ -365,6 +402,7 @@ fn render_config(cfg: &ScreenConfig) -> String {
          orientation = \"{orientation}\"\n\
          flip = \"{flip}\"\n\
          refresh_secs = {interval}\n\
+         brightness = {brightness}\n\
          \n\
          [components]\n\
          visible = [{list}]\n\
@@ -376,16 +414,20 @@ fn render_config(cfg: &ScreenConfig) -> String {
          stale_ms = 3000\n\
          client_exe = \"hetao-capsule.exe\"\n",
         interval = cfg.interval.clamp(1, 10),
+        brightness = cfg.brightness.clamp(10, 100),
     )
 }
 
-/// 胶囊主题名 → 小屏内置主题 id。旧名（white/official 等）按既有迁移规则归一。
-fn native_theme_id(theme: &str) -> &'static str {
+/// 胶囊主题名 → 小屏主题 id。旧名（white/official 等）按既有迁移规则归一；
+/// 不在内置列表里的 id（如用户自定义的 `pulsecore`）原样透传，
+/// 否则每次重启都会把自定义主题写回 dark。
+fn native_theme_id(theme: &str) -> String {
     match theme {
-        "light" | "white" => "light",
-        "bignum-light" | "official" => "bignum-light",
-        "bignum-dark" => "bignum-dark",
-        _ => "dark",
+        "light" | "white" => "light".to_string(),
+        "bignum-light" | "official" => "bignum-light".to_string(),
+        "bignum-dark" => "bignum-dark".to_string(),
+        "dark" | "" => "dark".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -406,6 +448,38 @@ fn config_path() -> PathBuf {
 
 fn pid_file() -> PathBuf {
     appdata_dir().join("screen").join("native.pid")
+}
+
+/// screen-app 写出的设备状态文件（与 config.toml 同目录）。
+fn status_path() -> PathBuf {
+    appdata_dir().join("screen").join("status.json")
+}
+
+/// 读取小屏进程上报的设备状态；超过 10s 未更新视为未知（进程可能已退出）。
+pub fn device_connected() -> Option<bool> {
+    let text = fs::read_to_string(status_path()).ok()?;
+    parse_device_status(&text, now_ms())
+}
+
+#[derive(serde::Deserialize)]
+struct DeviceStatus {
+    connected: bool,
+    updated_ms: u64,
+}
+
+fn parse_device_status(text: &str, now_ms: u64) -> Option<bool> {
+    let st: DeviceStatus = serde_json::from_str(text).ok()?;
+    if now_ms.saturating_sub(st.updated_ms) > 10_000 {
+        return None;
+    }
+    Some(st.connected)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn exe_path() -> Option<PathBuf> {
@@ -544,7 +618,9 @@ mod tests {
             ("bignum-light", "bignum-light"),
             ("official", "bignum-light"),
             ("bignum-dark", "bignum-dark"),
-            ("unknown", "dark"),
+            // 自定义主题（用户 themes/ 目录里的）原样透传，重启不会写回 dark
+            ("pulsecore", "pulsecore"),
+            ("unknown", "unknown"),
         ] {
             let mut c = cfg("portrait", 1);
             c.theme = input.to_string();
@@ -562,6 +638,36 @@ mod tests {
         assert!(text.contains("refresh_secs = 1"));
         let text = render_config(&cfg("portrait", 99));
         assert!(text.contains("refresh_secs = 10"));
+    }
+
+    #[test]
+    fn device_status_requires_fresh_timestamp() {
+        let now = 1_000_000u64;
+        assert_eq!(
+            parse_device_status(r#"{"connected":false,"updated_ms":999500}"#, now),
+            Some(false)
+        );
+        assert_eq!(
+            parse_device_status(r#"{"connected":true,"updated_ms":995000}"#, now),
+            Some(true)
+        );
+        // 超过 10s 未更新：视为未知，避免进程退出后仍显示“已连接”
+        assert_eq!(
+            parse_device_status(r#"{"connected":true,"updated_ms":980000}"#, now),
+            None
+        );
+        assert_eq!(parse_device_status("not json", now), None);
+    }
+
+    #[test]
+    fn brightness_is_clamped_and_written() {
+        let mut c = cfg("portrait", 1);
+        c.brightness = 60;
+        assert!(render_config(&c).contains("brightness = 60"));
+        c.brightness = 0;
+        assert!(render_config(&c).contains("brightness = 10"));
+        c.brightness = 200;
+        assert!(render_config(&c).contains("brightness = 100"));
     }
 
     #[test]

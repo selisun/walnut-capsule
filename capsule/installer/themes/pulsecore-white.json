@@ -1,0 +1,85 @@
+{
+  "schema": "hetao.theme/1",
+  "id": "pulsecore-white",
+  "name": "PulseCore 白色（品牌自适应）",
+  "author": "pulsecore-art",
+  "version": "2.0.0",
+  "palette": {
+    "bg": "#F5F5F5",
+    "card": "#00000000",
+    "text": "#111111",
+    "dim": "#5F6368",
+    "accent": "#111111",
+    "warn": "#B26A00",
+    "danger": "#C62828"
+  },
+  "typography": {
+    "family": "Microsoft YaHei",
+    "base_px": 18,
+    "scale": 1.0,
+    "weights": { "title": 600, "value": 700 }
+  },
+  "background": {
+    "image": "pcw-l-amd-amd.png",
+    "variants": {
+      "landscape-amd-amd": "pcw-l-amd-amd.png",
+      "landscape-amd-nvidia": "pcw-l-amd-nvidia.png",
+      "landscape-intel-amd": "pcw-l-intel-amd.png",
+      "landscape-intel-nvidia": "pcw-l-intel-nvidia.png",
+      "portrait-amd-amd": "pcw-p-amd-amd.png",
+      "portrait-amd-nvidia": "pcw-p-amd-nvidia.png",
+      "portrait-intel-amd": "pcw-p-intel-amd.png",
+      "portrait-intel-nvidia": "pcw-p-intel-nvidia.png",
+      "landscape-intel-intel": "pcw-l-intel-intel.png",
+      "portrait-intel-intel": "pcw-p-intel-intel.png"
+    },
+    "fit": "cover",
+    "anchor": "center",
+    "dim": 0.0,
+    "fallback_color": "#F5F5F5"
+  },
+  "resources": [
+    { "path": "pcw-l-amd-amd.png", "kind": "image", "sha256": "6b22eba50adf5053223c21ace1c6808ea7e0cf87ca301ed6710c2e01c6dbe46f" },
+    { "path": "pcw-l-amd-nvidia.png", "kind": "image", "sha256": "a2ccc4b2f89e3267a0206c28a03e1628a321e80b609e2af5e641751112a5765a" },
+    { "path": "pcw-l-intel-amd.png", "kind": "image", "sha256": "a722120d99dacb9959f8aef9cd084a1b1db23b71921f33ec836c1462bc7f768d" },
+    { "path": "pcw-l-intel-nvidia.png", "kind": "image", "sha256": "28bbce762c52914a6297a7c4ebf6effdb26193b35a0a487539f3ccc92bc540e9" },
+    { "path": "pcw-p-amd-amd.png", "kind": "image", "sha256": "09c954244353b1db0b4e0a57c5277f1500dfdab666cb0dcaf68ebe68d5eeb3aa" },
+    { "path": "pcw-p-amd-nvidia.png", "kind": "image", "sha256": "53b8f27a19b6b3e3ad7aede99614f72d0f6134a72d57d2739608370989b388a7" },
+    { "path": "pcw-p-intel-amd.png", "kind": "image", "sha256": "f881fad98c050665418d62d31904f8c74882e83ad7a8c5cbfe593f44128f9f1f" },
+    { "path": "pcw-p-intel-nvidia.png", "kind": "image", "sha256": "ec60548fa9f6dc8ce8f9db2a61572ab45a9512e23df0e42c8ed3dc60d577ed3d" },
+    { "path": "pcw-l-intel-intel.png", "kind": "image", "sha256": "da94829b75f06644053c67fd6304f84c54aa7644d4dbc3589356586c735f6500" },
+    { "path": "pcw-p-intel-intel.png", "kind": "image", "sha256": "b3470c19860de0acc8586ef67b160a6ea111d2472929025ae722eeed15e34a97" }
+  ],
+  "components": {
+    "visible": ["cpu", "memory", "gpu", "network", "disk"],
+    "styles": {}
+  },
+  "layout": { "template": "auto" },
+  "render": "legacy-overlay",
+  "overlay": {
+    "variants": {
+      "landscape": [
+        { "metric": "cpu_temp", "x": 208, "y": 30, "w": 44, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "cpu", "x": 208, "y": 88, "w": 44, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "gpu_temp", "x": 208, "y": 184, "w": 44, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "gpu", "x": 208, "y": 242, "w": 44, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "memory", "x": 380, "y": 33, "w": 48, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "disk_read", "x": 372, "y": 124, "w": 56, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" },
+        { "metric": "disk_write", "x": 372, "y": 158, "w": 56, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" },
+        { "metric": "network_up", "x": 372, "y": 234, "w": 56, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" },
+        { "metric": "network_down", "x": 372, "y": 268, "w": 56, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" }
+      ],
+      "portrait": [
+        { "metric": "cpu_temp", "x": 210, "y": 30, "w": 51, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "cpu", "x": 210, "y": 88, "w": 51, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "gpu_temp", "x": 210, "y": 170, "w": 51, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "gpu", "x": 210, "y": 228, "w": 51, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "memory", "x": 210, "y": 299, "w": 51, "size": 22, "align": "right", "color": "#111111" },
+        { "metric": "disk_read", "x": 210, "y": 354, "w": 51, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" },
+        { "metric": "disk_write", "x": 210, "y": 380, "w": 51, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" },
+        { "metric": "network_up", "x": 210, "y": 418, "w": 51, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" },
+        { "metric": "network_down", "x": 210, "y": 444, "w": 51, "size": 16, "align": "right", "color": "#111111", "decimals": 1, "rate_unit": "mb_fit" }
+      ]
+    }
+  }
+}

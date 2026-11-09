@@ -29,6 +29,9 @@ pub struct ScreenConfig {
     /// 小屏刷新间隔（秒）：1 | 2 | 3 | 5
     #[serde(default = "default_screen_interval")]
     pub interval: u32,
+    /// 小屏亮度（10 ~ 100）：渲染端按百分比调暗整帧，100 = 原始色彩
+    #[serde(default = "default_screen_brightness")]
+    pub brightness: u8,
     /// 小屏开关：关闭后不再拉起 screen.ps1。
     /// 默认关闭；旧配置里已有该字段就沿用，升级不会改动用户原来的开关状态。
     #[serde(default)]
@@ -66,6 +69,7 @@ impl Default for ScreenConfig {
             orientation: default_screen_orientation(),
             theme: default_screen_theme(),
             interval: default_screen_interval(),
+            brightness: default_screen_brightness(),
             enabled: false,
             engine: default_screen_engine(),
             cpu: true,
@@ -90,8 +94,19 @@ pub const SCREEN_MODES: [&str; 3] = [SCREEN_MODE_CAPSULE, SCREEN_MODE_RINGS, SCR
 pub const SCREEN_ORIENTATIONS: [&str; 4] =
     ["portrait", "portrait-flip", "landscape", "landscape-flip"];
 
-/// 小屏配色主题档位（与设置窗下拉框顺序一致）：Dark / 白色大字 / Light / 黑色大字。
-pub const SCREEN_THEMES: [&str; 4] = ["dark", "bignum-light", "light", "bignum-dark"];
+/// 小屏配色主题档位（与设置窗卡片顺序一致）：Dark / 白色双显 / Light / 黑色双显 /
+/// PulseCore 深色 / PulseCore 白色（后两个为官方皮肤，随安装包分发到用户主题目录）。
+pub const SCREEN_THEMES: [&str; 6] = [
+    "dark",
+    "bignum-light",
+    "light",
+    "bignum-dark",
+    "pulsecore-dark",
+    "pulsecore-white",
+];
+
+/// 新装机器的小屏默认主题：官方 PulseCore 深色皮肤。
+pub const DEFAULT_SCREEN_THEME: &str = "pulsecore-dark";
 
 /// 小屏刷新间隔档位（秒，与设置窗下拉框顺序一致）。
 pub const SCREEN_INTERVALS: [u32; 4] = [1, 2, 3, 5];
@@ -348,10 +363,13 @@ fn default_screen_orientation() -> String {
     SCREEN_ORIENTATIONS[0].to_string()
 }
 fn default_screen_theme() -> String {
-    SCREEN_THEMES[0].to_string()
+    DEFAULT_SCREEN_THEME.to_string()
 }
 fn default_screen_interval() -> u32 {
     2
+}
+fn default_screen_brightness() -> u8 {
+    50
 }
 fn default_screen_engine() -> String {
     SCREEN_ENGINE_NATIVE.to_string()
@@ -422,6 +440,7 @@ fn migrate(cfg: &mut Config) {
     if cfg.screen.engine != SCREEN_ENGINE_NATIVE {
         cfg.screen.engine = SCREEN_ENGINE_NATIVE.to_string();
     }
+    cfg.screen.brightness = cfg.screen.brightness.clamp(10, 100);
 }
 
 pub fn load() -> Config {
@@ -492,5 +511,16 @@ mod tests {
     #[test]
     fn default_config_uses_native_engine() {
         assert_eq!(Config::default().screen.engine, SCREEN_ENGINE_NATIVE);
+    }
+
+    #[test]
+    fn brightness_defaults_to_half_and_is_clamped() {
+        assert_eq!(Config::default().screen.brightness, 50);
+        for (input, expected) in [(0u8, 10u8), (5, 10), (60, 60), (200, 100)] {
+            let mut cfg = Config::default();
+            cfg.screen.brightness = input;
+            migrate(&mut cfg);
+            assert_eq!(cfg.screen.brightness, expected, "输入 {input}");
+        }
     }
 }

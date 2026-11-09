@@ -50,6 +50,16 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 鼠标离开窗口（部分 feature 组合下该常量不导出，这里直接给出值）。
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// 设置窗内「透明度滑条被拖动」的自定义消息（滑条子类 → 父窗口）。
+const WM_SETTINGS_OPACITY: u32 = 0x0400 + 1; // WM_APP + 1
+/// 设置窗内「悬停提示图标」显示 / 隐藏气泡（图标子类 → 父窗口）。
+const WM_SETTINGS_HINT_SHOW: u32 = 0x0400 + 2;
+const WM_SETTINGS_HINT_HIDE: u32 = 0x0400 + 3;
+/// 透明度滑条松手：父窗口把当前选项落盘（拖动过程中只做即时预览，避免频繁写盘）
+const WM_SETTINGS_OPACITY_DONE: u32 = 0x0400 + 4;
+/// 小屏亮度滑条拖动 / 松手
+const WM_SETTINGS_BRIGHTNESS: u32 = 0x0400 + 5;
+const WM_SETTINGS_BRIGHTNESS_DONE: u32 = 0x0400 + 6;
 
 fn pcwstr(s: &str) -> PCWSTR {
     let v: Vec<u16> = s.encode_utf16().chain(Some(0)).collect();
@@ -77,6 +87,21 @@ fn cached_brush(key: &'static str, color: COLORREF) -> HBRUSH {
         .entry(key)
         .or_insert_with(|| unsafe { CreateSolidBrush(color).0 as isize });
     HBRUSH(*v as *mut c_void)
+}
+
+/// 缓存版 1px 实线画笔（自绘边框 / 折线反复用到，避免 GDI 句柄泄漏）。
+fn cached_pen(key: &'static str, color: COLORREF) -> HPEN {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<&'static str, isize>>> = OnceLock::new();
+    let mut g = MAP
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let v = g
+        .entry(key)
+        .or_insert_with(|| unsafe { CreatePen(PS_SOLID, 1, color).0 as isize });
+    HPEN(*v as *mut c_void)
 }
 
 /// 缓存版宽字符串：用于轮询路径（如每 500ms 查任务栏），避免 pcwstr 反复泄漏。
@@ -180,10 +205,11 @@ fn app_icon_at(size: i32) -> HICON {
 
 /// 小屏主题预览缩略图（192×288，构建期嵌入，按 SCREEN_THEMES 顺序）
 const PREVIEW_DARK: &[u8] = include_bytes!("../../tools/nas-screen/preview/dark.png");
-const PREVIEW_BIGNUM_LIGHT: &[u8] =
-    include_bytes!("../../tools/nas-screen/preview/bignum-light.png");
 const PREVIEW_LIGHT: &[u8] = include_bytes!("../../tools/nas-screen/preview/light.png");
-const PREVIEW_BIGNUM_DARK: &[u8] = include_bytes!("../../tools/nas-screen/preview/bignum-dark.png");
+const PREVIEW_BIGNUM_LIGHT: &[u8] = include_bytes!("../assets/preview/bignum-light.png");
+const PREVIEW_BIGNUM_DARK: &[u8] = include_bytes!("../assets/preview/bignum-dark.png");
+const PREVIEW_PULSECORE_DARK: &[u8] = include_bytes!("../assets/preview/pulsecore-dark.png");
+const PREVIEW_PULSECORE_WHITE: &[u8] = include_bytes!("../assets/preview/pulsecore-white.png");
 
 /// RGBA 像素 → 32bpp 顶朝下 DIB（STATIC SS_BITMAP 直接贴图用）
 fn hbitmap_from_rgba(w: i32, h: i32, rgba: &[u8]) -> HBITMAP {
@@ -229,11 +255,13 @@ fn screen_preview_bitmaps() -> &'static [isize] {
     use std::sync::OnceLock;
     static B: OnceLock<Vec<isize>> = OnceLock::new();
     B.get_or_init(|| {
-        let sources: [&[u8]; 4] = [
+        let sources: [&[u8]; 6] = [
             PREVIEW_DARK,
             PREVIEW_BIGNUM_LIGHT,
             PREVIEW_LIGHT,
             PREVIEW_BIGNUM_DARK,
+            PREVIEW_PULSECORE_DARK,
+            PREVIEW_PULSECORE_WHITE,
         ];
         sources
             .iter()
@@ -361,12 +389,14 @@ pub fn run(config: Config) {
         drag_moved: false,
         config,
         settings_hwnd: HWND(null_mut()),
-        settings_orig: None,
         settings_card_order: crate::config::DEFAULT_CARD_ORDER,
         settings_font: HFONT(null_mut()),
         about_title_font: HFONT(null_mut()),
         nav_icon_font: HFONT(null_mut()),
         settings_tab: 0,
+        theme_scroll: 0,
+        settings_items_collapsed: false,
+        settings_hint_on: usize::MAX,
         last_seq: 0,
         pin_anchor: None,
         pin_hidden: false,
@@ -381,6 +411,7 @@ pub fn run(config: Config) {
         pin_check_at: None,
         net_peak: (0, 0),
         fs_hidden: false,
+        screen_device: None,
     };
 
     let raw = Box::into_raw(Box::new(state));
@@ -419,6 +450,8 @@ pub fn run(config: Config) {
     // 500ms 一次，每次只是几次窗口查询，空闲开销可忽略。
     unsafe {
         let _ = SetTimer(hwnd, IDT_FS, 500, None);
+        // 小屏设备状态：1s 轮询一次 status.json，USB 拔出时弹托盘提示。
+        let _ = SetTimer(hwnd, IDT_SCREEN_STATE, 1000, None);
     }
 
     // 数据源在窗口首帧完成后再启动：配合入口处的 WSAStartup 串行预热，
@@ -470,9 +503,7 @@ struct AppState {
     drag_moved: bool,
     config: Config,
     settings_hwnd: HWND,
-    /// 设置窗打开时的 (主题, 透明度) 快照：即时预览靠它"取消/关窗"时还原
-    settings_orig: Option<(String, f32)>,
-    /// 设置窗里卡片的勾选顺序（勾一张挪到末尾），点"确定"才写进配置
+    /// 设置窗里卡片的勾选顺序（勾一张挪到末尾）
     settings_card_order: [u8; crate::config::CARD_COUNT],
     /// 设置窗子控件用的系统 UI 字体（窗口销毁时释放）
     settings_font: HFONT,
@@ -482,6 +513,12 @@ struct AppState {
     nav_icon_font: HFONT,
     /// 设置窗当前标签页（0 连接 / 1 胶囊 / 2 小屏），仅用于自绘标签按钮
     settings_tab: usize,
+    /// 主题页滚动偏移（像素，0 = 顶部）
+    theme_scroll: i32,
+    /// 小屏页「显示项目」是否已收起
+    settings_items_collapsed: bool,
+    /// 当前显示的说明气泡下标（HINT_COUNT = 未显示）
+    settings_hint_on: usize,
     last_seq: u64,
     /// 固定在任务栏时的锚点：(收起态左上角 x, 顶边 y, 是否向上展开)
     pin_anchor: Option<(i32, i32, bool)>,
@@ -507,6 +544,8 @@ struct AppState {
     net_peak: (u64, u64),
     /// 因全屏应用（游戏 / 放映）而临时隐藏了悬浮窗
     fs_hidden: bool,
+    /// 小屏设备最近一次上报的连接状态（None = 未知/未启用）。
+    screen_device: Option<bool>,
 }
 
 /// 任务栏内的三环子窗口：归属任务栏（owner = Shell_TrayWnd），常驻其上方。
@@ -1018,6 +1057,7 @@ unsafe extern "system" fn rings_wndproc(
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            // 三环形态：右键弹出与托盘一致的菜单
             show_tray_menu(state);
             LRESULT(0)
         }
@@ -1220,6 +1260,44 @@ fn tray_init(hwnd: HWND, icon: HICON) -> bool {
     ok
 }
 
+/// 托盘气泡提示（USB 拔出等需要用户注意的事件）。
+fn tray_notify(hwnd: HWND, title: &str, body: &str) {
+    unsafe {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_INFO,
+            ..Default::default()
+        };
+        let t: Vec<u16> = title.encode_utf16().collect();
+        let n = t.len().min(nid.szInfoTitle.len() - 1);
+        nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
+        let b: Vec<u16> = body.encode_utf16().collect();
+        let n = b.len().min(nid.szInfo.len() - 1);
+        nid.szInfo[..n].copy_from_slice(&b[..n]);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+/// 轮询小屏进程上报的设备状态；从“已连接”变为“未连接”时弹托盘提示。
+fn poll_screen_device(state: &mut AppState) {
+    let cur = if state.config.screen.enabled {
+        crate::screen_native::device_connected()
+    } else {
+        None
+    };
+    let prev = std::mem::replace(&mut state.screen_device, cur);
+    if state.config.screen.enabled && prev == Some(true) && cur == Some(false) {
+        tray_notify(
+            state.hwnd,
+            "小屏已断开",
+            "USB 连接已中断，请检查数据线；重新插上后会自动恢复。",
+        );
+    }
+}
+
 /// 资源管理器重启时 shell 会向所有顶层窗口广播这条注册消息（"TaskbarCreated"）。
 fn taskbar_created_msg() -> u32 {
     static MSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1312,8 +1390,11 @@ const IDT_ANIM: usize = 0x4A11;
 const IDT_PIN: usize = 0x4A12;
 /// 全屏应用检测定时器 ID（500ms 一次，游戏进出全屏时及时隐藏/恢复）
 const IDT_FS: usize = 0x4A13;
-/// 设置窗可选的透明度档位（同时也是设置窗单选钮的顺序）
-const OPACITY_STEPS: [f32; 4] = [1.0, 0.85, 0.70, 0.55];
+/// 小屏设备状态定时器 ID（1s 一次，轮询 status.json 并弹断开提示）
+const IDT_SCREEN_STATE: usize = 0x4A15;
+/// 设置窗透明度的可调范围（千分比，1.0 = 100%）
+const OPACITY_MIN_PER_MILLE: u32 = 300;
+const OPACITY_MAX_PER_MILLE: u32 = 1000;
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -1392,6 +1473,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER if wparam.0 == IDT_FS => {
             sync_fullscreen_state(state);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDT_SCREEN_STATE => {
+            poll_screen_device(state);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -1492,6 +1577,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     apply_layout(state, true);
                 }
             }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            // 胶囊条形态：右键弹出与托盘一致的菜单
+            show_tray_menu(state);
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -3006,8 +3096,6 @@ const IDC_ADDR_EDIT: usize = 101;
 const IDC_TOKEN_EDIT: usize = 102;
 const IDC_TEST_BUTTON: usize = 103;
 const IDC_TEST_RESULT: usize = 104;
-/// 胶囊 / 三环 切换（与托盘右键菜单里那项是同一个开关）
-const IDC_TASKBAR_CHK: usize = 105;
 /// 点击面板外自动收起（默认开启）
 const IDC_CLICK_OUTSIDE_CHK: usize = 106;
 /// 主题 2 档单选（顺序同 config::THEMES：亮色 / 暗色）
@@ -3024,11 +3112,17 @@ const IDC_FS_CHK: usize = 111;
 const IDC_CARD_BASE: usize = 120;
 const CARD_COUNT: usize = 6;
 const CARD_LABELS: [&str; CARD_COUNT] = ["CPU", "内存", "显卡", "网络", "硬盘读写", "存储状态"];
-/// 透明度 4 档单选（顺序同 OPACITY_STEPS）
-const IDC_OPACITY_BASE: usize = 130;
+/// 透明度滑条 + 右侧百分比数值
+const IDC_OPACITY_SLIDER: usize = 130;
+const IDC_OPACITY_VALUE: usize = 131;
+/// 小屏亮度滑条 + 右侧百分比数值（10% ~ 100%）
+const IDC_BRIGHT_SLIDER: usize = 132;
+const IDC_BRIGHT_VALUE: usize = 133;
+const BRIGHT_MIN: u32 = 10;
+const BRIGHT_MAX: u32 = 100;
 /// 显示方向 3 档单选（顺序同 config::ORIENTATIONS：自动 / 横向 / 竖向）
 const IDC_ORIENT_BASE: usize = 140;
-/// 展开样式单选（小面板 / 超大卡片）
+/// 展开样式单选（小面板 / 大面板）
 const IDC_STYLE_BASE: usize = 160;
 /// 小屏方向单选（竖屏 / 竖屏翻转 / 横屏 / 横屏翻转）
 const IDC_SCREEN_BASE: usize = 180;
@@ -3036,25 +3130,36 @@ const IDC_SCREEN_BASE: usize = 180;
 const IDC_SCREEN_MODE_BASE: usize = 190;
 const ORIENT_LABELS: [&str; 3] = ["自动", "横向", "竖向"];
 /// 展开样式档位（顺序同 config::EXPAND_STYLES）
-const STYLE_LABELS: [&str; 2] = ["小面板", "超大卡片"];
+const STYLE_LABELS: [&str; 2] = ["小面板", "大面板"];
 /// 小屏方向档位（顺序同 config::SCREEN_ORIENTATIONS）
 const SCREEN_LABELS: [&str; 4] = ["竖屏", "竖屏翻转", "横屏", "横屏翻转"];
 /// 显示模式档位（顺序同 config::SCREEN_MODES）
 const SCREEN_MODE_LABELS: [&str; 3] = ["胶囊模式", "三环模式", "机箱小屏模式"];
 /// 小屏主题档位（顺序同 config::SCREEN_THEMES）
-const SCREEN_THEME_LABELS: [&str; 4] = ["Dark", "白色双显", "Light", "黑色双显"];
+const SCREEN_THEME_LABELS: [&str; 6] = [
+    "Dark",
+    "白色双显",
+    "Light",
+    "黑色双显",
+    "PulseCore 深色",
+    "PulseCore 白色",
+];
+/// 主题页卡片的显示顺序（按 config::SCREEN_THEMES 下标），两列三行，每行一白一黑：
+/// 第一行 Light / Dark，第二行 白色双显 / 黑色双显，第三行 PulseCore 白色 / PulseCore 深色
+const THEME_CARD_ORDER: [usize; 6] = [2, 0, 1, 3, 5, 4];
 
 /// 小屏刷新频率档位（顺序同 config::SCREEN_INTERVALS）
 const SCREEN_REFRESH_LABELS: [&str; 4] = ["1 秒", "2 秒", "3 秒", "5 秒"];
 
-/// 顶部标签页按钮（连接 / 胶囊 / 小屏 / 关于，一次只显示一页）
+/// 顶部标签页按钮（连接 / 胶囊 / 小屏 / 小屏主题 / 关于，一次只显示一页）
 const IDC_TAB_BASE: usize = 200;
-const TAB_LABELS: [&str; 4] = ["连接", "胶囊", "小屏", "关于"];
+const TAB_LABELS: [&str; 5] = ["连接", "胶囊", "小屏", "小屏主题", "关于"];
 /// 连接页内的纯标签 / 分隔线：给了唯一 ID 才能在切页时按 ID 显隐
 const IDC_CONN_LBL_ADDR: usize = 210;
 const IDC_CONN_LBL_TOKEN: usize = 211;
 const IDC_CONN_SEP: usize = 212;
-const IDC_CONN_HINT: usize = 213;
+/// 连接页「界面」分组小标题
+const IDC_CONN_LBL_UI: usize = 214;
 /// 令牌输入框的显示 / 隐藏按钮
 const IDC_TOKEN_EYE: usize = 272;
 /// 编辑框密码字符（windows crate 未导出时自己给值）
@@ -3065,22 +3170,18 @@ const IDC_CAP_LBL_THEME: usize = 220;
 const IDC_CAP_LBL_OPACITY: usize = 221;
 const IDC_CAP_LBL_ORIENT: usize = 222;
 const IDC_CAP_LBL_STYLE: usize = 223;
-const IDC_CAP_LBL_CARDS: usize = 224;
 const IDC_CAP_SEP1: usize = 225;
 /// 小屏页内的纯标签 / 分隔线
-const IDC_SCREEN_LBL_MODE: usize = 244;
 const IDC_SCREEN_LBL_DIR: usize = 240;
 const IDC_SCREEN_SEP: usize = 241;
+/// 小屏页「刷新频率」上方的分隔线（与「显示项目」那条区分开）
+const IDC_SCREEN_SEP2: usize = 248;
 const IDC_SCREEN_LBL_ITEMS: usize = 242;
-const IDC_SCREEN_HINT: usize = 243;
 /// 小屏连接状态（读 screen.ps1 的心跳文件）：标题 / 状态文本
 const IDC_SCREEN_LBL_STATUS: usize = 246;
 const IDC_SCREEN_STATUS: usize = 247;
-/// 小屏主题：分隔线 / 标题 / 下拉框 / 右侧预览图
-const IDC_SCREEN_THEME_SEP: usize = 248;
-const IDC_SCREEN_LBL_THEME: usize = 249;
-const IDC_SCREEN_THEME_COMBO: usize = 260;
-const IDC_SCREEN_PREVIEW: usize = 273;
+/// 小屏主题页：4 张主题卡片
+const IDC_SCREEN_THEME_CARD_BASE: usize = 256;
 /// 关于页：logo / 应用名 / 版本号 / 作者
 const IDC_ABOUT_LOGO: usize = 280;
 const IDC_ABOUT_NAME: usize = 281;
@@ -3092,8 +3193,6 @@ const IDC_ABOUT_BLOG: usize = 285;
 const IDC_ABOUT_QQ: usize = 286;
 /// 关于页博客地址
 const ABOUT_BLOG_URL: &str = "https://blog.mzl.cc/";
-/// 「应用到小屏」按钮
-const IDC_SCREEN_APPLY: usize = 274;
 /// 小屏刷新频率：标题 + 下拉框
 const IDC_SCREEN_LBL_REFRESH: usize = 275;
 const IDC_SCREEN_REFRESH_COMBO: usize = 276;
@@ -3101,56 +3200,97 @@ const IDC_SCREEN_REFRESH_COMBO: usize = 276;
 const CB_ADDSTRING_MSG: u32 = 0x0143;
 const CB_GETCURSEL_MSG: u32 = 0x0147;
 const CB_SETCURSEL_MSG: u32 = 0x014E;
-const CBN_SELCHANGE_CODE: u32 = 1;
-const SS_BITMAP_STYLE: u32 = 0x000E;
-const IMAGE_BITMAP_TYPE: usize = 0;
 /// 小屏开关：开启 / 关闭 / 重新连接
 const IDC_SCREEN_BTN_ON: usize = 266;
 const IDC_SCREEN_BTN_OFF: usize = 267;
 const IDC_SCREEN_BTN_RE: usize = 268;
 /// 设置窗内刷新小屏状态用的定时器
 const IDT_SETTINGS_STATUS: usize = 0x4A14;
-/// 小屏显示项目复选（独立于胶囊面板的卡片开关，写在 config.screen 里）
+/// 小屏显示项目开关（独立于胶囊面板的卡片开关，写在 config.screen 里）
 const IDC_SCREEN_ITEM_BASE: usize = 250;
-const SCREEN_ITEM_COUNT: usize = 8;
-const SCREEN_ITEM_LABELS: [&str; SCREEN_ITEM_COUNT] = [
-    "CPU", "内存", "显卡", "网络", "硬盘", "存储", "温度", "时钟",
-];
+const SCREEN_ITEM_COUNT: usize = 5;
+const SCREEN_ITEM_LABELS: [&str; SCREEN_ITEM_COUNT] = ["CPU", "内存", "显卡", "网络", "硬盘"];
+/// 显示项目下限：少于 3 项时布局放大已经封顶，再减只会留下大片空白。
+const MIN_SCREEN_ITEMS: usize = 3;
 
 /// 设置窗口客户区尺寸（左侧导航 + 页内容 + 底部按钮）
-const SETTINGS_CLIENT_W: i32 = 560;
-const SETTINGS_CLIENT_H: i32 = 520;
+const SETTINGS_CLIENT_W: i32 = 760;
+const SETTINGS_CLIENT_H: i32 = 640;
 /// 左侧导航栏宽度 / 内容区左内边距
-const SETTINGS_SIDEBAR_W: i32 = 136;
-const SETTINGS_PAD: i32 = 152;
+const SETTINGS_SIDEBAR_W: i32 = 176;
+const SETTINGS_PAD: i32 = 216;
 
-/// 设置窗配色（参考云核桃输入法的浅色 + 墨绿）
+/// 设置窗配色：蓝 / 灰 / 白三色，克制、统一 8px 圆角。
 fn settings_rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(((b as u32) << 16) | ((g as u32) << 8) | r as u32)
 }
 fn set_side_bg() -> COLORREF {
-    settings_rgb(246, 248, 247)
+    settings_rgb(247, 248, 250)
 }
 fn set_card_bg() -> COLORREF {
     settings_rgb(255, 255, 255)
 }
+/// 主色（开关开启 / 确定按钮 / 选中态）：墨青 #004040。
 fn set_teal() -> COLORREF {
-    settings_rgb(15, 74, 68)
+    settings_rgb(0x00, 0x40, 0x40)
 }
 fn set_line() -> COLORREF {
-    settings_rgb(226, 233, 230)
+    settings_rgb(232, 235, 240)
 }
 fn set_text() -> COLORREF {
-    settings_rgb(46, 55, 51)
+    settings_rgb(31, 35, 41)
 }
 fn set_hint() -> COLORREF {
-    settings_rgb(122, 134, 129)
+    settings_rgb(122, 130, 142)
+}
+/// 选中项浅墨青底（色阶 200，侧栏导航选中）
+fn set_accent_soft() -> COLORREF {
+    settings_rgb(179, 215, 215)
+}
+/// 悬停浅底（色阶 50，仅用于文字按钮 / 收起箭头的 hover）
+fn set_hover_soft() -> COLORREF {
+    settings_rgb(239, 246, 246)
 }
 
 /// 侧栏 logo（不属于任何一页，切页时也常显）
 const IDC_SIDEBAR_TITLE: usize = 270;
 /// 侧栏应用名（logo 下方）
 const IDC_SIDEBAR_NAME: usize = 271;
+/// 侧栏版本号（应用名下方的小灰字）
+const IDC_SIDEBAR_VERSION: usize = 296;
+/// 页头标题（切页时改文字）
+const IDC_PAGE_TITLE: usize = 290;
+/// 页头右上角「恢复默认」
+const IDC_PAGE_RESET: usize = 291;
+/// 小屏页「显示项目」的收起 / 展开按钮
+const IDC_ITEMS_TOGGLE: usize = 292;
+/// 页头下方的 1px 分隔线
+const IDC_HEAD_SEP: usize = 297;
+/// 说明提示：4 个ⓘ图标 + 1 个气泡（悬停显示）
+const IDC_HINT_ICON_BASE: usize = 298;
+const HINT_COUNT: usize = 5;
+const IDC_TOOLTIP: usize = 303;
+/// 小屏主题页左上角的小标题
+const IDC_SCREEN_LBL_COLOR: usize = 304;
+/// 小屏页「亮度」标题
+const IDC_SCREEN_LBL_BRIGHT: usize = 305;
+/// 主题页可滚动容器（子窗口，负责裁剪卡片）
+const IDC_THEME_VIEW: usize = 306;
+/// 主题页垂直滚动条
+const IDC_THEME_SCROLL: usize = 307;
+/// 提示文案，顺序与 IDC_HINT_ICON_BASE 下标一致
+const HINT_TEXTS: [&str; HINT_COUNT] = [
+    "点“确定”后连接设置才会保存并立即生效",
+    "勾选顺序即面板排列顺序（后勾的排到后面）；收起态不受影响",
+    "与胶囊面板的卡片开关相互独立。\n注意：PulseCore 深色 / 白色是固定版式，增减项目不会生效；白色双显 / 黑色双显不显示硬盘读写。\n显示项目至少保留 3 项。",
+    "选好后点“确定”保存，小屏下一帧生效。白色双显 / 黑色双显会同时显示 NAS 与电脑本机的信息",
+    "配对令牌在 NAS 管理页可以查看和复制，粘贴到这里后点「测试连接」验证",
+];
+/// 胶囊页新增的两个分组小标题
+const IDC_CAP_LBL_LOOK: usize = 112;
+const IDC_CAP_LBL_BEHAVIOR: usize = 113;
+/// 胶囊页新增的分隔线
+const IDC_CAP_SEP2: usize = 114;
 /// STATIC 图标样式 / 图标赋值消息（windows crate 未导出时自己给值）
 const SS_ICON_STYLE: u32 = 0x0003;
 const SS_CENTER_STYLE: u32 = 0x0001;
@@ -3161,7 +3301,7 @@ const STM_SETIMAGE_MSG: u32 = 0x0172;
 const IMAGE_ICON_TYPE: usize = 1;
 
 /// 各标签页包含的控件 ID（切页时按这份清单统一 ShowWindow）
-const PAGE_CONN_IDS: [usize; 14] = [
+const PAGE_CONN_IDS: [usize; 15] = [
     IDC_SEC_CONN,
     IDC_CONN_LBL_ADDR,
     IDC_ADDR_EDIT,
@@ -3170,16 +3310,17 @@ const PAGE_CONN_IDS: [usize; 14] = [
     IDC_TOKEN_EYE,
     IDC_TEST_BUTTON,
     IDC_TEST_RESULT,
-    IDC_SCREEN_LBL_MODE,
     IDC_SCREEN_MODE_BASE,
     IDC_SCREEN_MODE_BASE + 1,
     IDC_SCREEN_MODE_BASE + 2,
     IDC_CONN_SEP,
-    IDC_CONN_HINT,
+    IDC_CONN_LBL_UI,
+    IDC_HINT_ICON_BASE,
+    IDC_HINT_ICON_BASE + 4,
 ];
 const PAGE_CAP_IDS: [usize; 28] = [
     IDC_SEC_CARDS,
-    IDC_CAP_LBL_CARDS,
+    IDC_HINT_ICON_BASE + 1,
     IDC_CARDS_HINT,
     IDC_CARD_BASE,
     IDC_CARD_BASE + 1,
@@ -3192,10 +3333,8 @@ const PAGE_CAP_IDS: [usize; 28] = [
     IDC_THEME_BASE,
     IDC_THEME_BASE + 1,
     IDC_CAP_LBL_OPACITY,
-    IDC_OPACITY_BASE,
-    IDC_OPACITY_BASE + 1,
-    IDC_OPACITY_BASE + 2,
-    IDC_OPACITY_BASE + 3,
+    IDC_OPACITY_SLIDER,
+    IDC_OPACITY_VALUE,
     IDC_CAP_LBL_ORIENT,
     IDC_ORIENT_BASE,
     IDC_ORIENT_BASE + 1,
@@ -3204,10 +3343,12 @@ const PAGE_CAP_IDS: [usize; 28] = [
     IDC_STYLE_BASE,
     IDC_STYLE_BASE + 1,
     IDC_CLICK_OUTSIDE_CHK,
-    IDC_TASKBAR_CHK,
     IDC_FS_CHK,
+    IDC_CAP_SEP2,
+    IDC_CAP_LBL_LOOK,
+    IDC_CAP_LBL_BEHAVIOR,
 ];
-const PAGE_SCREEN_IDS: [usize; 28] = [
+const PAGE_SCREEN_IDS: [usize; 25] = [
     IDC_SCREEN_BTN_ON,
     IDC_SCREEN_BTN_OFF,
     IDC_SCREEN_LBL_STATUS,
@@ -3219,23 +3360,33 @@ const PAGE_SCREEN_IDS: [usize; 28] = [
     IDC_SCREEN_BASE + 2,
     IDC_SCREEN_BASE + 3,
     IDC_SCREEN_SEP,
+    IDC_SCREEN_SEP2,
     IDC_SCREEN_LBL_ITEMS,
-    IDC_SCREEN_HINT,
+    IDC_HINT_ICON_BASE + 2,
+    IDC_ITEMS_TOGGLE,
     IDC_SCREEN_ITEM_BASE,
     IDC_SCREEN_ITEM_BASE + 1,
     IDC_SCREEN_ITEM_BASE + 2,
     IDC_SCREEN_ITEM_BASE + 3,
     IDC_SCREEN_ITEM_BASE + 4,
-    IDC_SCREEN_ITEM_BASE + 5,
-    IDC_SCREEN_ITEM_BASE + 6,
-    IDC_SCREEN_ITEM_BASE + 7,
-    IDC_SCREEN_THEME_SEP,
-    IDC_SCREEN_LBL_THEME,
-    IDC_SCREEN_THEME_COMBO,
-    IDC_SCREEN_PREVIEW,
     IDC_SCREEN_LBL_REFRESH,
     IDC_SCREEN_REFRESH_COMBO,
-    IDC_SCREEN_APPLY,
+    IDC_SCREEN_LBL_BRIGHT,
+    IDC_BRIGHT_SLIDER,
+    IDC_BRIGHT_VALUE,
+];
+/// 小屏主题页：滚动容器 + 滚动条 + 6 张主题卡片 + 说明
+const PAGE_THEME_IDS: [usize; 10] = [
+    IDC_SCREEN_LBL_COLOR,
+    IDC_THEME_VIEW,
+    IDC_THEME_SCROLL,
+    IDC_SCREEN_THEME_CARD_BASE,
+    IDC_SCREEN_THEME_CARD_BASE + 1,
+    IDC_SCREEN_THEME_CARD_BASE + 2,
+    IDC_SCREEN_THEME_CARD_BASE + 3,
+    IDC_SCREEN_THEME_CARD_BASE + 4,
+    IDC_SCREEN_THEME_CARD_BASE + 5,
+    IDC_HINT_ICON_BASE + 3,
 ];
 const PAGE_ABOUT_IDS: [usize; 6] = [
     IDC_ABOUT_LOGO,
@@ -3247,8 +3398,31 @@ const PAGE_ABOUT_IDS: [usize; 6] = [
 ];
 /// 按钮通知码 BN_CLICKED = 0（不依赖 crate 常量类型）
 const BN_CLICKED_CODE: u32 = 0;
-/// 静态控件样式 SS_ETCHEDHORZ = 0x10：一条 1px 蚀刻横线（分组分隔）
-const SS_ETCHEDHORZ_STYLE: u32 = 0x0010;
+/// 静态控件的自绘样式（SS_OWNERDRAW）：用来画 1px 分隔线
+const SS_OWNERDRAW_STYLE: u32 = 0x000D;
+
+/// 开关类控件（自绘 iOS 风格开关）：勾选态存在控件属性里，
+/// 因为 BS_OWNERDRAW 不保证维护 BM_GETCHECK 的原生状态。
+fn is_switch_id(id: usize) -> bool {
+    (IDC_CARD_BASE..IDC_CARD_BASE + CARD_COUNT).contains(&id)
+        || id == IDC_CLICK_OUTSIDE_CHK
+        || id == IDC_FS_CHK
+        || (IDC_SCREEN_ITEM_BASE..IDC_SCREEN_ITEM_BASE + SCREEN_ITEM_COUNT).contains(&id)
+}
+
+/// 分段控件：返回（组内第一颗 ID，档位数）。顺序与设置窗一致。
+fn segment_group(id: usize) -> Option<(usize, usize)> {
+    match id {
+        i if (IDC_THEME_BASE..IDC_THEME_BASE + 2).contains(&i) => Some((IDC_THEME_BASE, 2)),
+        i if (IDC_ORIENT_BASE..IDC_ORIENT_BASE + 3).contains(&i) => Some((IDC_ORIENT_BASE, 3)),
+        i if (IDC_STYLE_BASE..IDC_STYLE_BASE + 2).contains(&i) => Some((IDC_STYLE_BASE, 2)),
+        i if (IDC_SCREEN_BASE..IDC_SCREEN_BASE + 4).contains(&i) => Some((IDC_SCREEN_BASE, 4)),
+        i if (IDC_SCREEN_MODE_BASE..IDC_SCREEN_MODE_BASE + 3).contains(&i) => {
+            Some((IDC_SCREEN_MODE_BASE, 3))
+        }
+        _ => None,
+    }
+}
 
 /// 设置窗定位锚点：决定窗口从哪里长出来（两种入口都尽量让用户少移动鼠标）。
 #[derive(Clone, Copy)]
@@ -3397,11 +3571,6 @@ fn open_settings(state: &mut AppState, anchor: SettingsAnchor) {
     };
 
     let class_wide: Vec<u16> = SETTINGS_CLASS.encode_utf16().chain(Some(0)).collect();
-    // 即时预览的"还原点"：点取消 / 直接关窗时，用它把主题与透明度退回打开前的样子
-    state.settings_orig = Some((
-        state.config.capsule.theme.clone(),
-        state.config.capsule.opacity,
-    ));
     // 勾选顺序的起点：面板里当前的卡片顺序，之后每勾一张就挪到末尾
     state.settings_card_order = state.config.capsule.cards.order;
     let hwnd = unsafe {
@@ -3499,7 +3668,7 @@ fn create_ui_font() -> HFONT {
     }
 }
 
-/// 关于页应用名：沿用系统 UI 字体家族，放大到 20px 并加半粗。
+/// 页头大标题 / 关于页应用名：沿用系统 UI 字体家族，放大到 24px 并加粗。
 fn create_about_title_font() -> HFONT {
     unsafe {
         let mut ncm: NONCLIENTMETRICSW = std::mem::zeroed();
@@ -3515,8 +3684,8 @@ fn create_about_title_font() -> HFONT {
             return HFONT(null_mut());
         }
         let mut lf = ncm.lfMessageFont;
-        lf.lfHeight = -20;
-        lf.lfWeight = 600;
+        lf.lfHeight = -24;
+        lf.lfWeight = 700;
         CreateFontIndirectW(&lf)
     }
 }
@@ -3533,11 +3702,57 @@ fn child_font(hwnd: HWND, font: HFONT) {
     }
 }
 
-/// 读取复选/单选钮的勾选态。
+/// 读取复选 / 分段控件的勾选态（自绘控件用窗口属性存状态）。
 fn is_checked(hwnd: HWND, id: usize) -> bool {
     unsafe {
-        let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
-        SendMessageW(ctl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0
+        // 主题卡片挂在滚动容器里，设置窗直接查不到，需要回退到容器。
+        let ctl = GetDlgItem(hwnd, id as i32)
+            .or_else(|_| {
+                GetDlgItem(hwnd, IDC_THEME_VIEW as i32).and_then(|view| GetDlgItem(view, id as i32))
+            })
+            .unwrap_or_default();
+        ctl_checked(ctl)
+    }
+}
+
+/// 勾选态属性名（固定宽字符串，避免反复分配）。
+fn check_prop() -> PCWSTR {
+    static WIDE: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    let v = WIDE.get_or_init(|| "htc_chk".encode_utf16().chain(Some(0)).collect());
+    PCWSTR(v.as_ptr())
+}
+
+fn ctl_checked(ctl: HWND) -> bool {
+    if ctl.is_invalid() {
+        return false;
+    }
+    unsafe { GetPropW(ctl, check_prop()).0 as isize != 0 }
+}
+
+/// 透明度滑条的值属性名（千分比，300 ~ 1000）。
+fn opacity_prop() -> PCWSTR {
+    static WIDE: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    let v = WIDE.get_or_init(|| "htc_opm".encode_utf16().chain(Some(0)).collect());
+    PCWSTR(v.as_ptr())
+}
+
+/// 设置勾选态（同时保留 BM_SETCHECK，键盘/辅助工具读到的状态也一致）。
+fn set_check_state(hwnd: HWND, id: usize, on: bool) {
+    unsafe {
+        // 主题卡片在滚动容器里，直接 GetDlgItem 找不到，需要先落到容器上再找。
+        let ctl = GetDlgItem(hwnd, id as i32).or_else(|_| {
+            GetDlgItem(hwnd, IDC_THEME_VIEW as i32).and_then(|view| GetDlgItem(view, id as i32))
+        });
+        if let Ok(ctl) = ctl {
+            let flag = if on {
+                1 as *mut c_void
+            } else {
+                null_mut::<c_void>()
+            };
+            let _ = SetPropW(ctl, check_prop(), HANDLE(flag));
+            let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(on as usize), LPARAM(0));
+            let _ = InvalidateRect(ctl, None, TRUE);
+        }
     }
 }
 
@@ -3549,16 +3764,95 @@ fn read_cards(hwnd: HWND) -> CardVis {
     cv
 }
 
-/// 读取透明度单选（返回最接近的档位值）。
-fn read_opacity(hwnd: HWND) -> f32 {
-    (0..OPACITY_STEPS.len())
-        .find(|&i| is_checked(hwnd, IDC_OPACITY_BASE + i))
-        .map_or(OPACITY_STEPS[0], |i| OPACITY_STEPS[i])
+/// 透明度滑条的当前值（千分比）。
+fn opacity_per_mille(hwnd: HWND) -> u32 {
+    unsafe {
+        match GetDlgItem(hwnd, IDC_OPACITY_SLIDER as i32) {
+            Ok(ctl) if !ctl.is_invalid() => {
+                let v = GetPropW(ctl, opacity_prop()).0 as usize as u32;
+                v.clamp(OPACITY_MIN_PER_MILLE, OPACITY_MAX_PER_MILLE)
+            }
+            _ => OPACITY_MAX_PER_MILLE,
+        }
+    }
 }
 
-/// 读取设置窗里小屏的 8 个显示项目开关（CPU/内存/显卡/网络/硬盘/存储/温度/时钟）。
+/// 写入滑条值，并同步右侧百分比文字。
+fn set_opacity_per_mille(hwnd: HWND, v: u32) {
+    unsafe {
+        if let Ok(ctl) = GetDlgItem(hwnd, IDC_OPACITY_SLIDER as i32) {
+            let v = v.clamp(OPACITY_MIN_PER_MILLE, OPACITY_MAX_PER_MILLE);
+            let _ = SetPropW(ctl, opacity_prop(), HANDLE(v as *mut c_void));
+            let _ = InvalidateRect(ctl, None, TRUE);
+            if let Ok(lbl) = GetDlgItem(hwnd, IDC_OPACITY_VALUE as i32) {
+                let text: Vec<u16> = format!("{}%", v / 10)
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                let _ = SetWindowTextW(lbl, PCWSTR(text.as_ptr()));
+            }
+        }
+    }
+}
+
+/// 读取透明度滑条（0.30 ~ 1.00）。
+fn read_opacity(hwnd: HWND) -> f32 {
+    opacity_per_mille(hwnd) as f32 / 1000.0
+}
+
+/// 小屏亮度滑条的值属性名（百分比，10 ~ 100）。
+fn brightness_prop() -> PCWSTR {
+    static WIDE: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    let v = WIDE.get_or_init(|| "htc_brg".encode_utf16().chain(Some(0)).collect());
+    PCWSTR(v.as_ptr())
+}
+
+/// 小屏亮度滑条的当前值（10 ~ 100，默认 100）。
+fn brightness_percent(hwnd: HWND) -> u32 {
+    unsafe {
+        match GetDlgItem(hwnd, IDC_BRIGHT_SLIDER as i32) {
+            Ok(ctl) if !ctl.is_invalid() => {
+                let v = GetPropW(ctl, brightness_prop()).0 as usize as u32;
+                v.clamp(BRIGHT_MIN, BRIGHT_MAX)
+            }
+            _ => BRIGHT_MAX,
+        }
+    }
+}
+
+/// 写入亮度滑条值，并同步右侧百分比文字。
+fn set_brightness_percent(hwnd: HWND, v: u32) {
+    unsafe {
+        if let Ok(ctl) = GetDlgItem(hwnd, IDC_BRIGHT_SLIDER as i32) {
+            let v = v.clamp(BRIGHT_MIN, BRIGHT_MAX);
+            let _ = SetPropW(ctl, brightness_prop(), HANDLE(v as *mut c_void));
+            let _ = InvalidateRect(ctl, None, TRUE);
+            if let Ok(lbl) = GetDlgItem(hwnd, IDC_BRIGHT_VALUE as i32) {
+                let text: Vec<u16> = format!("{v}%").encode_utf16().chain(Some(0)).collect();
+                let _ = SetWindowTextW(lbl, PCWSTR(text.as_ptr()));
+            }
+        }
+    }
+}
+
+/// 读取设置窗里小屏的 5 个显示项目开关（CPU/内存/显卡/网络/硬盘）。
 fn read_screen_items(hwnd: HWND) -> [bool; SCREEN_ITEM_COUNT] {
     std::array::from_fn(|i| is_checked(hwnd, IDC_SCREEN_ITEM_BASE + i))
+}
+
+/// 已到显示项目下限时的提示（拒绝再关一项）。
+unsafe fn show_min_items_hint(hwnd: HWND) {
+    let msg: Vec<u16> = "小屏显示项目至少保留 3 项。\n如需精简，请先勾选其他项目，再取消当前项。"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let title: Vec<u16> = "核桃胶囊".encode_utf16().chain(Some(0)).collect();
+    let _ = MessageBoxW(
+        hwnd,
+        PCWSTR(msg.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        MB_OK | MB_ICONINFORMATION,
+    );
 }
 
 /// 推送桥跟随开关：只有小屏启用时才推送快照，否则小屏只能显示「等待客户端」。
@@ -3627,10 +3921,14 @@ struct SettingsDrawItem {
 }
 
 fn settings_update_screen_status(hwnd: HWND, cfg: &crate::config::ScreenConfig) {
-    let text = if cfg.enabled {
-        "已启用"
-    } else {
+    let text = if !cfg.enabled {
         "未启用"
+    } else {
+        match crate::screen_native::device_connected() {
+            Some(true) => "已连接",
+            Some(false) => "未连接（请检查 USB）",
+            None => "已启用（等待小屏）",
+        }
     };
     set_dlg_text(hwnd, IDC_SCREEN_STATUS as i32, text);
 }
@@ -3645,8 +3943,8 @@ fn old_wndprocs() -> &'static std::sync::Mutex<std::collections::HashMap<isize, 
 /// 当前鼠标悬停的按钮 ID（0 = 没有），同一时刻只会有一个。
 static HOT_BTN: AtomicUsize = AtomicUsize::new(0);
 
-/// 所有圆角自绘按钮：确定 / 取消 / 测试连接 / 令牌显隐 / 小屏开关·重连·应用
-const ROUND_BTN_IDS: [usize; 8] = [
+/// 所有圆角自绘按钮：确定 / 取消 / 测试连接 / 令牌显隐 / 小屏开关·重连 / 恢复默认 / 收起箭头
+const ROUND_BTN_IDS: [usize; 9] = [
     1,
     2,
     IDC_TEST_BUTTON,
@@ -3654,7 +3952,8 @@ const ROUND_BTN_IDS: [usize; 8] = [
     IDC_SCREEN_BTN_ON,
     IDC_SCREEN_BTN_OFF,
     IDC_SCREEN_BTN_RE,
-    IDC_SCREEN_APPLY,
+    IDC_PAGE_RESET,
+    IDC_ITEMS_TOGGLE,
 ];
 
 /// 自绘按钮没有系统悬停反馈，这里自己跟一下鼠标进出：
@@ -3703,6 +4002,28 @@ unsafe extern "system" fn rounded_btn_proc(
     CallWindowProcW(prev, hwnd, msg, wparam, lparam)
 }
 
+/// 给透明度滑条挂上子类过程（每个控件只挂一次）。
+fn subclass_slider(
+    ctl: HWND,
+    proc_: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) {
+    unsafe {
+        if ctl.is_invalid() {
+            return;
+        }
+        let key = ctl.0 as isize;
+        let mut map = match old_wndprocs().lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if map.contains_key(&key) {
+            return;
+        }
+        let old = SetWindowLongPtrW(ctl, GWLP_WNDPROC, proc_ as usize as isize);
+        map.insert(key, old);
+    }
+}
+
 /// 给圆角按钮挂上鼠标跟踪（每个控件只挂一次）。
 fn subclass_round_buttons(hwnd: HWND) {
     unsafe {
@@ -3727,22 +4048,997 @@ fn subclass_round_buttons(hwnd: HWND) {
     }
 }
 
-/// 悬停 / 按下时的按钮底色：主按钮（确定）用墨绿的亮暗两档，次按钮用浅灰两档。
+/// 单条闭合路径的圆角矩形：四角半径可分别指定（0 即直角）。
+fn round_rect_path(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    tl: f32,
+    tr: f32,
+    br: f32,
+    bl: f32,
+) -> Option<tiny_skia::Path> {
+    let (x2, y2) = (x + w, y + h);
+    let lim = (w / 2.0).min(h / 2.0).max(0.0);
+    let (tl, tr, br, bl) = (
+        tl.min(lim).max(0.0),
+        tr.min(lim).max(0.0),
+        br.min(lim).max(0.0),
+        bl.min(lim).max(0.0),
+    );
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x + tl, y);
+    pb.line_to(x2 - tr, y);
+    if tr > 0.0 {
+        pb.cubic_to(x2 - tr / 2.0, y, x2, y + tr / 2.0, x2, y + tr);
+    }
+    pb.line_to(x2, y2 - br);
+    if br > 0.0 {
+        pb.cubic_to(x2, y2 - br / 2.0, x2 - br / 2.0, y2, x2 - br, y2);
+    }
+    pb.line_to(x + bl, y2);
+    if bl > 0.0 {
+        pb.cubic_to(x + bl / 2.0, y2, x, y2 - bl / 2.0, x, y2 - bl);
+    }
+    pb.line_to(x, y + tl);
+    if tl > 0.0 {
+        pb.cubic_to(x, y + tl / 2.0, x + tl / 2.0, y, x + tl, y);
+    }
+    pb.close();
+    pb.finish()
+}
+
+fn fill_solid(pm: &mut tiny_skia::Pixmap, path: &tiny_skia::Path, rgba: (u8, u8, u8, u8)) {
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color_rgba8(rgba.0, rgba.1, rgba.2, rgba.3);
+    paint.anti_alias = true;
+    pm.fill_path(
+        path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
+/// 控件位图类型（`kind` 的低位含义）：
+/// - 0/1：开关关闭 / 开启
+/// - 8 + bit0(选中) + bit1(左圆角) + bit2(右圆角)：分段控件
+/// - 16/17：收起 / 展开箭头
+const CTL_KIND_SWITCH: u8 = 0;
+const CTL_KIND_SEGMENT: u8 = 8;
+const CTL_KIND_CHEVRON: u8 = 16;
+/// 主题色卡：20/21 = 亮色未选/选中，22/23 = 暗色未选/选中
+const CTL_KIND_THEME: u8 = 20;
+/// 滑条滑块（透明底，需 AlphaBlend）
+const CTL_KIND_KNOB: u8 = 24;
+/// 小屏主题卡片底：28/29 = 未选中/选中
+const CTL_KIND_CARD: u8 = 28;
+/// 卡片名称旁的圆形对勾（透明底）
+const CTL_KIND_CHECK: u8 = 30;
+/// 说明提示图标（圆圈感叹号）
+const CTL_KIND_INFO: u8 = 32;
+/// 说明气泡底（白底圆角 + 细边，尺寸随内容）
+const CTL_KIND_TOOLTIP: u8 = 34;
+/// 显示模式卡片底：36/37 = 未选中/选中
+const CTL_KIND_MODE: u8 = 36;
+/// 显示模式示意缩略图：38 胶囊 / 39 三环 / 40 小屏
+const CTL_KIND_MODE_SKETCH: u8 = 38;
+
+/// 用 tiny-skia 离屏画一张抗锯齿控件位图（白底不透明，可直接 BitBlt）。
+fn render_ctl_pixmap(w: i32, h: i32, kind: u8) -> Option<tiny_skia::Pixmap> {
+    let wu = w.max(2) as u32;
+    let hu = h.max(2) as u32;
+    let mut pm = tiny_skia::Pixmap::new(wu, hu)?;
+    // 滑块与对勾要保留透明背景（AlphaBlend 上屏），其余控件铺白底后直接 BitBlt
+    if kind != CTL_KIND_KNOB && kind != CTL_KIND_CHECK {
+        pm.fill(tiny_skia::Color::WHITE);
+    }
+    let (fw, fh) = (wu as f32, hu as f32);
+    match kind {
+        k if k < CTL_KIND_SEGMENT => {
+            let on = k == 1;
+            if let Some(p) =
+                round_rect_path(0.0, 0.0, fw, fh, fh / 2.0, fh / 2.0, fh / 2.0, fh / 2.0)
+            {
+                let track = if on {
+                    (31, 127, 127, 255)
+                } else {
+                    (209, 213, 219, 255)
+                };
+                fill_solid(&mut pm, &p, track);
+            }
+            let d = fh - 6.0;
+            let kx = if on { fw - 3.0 - d } else { 3.0 };
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(kx + d / 2.0, fh / 2.0, d / 2.0);
+            if let Some(p) = pb.finish() {
+                fill_solid(&mut pm, &p, (255, 255, 255, 255));
+            }
+        }
+        k if (CTL_KIND_SEGMENT..CTL_KIND_CHEVRON).contains(&k) => {
+            let checked = k & 1 != 0;
+            let r = if k & 2 != 0 { fh / 2.0 } else { 0.0 };
+            let rr = if k & 4 != 0 { fh / 2.0 } else { 0.0 };
+            if let Some(p) = round_rect_path(0.0, 0.0, fw, fh, r, rr, rr, r) {
+                fill_solid(&mut pm, &p, (243, 244, 246, 255));
+            }
+            if checked {
+                let inner = 3.0;
+                let (iw, ih) = (fw - inner * 2.0, fh - inner * 2.0);
+                let (ir, irr) = (ih / 2.0, ih / 2.0);
+                if let Some(p) = round_rect_path(inner, inner, iw, ih, ir, irr, irr, ir) {
+                    fill_solid(&mut pm, &p, (255, 255, 255, 255));
+                }
+            }
+        }
+        k if (CTL_KIND_THEME..CTL_KIND_THEME + 4).contains(&k) => {
+            let dark = (k - CTL_KIND_THEME) & 2 != 0;
+            let checked = (k - CTL_KIND_THEME) & 1 != 0;
+            // 只有「暗色」被选中时才铺黑底；未选中一律白底
+            let dark_bg = dark && checked;
+            let bg = if dark_bg {
+                (30, 30, 35, 255)
+            } else {
+                (255, 255, 255, 255)
+            };
+            if let Some(p) = round_rect_path(1.0, 1.0, fw - 2.0, fh - 2.0, 9.0, 9.0, 9.0, 9.0) {
+                fill_solid(&mut pm, &p, bg);
+            }
+            let (bw, color) = if checked {
+                (2.0, (37, 99, 235, 255))
+            } else {
+                (1.0, (209, 213, 219, 255))
+            };
+            if let Some(p) = round_rect_path(1.5, 1.5, fw - 3.0, fh - 3.0, 8.0, 8.0, 8.0, 8.0) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(color.0, color.1, color.2, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: bw,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+        CTL_KIND_KNOB => {
+            let c = (fw / 2.0, fh / 2.0);
+            let r = fw / 2.0 - 1.0;
+            // 阴影（透明底，AlphaBlend 时可透出轨道）
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(c.0, c.1 + 1.0, r);
+            if let Some(p) = pb.finish() {
+                fill_solid(&mut pm, &p, (15, 23, 42, 28));
+            }
+            // 白色滑块 + 1px 描边
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(c.0, c.1, r - 1.0);
+            if let Some(p) = pb.finish() {
+                fill_solid(&mut pm, &p, (255, 255, 255, 255));
+            }
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(c.0, c.1, r - 1.0);
+            if let Some(p) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(203, 208, 216, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: 1.0,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+        k if (CTL_KIND_CARD..CTL_KIND_CARD + 2).contains(&k) => {
+            let checked = k == CTL_KIND_CARD + 1;
+            if let Some(p) = round_rect_path(1.0, 1.0, fw - 2.0, fh - 2.0, 11.0, 11.0, 11.0, 11.0) {
+                fill_solid(&mut pm, &p, (255, 255, 255, 255));
+            }
+            let (bw, color) = if checked {
+                (2.0, (0, 64, 64, 255))
+            } else {
+                (1.0, (228, 231, 236, 255))
+            };
+            if let Some(p) = round_rect_path(1.5, 1.5, fw - 3.0, fh - 3.0, 10.0, 10.0, 10.0, 10.0) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(color.0, color.1, color.2, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: bw,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+        CTL_KIND_CHECK => {
+            let (cx, cy, r) = (fw / 2.0, fh / 2.0, fw / 2.0 - 1.0);
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(cx, cy, r);
+            if let Some(p) = pb.finish() {
+                fill_solid(&mut pm, &p, (0, 64, 64, 255));
+            }
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.move_to(cx - r * 0.45, cy);
+            pb.line_to(cx - r * 0.1, cy + r * 0.35);
+            pb.line_to(cx + r * 0.5, cy - r * 0.4);
+            if let Some(p) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(255, 255, 255, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: (r * 0.28).max(1.2),
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+        CTL_KIND_INFO => {
+            let (cx, cy, r) = (fw / 2.0, fh / 2.0, fw / 2.0 - 1.0);
+            let ink = (154, 163, 175, 255);
+            // 细圆环
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(cx, cy, r);
+            if let Some(p) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(ink.0, ink.1, ink.2, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: 1.2,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+            // i 的点（实心圆）
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_circle(cx, cy - r * 0.44, 1.0);
+            if let Some(p) = pb.finish() {
+                fill_solid(&mut pm, &p, ink);
+            }
+            // i 的竖条（圆角小条，比描边更干净）
+            let bar_w = 1.8;
+            let bar_top = cy - r * 0.10;
+            let bar_h = r * 0.72;
+            if let Some(p) = round_rect_path(
+                cx - bar_w / 2.0,
+                bar_top,
+                bar_w,
+                bar_h,
+                bar_w / 2.0,
+                bar_w / 2.0,
+                bar_w / 2.0,
+                bar_w / 2.0,
+            ) {
+                fill_solid(&mut pm, &p, ink);
+            }
+        }
+        CTL_KIND_TOOLTIP => {
+            if let Some(p) = round_rect_path(0.5, 0.5, fw - 1.0, fh - 1.0, 8.0, 8.0, 8.0, 8.0) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(219, 223, 229, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: 1.0,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+        k if (CTL_KIND_MODE..CTL_KIND_MODE + 2).contains(&k) => {
+            let checked = k == CTL_KIND_MODE + 1;
+            if let Some(p) = round_rect_path(1.0, 1.0, fw - 2.0, fh - 2.0, 9.0, 9.0, 9.0, 9.0) {
+                fill_solid(&mut pm, &p, (255, 255, 255, 255));
+            }
+            let (bw, color) = if checked {
+                (2.0, (0, 64, 64, 255))
+            } else {
+                (1.0, (228, 231, 236, 255))
+            };
+            if let Some(p) = round_rect_path(1.5, 1.5, fw - 3.0, fh - 3.0, 8.0, 8.0, 8.0, 8.0) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(color.0, color.1, color.2, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: bw,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+        k if (CTL_KIND_MODE_SKETCH..CTL_KIND_MODE_SKETCH + 3).contains(&k) => {
+            let idx = (k - CTL_KIND_MODE_SKETCH) as usize;
+            if let Some(p) = round_rect_path(0.0, 0.0, fw, fh, 6.0, 6.0, 6.0, 6.0) {
+                fill_solid(&mut pm, &p, (237, 242, 247, 255));
+            }
+            match idx {
+                // 胶囊模式：悬浮药丸 + 展开面板
+                0 => {
+                    if let Some(p) = round_rect_path(44.0, 10.0, 52.0, 16.0, 8.0, 8.0, 8.0, 8.0) {
+                        fill_solid(&mut pm, &p, (31, 41, 55, 255));
+                    }
+                    if let Some(p) = round_rect_path(32.0, 32.0, 76.0, 24.0, 4.0, 4.0, 4.0, 4.0) {
+                        fill_solid(&mut pm, &p, (255, 255, 255, 255));
+                        let mut paint = tiny_skia::Paint::default();
+                        paint.set_color_rgba8(213, 222, 232, 255);
+                        paint.anti_alias = true;
+                        let stroke = tiny_skia::Stroke {
+                            width: 1.0,
+                            ..Default::default()
+                        };
+                        pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+                    }
+                    if let Some(p) = round_rect_path(40.0, 38.0, 26.0, 3.0, 1.5, 1.5, 1.5, 1.5) {
+                        fill_solid(&mut pm, &p, (203, 213, 225, 255));
+                    }
+                    if let Some(p) = round_rect_path(40.0, 45.0, 40.0, 3.0, 1.5, 1.5, 1.5, 1.5) {
+                        fill_solid(&mut pm, &p, (226, 232, 240, 255));
+                    }
+                }
+                // 三环模式：任务栏 + 三个彩色圆环
+                1 => {
+                    if let Some(p) = round_rect_path(10.0, 40.0, 120.0, 14.0, 5.0, 5.0, 5.0, 5.0) {
+                        fill_solid(&mut pm, &p, (31, 41, 55, 255));
+                    }
+                    let rings = [
+                        (52.0, (34, 211, 238, 255)),
+                        (70.0, (52, 211, 153, 255)),
+                        (88.0, (251, 191, 36, 255)),
+                    ];
+                    for (cx, color) in rings {
+                        let mut pb = tiny_skia::PathBuilder::new();
+                        pb.push_circle(cx, 47.0, 4.2);
+                        if let Some(p) = pb.finish() {
+                            let mut paint = tiny_skia::Paint::default();
+                            paint.set_color_rgba8(color.0, color.1, color.2, 255);
+                            paint.anti_alias = true;
+                            let stroke = tiny_skia::Stroke {
+                                width: 2.0,
+                                ..Default::default()
+                            };
+                            pm.stroke_path(
+                                &p,
+                                &paint,
+                                &stroke,
+                                tiny_skia::Transform::identity(),
+                                None,
+                            );
+                        }
+                    }
+                }
+                // 机箱小屏模式：竖屏 + 内部数据条
+                _ => {
+                    if let Some(p) = round_rect_path(56.0, 4.0, 28.0, 56.0, 3.0, 3.0, 3.0, 3.0) {
+                        fill_solid(&mut pm, &p, (31, 41, 55, 255));
+                    }
+                    for (i, w) in [16.0f32, 12.0, 18.0].iter().enumerate() {
+                        if let Some(p) = round_rect_path(
+                            62.0,
+                            16.0 + i as f32 * 9.0,
+                            *w,
+                            3.0,
+                            1.5,
+                            1.5,
+                            1.5,
+                            1.5,
+                        ) {
+                            fill_solid(&mut pm, &p, (100, 116, 139, 255));
+                        }
+                    }
+                    if let Some(p) = round_rect_path(62.0, 8.0, 9.0, 2.0, 1.0, 1.0, 1.0, 1.0) {
+                        fill_solid(&mut pm, &p, (148, 163, 184, 255));
+                    }
+                }
+            }
+        }
+        _ => {
+            let up = kind == CTL_KIND_CHEVRON + 1;
+            let (cx, cy) = (fw / 2.0, fh / 2.0);
+            let dy = if up { -2.0 } else { 2.0 };
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.move_to(cx - 5.0, cy - dy);
+            pb.line_to(cx, cy + dy);
+            pb.line_to(cx + 5.0, cy - dy);
+            if let Some(p) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(122, 130, 142, 255);
+                paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke {
+                    width: 1.6,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            }
+        }
+    }
+    Some(pm)
+}
+
+/// 控件位图缓存：(宽, 高, 类型) → DIB。进程内只画一次。
+fn ctl_bitmap(w: i32, h: i32, kind: u8) -> HBITMAP {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<(i32, i32, u8), isize>>> = OnceLock::new();
+    let mut g = MAP
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(&v) = g.get(&(w, h, kind)) {
+        return HBITMAP(v as *mut c_void);
+    }
+    let hbm = match render_ctl_pixmap(w, h, kind) {
+        Some(pm) => hbitmap_from_rgba(pm.width() as i32, pm.height() as i32, pm.data()),
+        None => HBITMAP(null_mut()),
+    };
+    g.insert((w, h, kind), hbm.0 as isize);
+    hbm
+}
+
+/// 把缓存的控件位图贴到目标 DC（抗锯齿边缘已在位图里算好）。
+unsafe fn blit_ctl_bitmap(hdc: HDC, hbm: HBITMAP, x: i32, y: i32, w: i32, h: i32) {
+    if hbm.is_invalid() {
+        return;
+    }
+    let mem = CreateCompatibleDC(hdc);
+    if mem.is_invalid() {
+        return;
+    }
+    let old = SelectObject(mem, HGDIOBJ(hbm.0));
+    let _ = BitBlt(hdc, x, y, w, h, mem, 0, 0, SRCCOPY);
+    let _ = SelectObject(mem, old);
+    let _ = DeleteDC(mem);
+}
+
+/// 保留 alpha 的位图（滑块用）：RGBA（预乘）→ 32bpp DIB。
+fn hbitmap_from_pixmap_alpha(pm: &tiny_skia::Pixmap) -> HBITMAP {
+    unsafe {
+        let (w, h) = (pm.width() as i32, pm.height() as i32);
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = null_mut();
+        let hbm = CreateDIBSection(
+            HDC::default(),
+            &bi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            HANDLE(null_mut()),
+            0,
+        )
+        .unwrap_or_default();
+        if bits.is_null() {
+            return hbm;
+        }
+        let src = pm.data();
+        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+        for i in (0..dst.len()).step_by(4) {
+            dst[i] = src[i + 2];
+            dst[i + 1] = src[i + 1];
+            dst[i + 2] = src[i];
+            dst[i + 3] = src[i + 3];
+        }
+        hbm
+    }
+}
+
+/// 带 alpha 的控件位图缓存（只给滑块用）。
+fn ctl_bitmap_alpha(w: i32, h: i32, kind: u8) -> HBITMAP {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<(i32, i32, u8), isize>>> = OnceLock::new();
+    let mut g = MAP
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(&v) = g.get(&(w, h, kind)) {
+        return HBITMAP(v as *mut c_void);
+    }
+    let hbm = match render_ctl_pixmap(w, h, kind) {
+        Some(pm) => hbitmap_from_pixmap_alpha(&pm),
+        None => HBITMAP(null_mut()),
+    };
+    g.insert((w, h, kind), hbm.0 as isize);
+    hbm
+}
+
+/// 带 alpha 的贴图（AlphaBlend，滑块阴影/圆角能透出轨道）。
+unsafe fn blit_ctl_bitmap_alpha(hdc: HDC, hbm: HBITMAP, x: i32, y: i32, w: i32, h: i32) {
+    if hbm.is_invalid() {
+        return;
+    }
+    let mem = CreateCompatibleDC(hdc);
+    if mem.is_invalid() {
+        return;
+    }
+    let old = SelectObject(mem, HGDIOBJ(hbm.0));
+    let bf = BLENDFUNCTION {
+        BlendOp: 0, // AC_SRC_OVER
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA
+    };
+    let _ = AlphaBlend(hdc, x, y, w, h, mem, 0, 0, w, h, bf);
+    let _ = SelectObject(mem, old);
+    let _ = DeleteDC(mem);
+}
+
+/// 显示模式卡片：上图下名；选中时蓝框（主色） + 名称右侧圆形对勾。
+const MODE_CARD_W: i32 = 168;
+const MODE_CARD_H: i32 = 96;
+const MODE_CARD_TOTAL_H: i32 = 122;
+
+unsafe fn draw_mode_card(
+    hdc: HDC,
+    rc: RECT,
+    label: &str,
+    checked: bool,
+    mode_idx: usize,
+    font: HFONT,
+) {
+    let kind = if checked {
+        CTL_KIND_MODE + 1
+    } else {
+        CTL_KIND_MODE
+    };
+    blit_ctl_bitmap(
+        hdc,
+        ctl_bitmap(MODE_CARD_W, MODE_CARD_H, kind),
+        rc.left,
+        rc.top,
+        MODE_CARD_W,
+        MODE_CARD_H,
+    );
+
+    // 示意缩略图 140×64 居中
+    let (sw, sh) = (140, 64);
+    let sx = rc.left + (MODE_CARD_W - sw) / 2;
+    let sy = rc.top + (MODE_CARD_H - sh) / 2;
+    blit_ctl_bitmap(
+        hdc,
+        ctl_bitmap(sw, sh, CTL_KIND_MODE_SKETCH + mode_idx as u8),
+        sx,
+        sy,
+        sw,
+        sh,
+    );
+
+    if !font.is_invalid() {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, if checked { set_text() } else { set_hint() });
+    let mut text: Vec<u16> = label.encode_utf16().collect();
+    let mut size = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &text, &mut size);
+    let tw = size.cx.max(0);
+    let check_w = if checked { 22 } else { 0 };
+    let center = (rc.left + rc.right) / 2;
+    let name_left = center - (tw + check_w) / 2;
+    let name_top = rc.top + MODE_CARD_H + 4;
+    let mut trc = RECT {
+        left: name_left,
+        top: name_top,
+        right: name_left + tw,
+        bottom: name_top + 20,
+    };
+    let fmt = DRAW_TEXT_FORMAT(DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0);
+    let _ = DrawTextW(hdc, &mut text, &mut trc, fmt);
+    if checked {
+        let d = 16;
+        blit_ctl_bitmap_alpha(
+            hdc,
+            ctl_bitmap_alpha(d, d, CTL_KIND_CHECK),
+            name_left + tw + 6,
+            name_top + (20 - d) / 2,
+            d,
+            d,
+        );
+    }
+}
+
+/// 小屏主题卡片：上图下名；选中时蓝框 + 名称右侧圆形对勾。
+const SCREEN_THEME_CARD_H: i32 = 176;
+const SCREEN_THEME_CARD_TOTAL_H: i32 = 202;
+/// 主题页滚动范围：3 行 × 216 + 单卡总高 202 − 可视高 486 = 148
+const THEME_SCROLL_MAX: i32 = 3 * 216 + SCREEN_THEME_CARD_TOTAL_H - 486;
+/// 滚动条控件消息（windows crate 未导出 SetScrollPos/SetScrollRange 的便捷封装）
+const SBM_SETRANGE_MSG: u32 = 0x00E2;
+const SBM_SETPOS_MSG: u32 = 0x00E0;
+const SBM_GETPOS_MSG: u32 = 0x00E8;
+
+/// 主题页滚动容器的原窗口过程（子类化后用于把消息转回设置窗）
+static mut THEME_VIEW_PROC: isize = 0;
+
+/// 容器子类化：卡片是容器子窗口，`WM_DRAWITEM` / `WM_COMMAND` / 滚轮会先发给容器，
+/// 这里原样转给设置窗，保持原有的自绘与点击逻辑不变。
+unsafe extern "system" fn theme_view_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if matches!(msg, WM_DRAWITEM | WM_COMMAND | WM_MOUSEWHEEL) {
+        let parent = GetParent(hwnd).unwrap_or_default();
+        return SendMessageW(parent, msg, wparam, lparam);
+    }
+    // STATIC 控件默认不擦背景：滚动移动卡片后旧位置会留下残影（红框里那种重影）。
+    // 用内容区底色重刷整块容器，子卡片区域由 WS_CLIPCHILDREN 自动跳过。
+    if msg == WM_ERASEBKGND {
+        let hdc = HDC(wparam.0 as *mut c_void);
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let _ = FillRect(hdc, &rc, cached_brush("set_card", set_card_bg()));
+        return LRESULT(1);
+    }
+    let proc: WNDPROC = std::mem::transmute(THEME_VIEW_PROC);
+    CallWindowProcW(proc, hwnd, msg, wparam, lparam)
+}
+
+unsafe fn draw_screen_theme_card(
+    hdc: HDC,
+    rc: RECT,
+    title: &str,
+    checked: bool,
+    theme_idx: usize,
+    font: HFONT,
+) {
+    let card_w = rc.right - rc.left;
+    let kind = if checked {
+        CTL_KIND_CARD + 1
+    } else {
+        CTL_KIND_CARD
+    };
+    blit_ctl_bitmap(
+        hdc,
+        ctl_bitmap(card_w, SCREEN_THEME_CARD_H, kind),
+        rc.left,
+        rc.top,
+        card_w,
+        SCREEN_THEME_CARD_H,
+    );
+
+    // 预览缩略图 96×144，居中
+    if let Some(&hbm) = screen_preview_bitmaps().get(theme_idx) {
+        if hbm != 0 {
+            let mem = CreateCompatibleDC(hdc);
+            if !mem.is_invalid() {
+                let old = SelectObject(mem, HGDIOBJ(hbm as *mut c_void));
+                let _ = SetStretchBltMode(hdc, HALFTONE);
+                let (dw, dh) = (96, 144);
+                let dx = rc.left + (card_w - dw) / 2;
+                let dy = rc.top + (SCREEN_THEME_CARD_H - dh) / 2;
+                let _ = StretchBlt(hdc, dx, dy, dw, dh, mem, 0, 0, 192, 288, SRCCOPY);
+                let _ = SelectObject(mem, old);
+                let _ = DeleteDC(mem);
+            }
+        }
+    }
+
+    if !font.is_invalid() {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, if checked { set_text() } else { set_hint() });
+    let mut text: Vec<u16> = title.encode_utf16().collect();
+    let mut size = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &text, &mut size);
+    let tw = size.cx.max(0);
+    let check_w = if checked { 22 } else { 0 };
+    let center = (rc.left + rc.right) / 2;
+    let name_left = center - (tw + check_w) / 2;
+    let name_top = rc.top + SCREEN_THEME_CARD_H + 6;
+    let mut trc = RECT {
+        left: name_left,
+        top: name_top,
+        right: name_left + tw,
+        bottom: name_top + 20,
+    };
+    let fmt = DRAW_TEXT_FORMAT(DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0);
+    let _ = DrawTextW(hdc, &mut text, &mut trc, fmt);
+    if checked {
+        let d = 16;
+        blit_ctl_bitmap_alpha(
+            hdc,
+            ctl_bitmap_alpha(d, d, CTL_KIND_CHECK),
+            name_left + tw + 6,
+            name_top + (20 - d) / 2,
+            d,
+            d,
+        );
+    }
+}
+
+/// 主题色卡：亮色＝白底黑字，暗色＝黑底白字，选中加蓝色描边（参考图样式）。
+unsafe fn draw_theme_card(
+    hdc: HDC,
+    rc: RECT,
+    label: &str,
+    checked: bool,
+    dark_card: bool,
+    font: HFONT,
+) {
+    let mut kind = CTL_KIND_THEME;
+    if checked {
+        kind |= 1;
+    }
+    if dark_card {
+        kind |= 2;
+    }
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    blit_ctl_bitmap(hdc, ctl_bitmap(w, h, kind), rc.left, rc.top, w, h);
+    if !font.is_invalid() {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    // 只有「暗色 + 已选中」是黑底，文字才需要反白
+    let _ = SetTextColor(
+        hdc,
+        if dark_card && checked {
+            settings_rgb(245, 245, 247)
+        } else {
+            set_text()
+        },
+    );
+    let mut text: Vec<u16> = label.encode_utf16().collect();
+    let mut trc = rc;
+    let fmt = DRAW_TEXT_FORMAT(DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0);
+    let _ = DrawTextW(hdc, &mut text, &mut trc, fmt);
+}
+
+/// 透明度滑条：灰轨道 + 蓝色已选段 + 圆形滑块（无极）。
+unsafe fn draw_opacity_slider(hdc: HDC, rc: RECT, value: u32) {
+    draw_level_slider(hdc, rc, value, OPACITY_MIN_PER_MILLE, OPACITY_MAX_PER_MILLE);
+}
+
+/// 无极滑条：灰轨道 + 已选段 + 圆形滑块，`min..max` 决定两端。
+unsafe fn draw_level_slider(hdc: HDC, rc: RECT, value: u32, min: u32, max: u32) {
+    let _ = FillRect(hdc, &rc, cached_brush("set_card", set_card_bg()));
+    let pad = 10;
+    let l = rc.left + pad;
+    let r = rc.right - pad;
+    if r <= l || max <= min {
+        return;
+    }
+    let cy = (rc.top + rc.bottom) / 2;
+    let ratio = (value.clamp(min, max) - min) as f32 / (max - min) as f32;
+    let cx = l + (ratio * (r - l) as f32).round() as i32;
+
+    let th = 6;
+    let old_brush = SelectObject(
+        hdc,
+        HGDIOBJ(cached_brush("set_sl_track", settings_rgb(229, 231, 235)).0),
+    );
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = RoundRect(hdc, l, cy - th / 2, r, cy + th / 2, th, th);
+    if cx > l {
+        let _ = SelectObject(hdc, HGDIOBJ(cached_brush("set_sl_fill", set_teal()).0));
+        let _ = RoundRect(hdc, l, cy - th / 2, cx.max(l + 1), cy + th / 2, th, th);
+    }
+    let _ = SelectObject(hdc, old_brush);
+    let _ = SelectObject(hdc, old_pen);
+
+    let d = 18;
+    blit_ctl_bitmap_alpha(
+        hdc,
+        ctl_bitmap_alpha(d, d, CTL_KIND_KNOB),
+        cx - d / 2,
+        cy - d / 2,
+        d,
+        d,
+    );
+}
+
+/// 滑条子类化：把鼠标位置换算成区间值并通知父窗口。
+unsafe extern "system" fn opacity_slider_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if let Some(r) = level_slider_common(
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+        OPACITY_MIN_PER_MILLE,
+        OPACITY_MAX_PER_MILLE,
+        IDC_OPACITY_VALUE,
+        10,
+        WM_SETTINGS_OPACITY,
+        WM_SETTINGS_OPACITY_DONE,
+        opacity_prop(),
+    ) {
+        return r;
+    }
+    let old = old_wndprocs()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(hwnd.0 as isize)).copied())
+        .unwrap_or(0);
+    let prev: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+}
+
+/// 小屏亮度滑条子类化（10% ~ 100%）。
+unsafe extern "system" fn brightness_slider_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if let Some(r) = level_slider_common(
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+        BRIGHT_MIN,
+        BRIGHT_MAX,
+        IDC_BRIGHT_VALUE,
+        1,
+        WM_SETTINGS_BRIGHTNESS,
+        WM_SETTINGS_BRIGHTNESS_DONE,
+        brightness_prop(),
+    ) {
+        return r;
+    }
+    let old = old_wndprocs()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(hwnd.0 as isize)).copied())
+        .unwrap_or(0);
+    let prev: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+}
+
+/// 滑条通用拖动逻辑：换算数值、写属性、更新百分比文字并通知父窗口。
+#[allow(clippy::too_many_arguments)]
+unsafe fn level_slider_common(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    min: u32,
+    max: u32,
+    label_id: usize,
+    label_div: u32,
+    notify: u32,
+    done: u32,
+    prop: PCWSTR,
+) -> Option<LRESULT> {
+    match msg {
+        WM_LBUTTONDOWN | WM_MOUSEMOVE => {
+            let down = (wparam.0 & 1) != 0 || msg == WM_LBUTTONDOWN;
+            if down {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let x = (lparam.0 as i16) as i32; // LOWORD
+                let pad = 10;
+                let (l, r) = (pad, (rc.right - pad).max(pad + 1));
+                let t = ((x - l) as f32 / (r - l) as f32).clamp(0.0, 1.0);
+                let v = min + (t * (max - min) as f32).round() as u32;
+                let _ = SetPropW(hwnd, prop, HANDLE(v as *mut c_void));
+                let _ = InvalidateRect(hwnd, None, TRUE);
+                // 同步父窗口里的百分比文字 + 即时预览
+                if let Ok(parent) = GetParent(hwnd) {
+                    if let Ok(lbl) = GetDlgItem(parent, label_id as i32) {
+                        let text: Vec<u16> = format!("{}%", v / label_div)
+                            .encode_utf16()
+                            .chain(Some(0))
+                            .collect();
+                        let _ = SetWindowTextW(lbl, PCWSTR(text.as_ptr()));
+                    }
+                    let _ = SendMessageW(parent, notify, WPARAM(v as usize), LPARAM(0));
+                }
+                if msg == WM_LBUTTONDOWN {
+                    let _ = SetCapture(hwnd);
+                }
+                return Some(LRESULT(0));
+            }
+        }
+        WM_LBUTTONUP => {
+            let _ = ReleaseCapture();
+            // 松手才落盘：拖动期间只做即时预览，避免每帧写配置文件
+            if let Ok(parent) = GetParent(hwnd) {
+                let _ = SendMessageW(parent, done, WPARAM(0), LPARAM(0));
+            }
+            return Some(LRESULT(0));
+        }
+        _ => {}
+    }
+    None
+}
+
+/// 分段控件某一颗的左右圆角：每组首尾各圆外角，中间保持直角，拼成一条完整轨道。
+fn segment_corners(id: usize) -> (bool, bool) {
+    match segment_group(id) {
+        Some((base, n)) => (id == base, id == base + n - 1),
+        None => (true, true),
+    }
+}
+
+/// 开关行：左侧标签 + 右侧 iOS 风格开关（整行可点）。
+unsafe fn draw_switch_row(hdc: HDC, rc: RECT, label: &str, on: bool, font: HFONT) {
+    if !font.is_invalid() {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, set_text());
+    let mut text: Vec<u16> = label.encode_utf16().collect();
+    let mut trc = RECT {
+        left: rc.left + 4,
+        top: rc.top,
+        right: rc.right - 52,
+        bottom: rc.bottom,
+    };
+    let fmt = DRAW_TEXT_FORMAT(DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0);
+    let _ = DrawTextW(hdc, &mut text, &mut trc, fmt);
+
+    let tw = 44;
+    let th = 24;
+    let left = rc.right - 4 - tw;
+    let top = rc.top + (rc.bottom - rc.top - th) / 2;
+    let kind = if on { 1 } else { CTL_KIND_SWITCH };
+    blit_ctl_bitmap(hdc, ctl_bitmap(tw, th, kind), left, top, tw, th);
+}
+
+/// 分段控件的一颗：灰底轨道 + 选中项白底小卡（参考图样式，抗锯齿）。
+unsafe fn draw_segment(hdc: HDC, rc: RECT, label: &str, checked: bool, font: HFONT, id: usize) {
+    let (round_l, round_r) = segment_corners(id);
+    let mut kind = CTL_KIND_SEGMENT | if checked { 1 } else { 0 };
+    if round_l {
+        kind |= 2;
+    }
+    if round_r {
+        kind |= 4;
+    }
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    blit_ctl_bitmap(hdc, ctl_bitmap(w, h, kind), rc.left, rc.top, w, h);
+    if !font.is_invalid() {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, set_text());
+    let mut text: Vec<u16> = label.encode_utf16().collect();
+    let mut trc = rc;
+    let fmt = DRAW_TEXT_FORMAT(DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0);
+    let _ = DrawTextW(hdc, &mut text, &mut trc, fmt);
+}
+
+/// 分组标题右侧的收起 / 展开箭头（抗锯齿位图）。
+unsafe fn draw_chevron(hdc: HDC, rc: RECT, collapsed: bool) {
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    let kind = if collapsed {
+        CTL_KIND_CHEVRON
+    } else {
+        CTL_KIND_CHEVRON + 1
+    };
+    blit_ctl_bitmap(hdc, ctl_bitmap(w, h, kind), rc.left, rc.top, w, h);
+}
+
+/// 悬停 / 按下时的按钮底色：主按钮（确定）用墨青的亮暗两档，次按钮用浅灰两档。
 fn settings_btn_fill(primary: bool, hot: bool, down: bool) -> (&'static str, COLORREF) {
     if primary {
         if down {
-            ("set_teal_down", settings_rgb(9, 52, 47))
+            ("set_teal_down", settings_rgb(0x00, 0x2A, 0x2A))
         } else if hot {
-            ("set_teal_hot", settings_rgb(20, 88, 80))
+            ("set_teal_hot", settings_rgb(0x00, 0x5A, 0x5A))
         } else {
             ("set_teal", set_teal())
         }
     } else if down {
-        ("set_btn2_down", settings_rgb(214, 224, 220))
+        ("set_btn2_down", settings_rgb(226, 229, 234))
     } else if hot {
-        ("set_btn2_hot", settings_rgb(228, 235, 231))
+        ("set_btn2_hot", settings_rgb(240, 242, 245))
     } else {
-        ("set_btn2", settings_rgb(237, 241, 239))
+        ("set_btn2", settings_rgb(246, 247, 249))
     }
 }
 
@@ -3776,8 +5072,8 @@ unsafe fn draw_pill_icon(hdc: HDC, left: i32, top: i32, color: COLORREF) {
     let _ = DeleteObject(HGDIOBJ(rgn.0));
 }
 
-/// 左侧导航图标（Segoe 图标字体的码位）：地球 / 卡片 / 显示器 / 信息
-const NAV_ICONS: [u16; 4] = [0xE774, 0xE7B8, 0xE7F4, 0xE946];
+/// 左侧导航图标（Segoe 图标字体的码位）：地球 / 卡片 / 显示器 / 调色板 / 信息
+const NAV_ICONS: [u16; 5] = [0xE774, 0xE7B8, 0xE7F4, 0xE790, 0xE946];
 
 /// 导航图标字体：优先 Segoe Fluent Icons（Win11），回退 Segoe MDL2 Assets（Win10）。
 fn create_nav_icon_font() -> HFONT {
@@ -3845,10 +5141,11 @@ fn settings_refresh_screen_buttons(hwnd: HWND) {
 /// 切页：只显示 `page` 那一页的控件，其余页整组隐藏。
 /// 覆盖静态标签、编辑框、复选框、单选钮与分隔线（都按 ID 定位）。
 fn settings_show_page(hwnd: HWND, page: usize) {
-    let pages: [&[usize]; 4] = [
+    let pages: [&[usize]; 5] = [
         &PAGE_CONN_IDS,
         &PAGE_CAP_IDS,
         &PAGE_SCREEN_IDS,
+        &PAGE_THEME_IDS,
         &PAGE_ABOUT_IDS,
     ];
     for (i, ids) in pages.iter().enumerate() {
@@ -3862,6 +5159,319 @@ fn settings_show_page(hwnd: HWND, page: usize) {
                 }
             }
         }
+    }
+}
+
+/// 页头：标题跟着页签走；「恢复默认」只在胶囊 / 小屏 / 小屏主题页出现。
+fn settings_apply_page_header(hwnd: HWND, page: usize) {
+    let title = TAB_LABELS.get(page).copied().unwrap_or(TAB_LABELS[0]);
+    set_dlg_text(hwnd, IDC_PAGE_TITLE as i32, title);
+    let show_reset = page == 1 || page == 2 || page == 3;
+    unsafe {
+        if let Ok(btn) = GetDlgItem(hwnd, IDC_PAGE_RESET as i32) {
+            let _ = ShowWindow(btn, if show_reset { SW_SHOW } else { SW_HIDE });
+        }
+    }
+}
+
+/// 说明气泡宽度（像素）
+const TOOLTIP_W: i32 = 320;
+
+/// 悬停说明图标：按当前图标下标显示气泡（位置随图标，超出底部则翻到上方）。
+fn settings_show_hint(state: &mut AppState, hwnd: HWND, icon_id: usize) {
+    unsafe {
+        let idx = match icon_id.checked_sub(IDC_HINT_ICON_BASE) {
+            Some(i) if i < HINT_COUNT => i,
+            _ => return,
+        };
+        let Ok(tip) = GetDlgItem(hwnd, IDC_TOOLTIP as i32) else {
+            return;
+        };
+        let Ok(icon) = GetDlgItem(hwnd, icon_id as i32) else {
+            return;
+        };
+
+        // 先量出换行后的文字高度
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return;
+        }
+        if !state.settings_font.is_invalid() {
+            let _ = SelectObject(hdc, HGDIOBJ(state.settings_font.0));
+        }
+        let mut text: Vec<u16> = HINT_TEXTS[idx].encode_utf16().collect();
+        let mut calc = RECT {
+            left: 0,
+            top: 0,
+            right: TOOLTIP_W - 24,
+            bottom: 0,
+        };
+        let calc_fmt = DRAW_TEXT_FORMAT(DT_CALCRECT.0 | DT_WORDBREAK.0 | DT_NOPREFIX.0);
+        let _ = DrawTextW(hdc, &mut text, &mut calc, calc_fmt);
+        let _ = ReleaseDC(None, hdc);
+        let h = (calc.bottom + 24).max(44);
+
+        // 气泡贴着图标：默认向下展开，放不下就翻到上方
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(icon, &mut rc);
+        let mut origin = POINT::default();
+        let _ = ClientToScreen(hwnd, &mut origin);
+        let icon_left = rc.left - origin.x;
+        let icon_top = rc.top - origin.y;
+        let icon_bottom = rc.bottom - origin.y;
+        let max_x = (SETTINGS_CLIENT_W - TOOLTIP_W - 16).max(16);
+        let x = (icon_left - 12).clamp(16, max_x);
+        let footer = SETTINGS_CLIENT_H - 60;
+        let mut y = icon_bottom + 8;
+        if y + h > footer {
+            y = (icon_top - h - 8).max(16);
+        }
+        let _ = SetWindowPos(
+            tip,
+            HWND_TOP,
+            x,
+            y,
+            TOOLTIP_W,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        state.settings_hint_on = idx;
+        let _ = InvalidateRect(tip, None, TRUE);
+    }
+}
+
+/// 鼠标离开说明图标：收起气泡。
+fn settings_hide_hint(state: &mut AppState, hwnd: HWND) {
+    if state.settings_hint_on == usize::MAX {
+        return;
+    }
+    state.settings_hint_on = usize::MAX;
+    unsafe {
+        if let Ok(tip) = GetDlgItem(hwnd, IDC_TOOLTIP as i32) {
+            let _ = ShowWindow(tip, SW_HIDE);
+        }
+    }
+}
+
+/// 说明图标子类化：进入发「显示气泡」、离开发「收起气泡」，其余消息转回原窗口过程。
+unsafe extern "system" fn hint_icon_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_MOUSEMOVE {
+        if let Ok(parent) = GetParent(hwnd) {
+            let id = GetDlgCtrlID(hwnd) as usize;
+            let _ = SendMessageW(parent, WM_SETTINGS_HINT_SHOW, WPARAM(id), LPARAM(0));
+        }
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let _ = TrackMouseEvent(&mut tme);
+    } else if msg == WM_MOUSELEAVE {
+        if let Ok(parent) = GetParent(hwnd) {
+            let _ = SendMessageW(parent, WM_SETTINGS_HINT_HIDE, WPARAM(0), LPARAM(0));
+        }
+    }
+    let old = old_wndprocs()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(hwnd.0 as isize)).copied())
+        .unwrap_or(0);
+    let prev: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+}
+
+/// 给 4 个说明图标挂子类过程。
+fn subclass_hint_icons(hwnd: HWND) {
+    unsafe {
+        for i in 0..HINT_COUNT {
+            let Ok(ctl) = GetDlgItem(hwnd, (IDC_HINT_ICON_BASE + i) as i32) else {
+                continue;
+            };
+            if ctl.is_invalid() {
+                continue;
+            }
+            let key = ctl.0 as isize;
+            let mut map = match old_wndprocs().lock() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if map.contains_key(&key) {
+                continue;
+            }
+            let old = SetWindowLongPtrW(ctl, GWLP_WNDPROC, hint_icon_proc as usize as isize);
+            map.insert(key, old);
+        }
+    }
+}
+
+/// 说明气泡绘制：白底圆角 + 细边 + 自动换行的灰字。
+unsafe fn draw_tooltip(hdc: HDC, rc: RECT, text: &str, font: HFONT) {
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    blit_ctl_bitmap(
+        hdc,
+        ctl_bitmap(w, h, CTL_KIND_TOOLTIP),
+        rc.left,
+        rc.top,
+        w,
+        h,
+    );
+    if !font.is_invalid() {
+        let _ = SelectObject(hdc, HGDIOBJ(font.0));
+    }
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, settings_rgb(58, 66, 78));
+    let mut buf: Vec<u16> = text.encode_utf16().collect();
+    let mut trc = RECT {
+        left: rc.left + 12,
+        top: rc.top + 12,
+        right: rc.right - 12,
+        bottom: rc.bottom - 12,
+    };
+    let fmt = DRAW_TEXT_FORMAT(DT_LEFT.0 | DT_TOP.0 | DT_WORDBREAK.0 | DT_NOPREFIX.0);
+    let _ = DrawTextW(hdc, &mut buf, &mut trc, fmt);
+}
+
+/// 小屏页「显示项目」单行开关所占高度（收起时把下方主题区整体上移）。
+const SCREEN_ITEMS_BLOCK_H: i32 = 38;
+
+/// 收起 / 展开「显示项目」：隐藏项目开关行，并把主题与刷新区整体平移到收起后的位置。
+/// `page_visible` 为 false（当前不在小屏页）时，开关行必须保持隐藏，
+/// 否则切页回到别的页会把这些开关「露」到当前页上。
+fn settings_apply_items_collapsed(hwnd: HWND, collapsed: bool, page_visible: bool) {
+    unsafe {
+        let show_items = page_visible && !collapsed;
+        for i in 0..SCREEN_ITEM_COUNT {
+            if let Ok(ctl) = GetDlgItem(hwnd, (IDC_SCREEN_ITEM_BASE + i) as i32) {
+                let _ = ShowWindow(ctl, if show_items { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        // 小屏页基准 y＝84；下面是各控件在展开态的绝对 y（与 WM_CREATE 中的布局一致）
+        const S0: i32 = 84;
+        let shift = if collapsed { -SCREEN_ITEMS_BLOCK_H } else { 0 };
+        let moving = [
+            (IDC_SCREEN_SEP2, S0 + 180),
+            (IDC_SCREEN_LBL_REFRESH, S0 + 196),
+            (IDC_SCREEN_REFRESH_COMBO, S0 + 190),
+        ];
+        let mut origin = POINT::default();
+        let _ = ClientToScreen(hwnd, &mut origin);
+        for (id, y) in moving {
+            if let Ok(ctl) = GetDlgItem(hwnd, id as i32) {
+                let mut rc = RECT::default();
+                if GetWindowRect(ctl, &mut rc).is_ok() {
+                    let _ = SetWindowPos(
+                        ctl,
+                        None,
+                        rc.left - origin.x,
+                        y + shift,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+        if let Ok(btn) = GetDlgItem(hwnd, IDC_ITEMS_TOGGLE as i32) {
+            let _ = InvalidateRect(btn, None, TRUE);
+        }
+    }
+}
+
+/// 应用主题页滚动偏移：移动容器里的卡片并同步滚动条位置。
+fn apply_theme_scroll(state: &mut AppState, hwnd: HWND, offset: i32) {
+    let off = offset.clamp(0, THEME_SCROLL_MAX);
+    state.theme_scroll = off;
+    unsafe {
+        let Ok(view) = GetDlgItem(hwnd, IDC_THEME_VIEW as i32) else {
+            return;
+        };
+        for pos in 0..THEME_CARD_ORDER.len() {
+            let Ok(card) = GetDlgItem(view, (IDC_SCREEN_THEME_CARD_BASE + pos) as i32) else {
+                continue;
+            };
+            let x = 8 + (pos % 2) as i32 * 272;
+            let y = (pos / 2) as i32 * 216 - off;
+            // NOCOPYBITS：不让系统把旧位置的像素拷到新位置，避免滚动残影
+            let _ = SetWindowPos(
+                card,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOCOPYBITS,
+            );
+        }
+        // 旧位置露出的区域需要按底色重刷；TRUE = 连背景一起擦
+        let _ = InvalidateRect(view, None, TRUE);
+        if let Ok(sb) = GetDlgItem(hwnd, IDC_THEME_SCROLL as i32) {
+            let _ = SendMessageW(sb, SBM_SETPOS_MSG, WPARAM(off as usize), LPARAM(1));
+        }
+    }
+}
+
+/// 页头「恢复默认」：只改当前页的控件状态（胶囊页连主题 / 透明度一起即时预览）。
+fn settings_restore_defaults(state: &mut AppState, hwnd: HWND) {
+    match state.settings_tab {
+        1 => {
+            for i in 0..THEME_LABELS.len() {
+                set_check_state(hwnd, IDC_THEME_BASE + i, i == 0);
+            }
+            set_opacity_per_mille(hwnd, OPACITY_MAX_PER_MILLE);
+            for i in 0..ORIENT_LABELS.len() {
+                set_check_state(hwnd, IDC_ORIENT_BASE + i, i == 0);
+            }
+            for i in 0..STYLE_LABELS.len() {
+                set_check_state(hwnd, IDC_STYLE_BASE + i, i == 0);
+            }
+            for i in 0..CARD_COUNT {
+                set_check_state(hwnd, IDC_CARD_BASE + i, true);
+            }
+            set_check_state(hwnd, IDC_CLICK_OUTSIDE_CHK, true);
+            set_check_state(hwnd, IDC_FS_CHK, true);
+            state.settings_card_order = crate::config::DEFAULT_CARD_ORDER;
+            let names: Vec<&str> = CARD_LABELS.to_vec();
+            set_dlg_text(
+                hwnd,
+                IDC_CARDS_HINT as i32,
+                &format!("面板顺序：{}", names.join(" → ")),
+            );
+            apply_settings_preview(state, hwnd);
+        }
+        2 => {
+            for i in 0..SCREEN_LABELS.len() {
+                set_check_state(hwnd, IDC_SCREEN_BASE + i, i == 0);
+            }
+            let defaults = [true, true, true, true, true];
+            for (i, on) in defaults.iter().enumerate() {
+                set_check_state(hwnd, IDC_SCREEN_ITEM_BASE + i, *on);
+            }
+            unsafe {
+                if let Ok(combo) = GetDlgItem(hwnd, IDC_SCREEN_REFRESH_COMBO as i32) {
+                    let _ = SendMessageW(combo, CB_SETCURSEL_MSG, WPARAM(1), LPARAM(0));
+                }
+            }
+            set_brightness_percent(hwnd, 50);
+        }
+        3 => {
+            let default_theme = crate::config::DEFAULT_SCREEN_THEME.to_string();
+            state.config.screen.theme = default_theme.clone();
+            let idx = crate::config::SCREEN_THEMES
+                .iter()
+                .position(|v| *v == default_theme)
+                .unwrap_or(0);
+            let pos = THEME_CARD_ORDER.iter().position(|&t| t == idx).unwrap_or(0);
+            for i in 0..SCREEN_THEME_LABELS.len() {
+                set_check_state(hwnd, IDC_SCREEN_THEME_CARD_BASE + i, i == pos);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3889,28 +5499,183 @@ fn apply_settings_preview(state: &mut AppState, hwnd: HWND) {
     rings_paint(state, true); // 任务栏三环是独立窗口，单独刷一次
 }
 
-/// 还原即时预览（点"取消"或直接关窗时）：退回打开设置窗时的主题与透明度并重绘。
-/// 快照已被"确定"取走（None）时什么都不做。
-fn restore_settings_preview(state: &mut AppState) {
-    let Some((theme, opacity)) = state.settings_orig.take() else {
-        return;
+/// 小屏运行时相关的配置是否有变化（显示模式只影响胶囊，不需要重启小屏进程）。
+/// 只有「必须重启小屏进程才能生效」的字段变化才返回 true。
+/// 亮度与刷新间隔是热更新项（小屏每拍重读配置），不在此列——重启会重新初始化设备并闪屏。
+fn screen_runtime_changed(
+    a: &crate::config::ScreenConfig,
+    b: &crate::config::ScreenConfig,
+) -> bool {
+    a.enabled != b.enabled
+        || a.orientation != b.orientation
+        || a.theme != b.theme
+        || a.cpu != b.cpu
+        || a.memory != b.memory
+        || a.gpu != b.gpu
+        || a.network != b.network
+        || a.disk != b.disk
+        || a.storage != b.storage
+        || a.temp != b.temp
+        || a.clock != b.clock
+}
+
+/// 把设置窗里的开关 / 分段 / 卡片 / 小屏项目 / 刷新间隔写进配置，**立即落盘并生效**。
+/// 地址与令牌是文本输入，仍由「确定」提交。
+fn settings_commit_options(state: &mut AppState, hwnd: HWND) {
+    let was_pinned = state.config.capsule.taskbar_pin;
+    let was_big = state.config.capsule.expand_big();
+    let old_screen = state.config.screen.clone();
+
+    let theme_idx = (0..THEME_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_THEME_BASE + i))
+        .unwrap_or(0);
+    state.config.capsule.theme = crate::config::THEMES[theme_idx].to_string();
+    state.config.capsule.opacity = read_opacity(hwnd);
+    state.config.capsule.click_outside_collapse = is_checked(hwnd, IDC_CLICK_OUTSIDE_CHK);
+    state.config.capsule.hide_on_fullscreen = is_checked(hwnd, IDC_FS_CHK);
+    let orient_idx = (0..ORIENT_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_ORIENT_BASE + i))
+        .unwrap_or(0);
+    state.config.capsule.orientation = crate::config::ORIENTATIONS[orient_idx].to_string();
+    let style_idx = (0..STYLE_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_STYLE_BASE + i))
+        .unwrap_or(0);
+    state.config.capsule.expand_style = crate::config::EXPAND_STYLES[style_idx].to_string();
+    let screen_idx = (0..SCREEN_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_SCREEN_BASE + i))
+        .unwrap_or(0);
+    state.config.screen.orientation = crate::config::SCREEN_ORIENTATIONS[screen_idx].to_string();
+    // 小屏配色：卡片位置按 THEME_CARD_ORDER 映射回 SCREEN_THEMES 下标。
+    // 没有卡片被选中说明当前用的是自定义主题（如 pulsecore），此时保持原值不改写。
+    if let Some(theme_pos) =
+        (0..SCREEN_THEME_LABELS.len()).find(|&i| is_checked(hwnd, IDC_SCREEN_THEME_CARD_BASE + i))
+    {
+        let screen_theme_idx = THEME_CARD_ORDER.get(theme_pos).copied().unwrap_or(0);
+        state.config.screen.theme = crate::config::SCREEN_THEMES[screen_theme_idx].to_string();
+    }
+    // 显示模式：胶囊模式 / 三环模式 / 机箱小屏模式（决定是否隐藏悬浮胶囊与任务栏三环）
+    let mode_idx = (0..SCREEN_MODE_LABELS.len())
+        .find(|&i| is_checked(hwnd, IDC_SCREEN_MODE_BASE + i))
+        .unwrap_or(0);
+    state.config.screen.mode = crate::config::SCREEN_MODES[mode_idx].to_string();
+    // 三环模式＝固定到任务栏；小屏模式＝取消固定（悬浮窗整体隐藏）
+    if state.config.screen.mode == crate::config::SCREEN_MODE_RINGS {
+        state.config.capsule.taskbar_pin = true;
+    } else if state.config.screen.mode == crate::config::SCREEN_MODE_SCREEN {
+        state.config.capsule.taskbar_pin = false;
+    }
+    // 小屏显示项目：独立于 config.capsule.cards，单独读写
+    let items = read_screen_items(hwnd);
+    state.config.screen.cpu = items[0];
+    state.config.screen.memory = items[1];
+    state.config.screen.gpu = items[2];
+    state.config.screen.network = items[3];
+    state.config.screen.disk = items[4];
+    // 存储 / 温度 / 时钟 已从设置页移除，固定关闭
+    state.config.screen.storage = false;
+    state.config.screen.temp = false;
+    state.config.screen.clock = false;
+    state.config.screen.interval = read_screen_interval(hwnd);
+    state.config.screen.brightness = brightness_percent(hwnd) as u8;
+    // 展开样式只影响展开形态：切换时先收起，避免旧面板几何残留
+    if was_big != state.config.capsule.expand_big() && state.view.expanded() {
+        collapse(state);
+    }
+    let mut picked = read_cards(hwnd);
+    // 兜底：手改配置把六项全关掉时，按"至少保留一张卡片"回到全开
+    if !picked.any() {
+        picked = CardVis::default();
+    } else {
+        // 顺序取设置窗里记录的勾选先后
+        picked.order = state.settings_card_order;
+    }
+    state.config.capsule.cards = picked;
+
+    // 方向变了：先落到该方向的默认位置（竖条贴右缘 / 横条贴顶边），
+    // 免得横竖互相"卡"在对方的位置上；再统一应用布局
+    let want_v = state.config.capsule.orientation_hint() == Some(true);
+    let cur_v = match state.shared.read() {
+        Ok(g) => g.vertical,
+        Err(e) => {
+            eprintln!("[App] RwLock poisoned in settings_commit_options: {:?}", e);
+            return;
+        }
     };
-    state.config.capsule.theme = theme;
-    state.config.capsule.opacity = opacity;
-    let dark = state.config.capsule.theme_dark();
+    if want_v != cur_v {
+        let (cw, _) = collapsed_main_size(want_v);
+        let (dx, dy) = default_capsule_pos(cw as i32, want_v);
+        state.config.capsule.x = Some(dx);
+        state.config.capsule.y = Some(dy);
+        let _ = unsafe {
+            SetWindowPos(
+                state.hwnd,
+                None,
+                dx,
+                dy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+    let _ = crate::config::save(&state.config);
+
+    // 小屏配置变化：重启进程才会读取新配置（未启用时收掉残留进程）
+    if screen_runtime_changed(&old_screen, &state.config.screen) {
+        if state.config.screen.enabled {
+            restart_native_screen(&state.shared, &state.config.screen);
+        } else {
+            stop_screen_engine();
+        }
+        settings_update_screen_status(hwnd, &state.config.screen);
+        settings_refresh_screen_buttons(hwnd);
+    } else if old_screen.interval != state.config.screen.interval
+        || old_screen.brightness != state.config.screen.brightness
+    {
+        // 热更新项：只重写配置文件，小屏运行期自己重读，不重启进程（避免设备重新初始化闪屏）
+        crate::screen_native::rewrite_config(&state.config.screen);
+    }
+
+    // "点击面板外自动收起"即时生效：面板正开着就立刻挂/撤全局鼠标钩子
+    if state.view.expanded() {
+        if state.config.capsule.click_outside_collapse {
+            mouse_hook_install();
+        } else {
+            mouse_hook_remove();
+        }
+    }
+
+    // 立即生效：主题/掩码/卡片同步给渲染侧并强制重绘一帧
     {
         let mut sh = match state.shared.write() {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("[App] RwLock poisoned in restore_settings_preview: {:?}", e);
+                eprintln!(
+                    "[App] RwLock poisoned in settings_commit_options final sync: {:?}",
+                    e
+                );
                 return;
             }
         };
-        sh.dark = dark;
+        sh.dark = state.config.capsule.theme_dark();
+        sh.cards = state.config.capsule.cards;
+        sh.big = state.config.capsule.expand_big();
         sh.bump_seq();
     }
-    paint_frame(state, true);
-    rings_paint(state, true);
+    if state.config.capsule.taskbar_pin != was_pinned {
+        apply_taskbar_pin(state);
+    } else {
+        // 方向/位置变化在这里落定，再强制重绘一帧
+        apply_layout(state, true);
+        resize_window(state);
+        paint_frame(state, true);
+    }
+
+    // 刚关掉"全屏应用时自动隐藏"时，若此前正被全屏藏起来，这里立刻恢复
+    sync_fullscreen_state(state);
+
+    // 显示模式：小屏模式隐藏悬浮窗/三环，切回胶囊模式按当前固定/展开状态恢复
+    apply_screen_mode(state);
 }
 
 fn settings_wndproc_impl(
@@ -3953,22 +5718,49 @@ fn settings_wndproc_impl(
                     h
                 };
                 let set_check = |id: usize, on: bool| {
-                    let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
-                    let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(on as usize), LPARAM(0));
+                    set_check_state(hwnd, id, on);
+                };
+                /// 指定父窗口创建子控件（滚动容器里的卡片用）
+                let mk_in = |parent: HWND,
+                             class: &str,
+                             text: &str,
+                             style: WINDOW_STYLE,
+                             x: i32,
+                             y: i32,
+                             w: i32,
+                             h: i32,
+                             id: usize| {
+                    let h = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        pcwstr(class),
+                        pcwstr(text),
+                        WS_CHILD | WS_VISIBLE | style,
+                        x,
+                        y,
+                        w,
+                        h,
+                        parent,
+                        HMENU(id as *mut c_void),
+                        GetModuleHandleW(None).unwrap_or_default(),
+                        None,
+                    )
+                    .unwrap_or_default();
+                    child_font(h, font);
+                    h
                 };
 
-                // 左侧导航栏：顶部 logo + 应用名 + 三个竖排入口（参考图样式）
+                // 左侧导航栏：logo + 应用名 + 版本 + 按域分组的入口
                 let logo = mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(SS_ICON_STYLE | SS_CENTERIMAGE_STYLE),
-                    (SETTINGS_SIDEBAR_W - 68) / 2,
-                    16,
-                    68,
-                    68,
+                    (SETTINGS_SIDEBAR_W - 56) / 2,
+                    18,
+                    56,
+                    56,
                     IDC_SIDEBAR_TITLE,
                 );
-                let icon = app_icon_at(64);
+                let icon = app_icon_at(56);
                 if !icon.is_invalid() {
                     let _ = SendMessageW(
                         logo,
@@ -3982,38 +5774,89 @@ fn settings_wndproc_impl(
                     "核桃胶囊",
                     WINDOW_STYLE(SS_CENTER_STYLE),
                     0,
-                    88,
+                    80,
                     SETTINGS_SIDEBAR_W,
                     20,
                     IDC_SIDEBAR_NAME,
                 );
+                mk_child(
+                    "STATIC",
+                    concat!("v", env!("CARGO_PKG_VERSION")),
+                    WINDOW_STYLE(SS_CENTER_STYLE),
+                    0,
+                    102,
+                    SETTINGS_SIDEBAR_W,
+                    16,
+                    IDC_SIDEBAR_VERSION,
+                );
+                // 导航四项平铺（不再显示「设备 / 扩展 / 应用」分组标题）
                 for (i, label) in TAB_LABELS.iter().enumerate() {
                     mk_child(
                         "BUTTON",
                         label,
                         WINDOW_STYLE(BS_OWNERDRAW as u32),
-                        10,
-                        124 + i as i32 * 42,
-                        SETTINGS_SIDEBAR_W - 20,
-                        34,
+                        12,
+                        138 + i as i32 * 42,
+                        SETTINGS_SIDEBAR_W - 24,
+                        36,
                         IDC_TAB_BASE + i,
                     );
                 }
                 state.settings_tab = 0;
 
-                // 页内容从 y = 20 起（导航已挪到左侧栏，顶部不再留标签栏的空档）
+                // 页头：大标题 + 右上角「恢复默认」+ 1px 分隔线
+                let title = mk_child(
+                    "STATIC",
+                    TAB_LABELS[0],
+                    WINDOW_STYLE(0),
+                    PAD,
+                    18,
+                    320,
+                    34,
+                    IDC_PAGE_TITLE,
+                );
+                if !state.about_title_font.is_invalid() {
+                    let _ = SendMessageW(
+                        title,
+                        WM_SETFONT,
+                        WPARAM(state.about_title_font.0 as usize),
+                        LPARAM(1),
+                    );
+                }
+                mk_child(
+                    "BUTTON",
+                    "恢复默认",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    SETTINGS_CLIENT_W - 28 - 96,
+                    24,
+                    96,
+                    28,
+                    IDC_PAGE_RESET,
+                );
+                mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
+                    PAD,
+                    62,
+                    CW,
+                    1,
+                    IDC_HEAD_SEP,
+                );
+
+                // 底部按钮所在 y（内容区到 594 为止）
                 let btn_y = SETTINGS_CLIENT_H - 16 - 30;
 
                 // ---- 页一：连接 ----
-                let c0 = 20; // 连接页基准 y
+                let c0 = 80; // 连接页基准 y
                 mk_child(
                     "STATIC",
-                    "连接",
+                    "服务器",
                     WINDOW_STYLE(0),
                     PAD,
                     c0,
                     200,
-                    18,
+                    16,
                     IDC_SEC_CONN,
                 );
                 mk_child(
@@ -4021,41 +5864,53 @@ fn settings_wndproc_impl(
                     "地址（host:port）",
                     WINDOW_STYLE(0),
                     PAD,
-                    c0 + 24,
-                    CW,
-                    16,
+                    c0 + 31,
+                    124,
+                    18,
                     IDC_CONN_LBL_ADDR,
                 );
+                // 地址框与下方令牌框同宽，右缘对齐（右侧留出显示 / 测试按钮的宽度）
+                let field_w = CW - 132 - 96 - 64 - 16;
                 mk_child(
                     "EDIT",
                     &state.config.nas.addr(),
                     WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32),
-                    PAD,
-                    c0 + 42,
-                    CW,
-                    26,
+                    PAD + 132,
+                    c0 + 24,
+                    field_w,
+                    32,
                     IDC_ADDR_EDIT,
                 );
                 mk_child(
                     "STATIC",
-                    "配对令牌（见 NAS 管理页）",
+                    "配对令牌",
                     WINDOW_STYLE(0),
                     PAD,
-                    c0 + 76,
-                    CW,
-                    16,
+                    c0 + 79,
+                    124,
+                    18,
                     IDC_CONN_LBL_TOKEN,
                 );
-                // 令牌默认打码（* 号），右侧「显示 / 隐藏」按钮切换
-                let token_w = CW - 72;
+                // 令牌说明收进 ⓘ：悬停显示「在 NAS 管理页查看 / 复制」
+                mk_child(
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 68,
+                    c0 + 80,
+                    16,
+                    16,
+                    IDC_HINT_ICON_BASE + 4,
+                );
+                // 令牌默认打码（* 号）；「显示 / 测试连接」与输入框同一行
                 let token_edit = mk_child(
                     "EDIT",
                     &state.config.nas.token,
                     WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32),
-                    PAD,
-                    c0 + 94,
-                    token_w,
-                    26,
+                    PAD + 132,
+                    c0 + 72,
+                    field_w,
+                    32,
                     IDC_TOKEN_EDIT,
                 );
                 let _ = SendMessageW(
@@ -4068,56 +5923,62 @@ fn settings_wndproc_impl(
                     "BUTTON",
                     "显示",
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
-                    PAD + token_w + 8,
-                    c0 + 94,
+                    PAD + 132 + field_w + 8,
+                    c0 + 72,
                     64,
-                    26,
+                    32,
                     IDC_TOKEN_EYE,
                 );
                 mk_child(
                     "BUTTON",
                     "测试连接",
                     WINDOW_STYLE(BS_OWNERDRAW as u32),
-                    PAD,
-                    c0 + 128,
-                    88,
-                    28,
+                    PAD + 132 + field_w + 8 + 64 + 8,
+                    c0 + 72,
+                    96,
+                    32,
                     IDC_TEST_BUTTON,
                 );
                 mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(0),
-                    PAD + 98,
-                    c0 + 134,
-                    CW - 98,
+                    PAD,
+                    c0 + 112,
+                    CW,
                     18,
                     IDC_TEST_RESULT,
                 );
-                // 模式：胶囊模式（悬浮窗）/ 机箱小屏模式（只喂外接小屏）
                 mk_child(
                     "STATIC",
-                    "模式",
+                    "",
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
+                    PAD,
+                    c0 + 140,
+                    CW,
+                    1,
+                    IDC_CONN_SEP,
+                );
+                mk_child(
+                    "STATIC",
+                    "界面",
                     WINDOW_STYLE(0),
                     PAD,
-                    c0 + 170,
-                    48,
-                    22,
-                    IDC_SCREEN_LBL_MODE,
+                    c0 + 156,
+                    200,
+                    16,
+                    IDC_CONN_LBL_UI,
                 );
-                let mode_x = [PAD + 56, PAD + 144, PAD + 232];
-                let mode_w = [88, 88, 120];
+                // 显示模式：三张示意图卡片（胶囊 / 三环 / 小屏）
                 for (i, label) in SCREEN_MODE_LABELS.iter().enumerate() {
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        mode_x[i],
-                        c0 + 170,
-                        mode_w[i],
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        PAD + i as i32 * 180,
+                        c0 + 178,
+                        MODE_CARD_W,
+                        MODE_CARD_TOTAL_H,
                         IDC_SCREEN_MODE_BASE + i,
                     );
                 }
@@ -4126,29 +5987,20 @@ fn settings_wndproc_impl(
                     .position(|v| *v == state.config.screen.mode)
                     .unwrap_or(0);
                 set_check(IDC_SCREEN_MODE_BASE + mode_idx, true);
+                // 连接页说明：改为「服务器」标题旁的 ⓘ，悬停显示
                 mk_child(
-                    "STATIC",
-                    "点“确定”后连接设置才会保存并立即生效",
-                    WINDOW_STYLE(0),
-                    PAD,
-                    c0 + 200,
-                    CW,
-                    16,
-                    IDC_CONN_HINT,
-                );
-                mk_child(
-                    "STATIC",
+                    "BUTTON",
                     "",
-                    WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
-                    PAD,
-                    c0 + 226,
-                    CW,
-                    2,
-                    IDC_CONN_SEP,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 46,
+                    c0 + 1,
+                    16,
+                    16,
+                    IDC_HINT_ICON_BASE,
                 );
 
-                // ---- 页二：胶囊（显示卡片 + 主题 / 透明度 / 方向 / 样式 / 开关）----
-                let k0 = 20; // 胶囊页基准 y
+                // ---- 页二：胶囊（显示卡片 + 外观 + 行为）----
+                let k0 = 80; // 胶囊页基准 y
                 mk_child(
                     "STATIC",
                     "显示卡片",
@@ -4156,36 +6008,36 @@ fn settings_wndproc_impl(
                     PAD,
                     k0,
                     200,
-                    18,
+                    16,
                     IDC_SEC_CARDS,
                 );
+                // 「显示卡片」标题旁的 ⓘ：悬停查看勾选顺序说明
                 mk_child(
-                    "STATIC",
-                    "勾选顺序即面板排列顺序（后勾的排到后面）；收起态不受影响",
-                    WINDOW_STYLE(0),
-                    PAD,
-                    k0 + 20,
-                    CW,
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 60,
+                    k0 + 1,
                     16,
-                    IDC_CAP_LBL_CARDS,
+                    16,
+                    IDC_HINT_ICON_BASE + 1,
                 );
                 for (i, label) in CARD_LABELS.iter().enumerate() {
                     let col = (i % 2) as i32;
                     let row = (i / 2) as i32;
-                    let chk = mk_child(
+                    mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                        PAD + col * 198,
-                        k0 + 42 + row * 24,
-                        190,
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        PAD + col * 258,
+                        k0 + 40 + row * 38,
+                        252,
+                        36,
                         IDC_CARD_BASE + i,
                     );
-                    let _ = chk;
                     set_check(IDC_CARD_BASE + i, state.config.capsule.cards.all()[i]);
                 }
-                // 回显当前排列顺序（与点击复选后的回显一致）
+                // 回显当前排列顺序（与点击开关后的回显一致）
                 let names: Vec<&str> = state
                     .config
                     .capsule
@@ -4199,7 +6051,7 @@ fn settings_wndproc_impl(
                     &format!("面板顺序：{}", names.join(" → ")),
                     WINDOW_STYLE(0),
                     PAD,
-                    k0 + 118,
+                    k0 + 158,
                     CW,
                     16,
                     IDC_CARDS_HINT,
@@ -4207,40 +6059,48 @@ fn settings_wndproc_impl(
                 mk_child(
                     "STATIC",
                     "",
-                    WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
                     PAD,
-                    k0 + 144,
+                    k0 + 178,
                     CW,
-                    2,
+                    1,
                     IDC_CAP_SEP1,
                 );
-
-                // ---- 页二下半：主题 / 透明度 / 方向 / 样式 / 开关 ----
+                // 外观：主题 / 透明度 / 方向 / 展开样式（分段控件）
+                mk_child(
+                    "STATIC",
+                    "外观",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    k0 + 190,
+                    200,
+                    16,
+                    IDC_CAP_LBL_LOOK,
+                );
                 mk_child(
                     "STATIC",
                     "主题",
                     WINDOW_STYLE(0),
                     PAD,
-                    k0 + 156,
-                    64,
-                    22,
+                    k0 + 219,
+                    124,
+                    18,
                     IDC_CAP_LBL_THEME,
                 );
+                let theme_w = [96, 96];
+                let mut theme_x = PAD + 132;
                 for (i, label) in THEME_LABELS.iter().enumerate() {
-                    // 每组第一颗加 WS_GROUP：自动单选钮按 WS_GROUP 划组，
-                    // 否则全窗口的自动单选钮会被当成同一组互相取消（主题与显示方向不能同时选）。
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        PAD + 72 + i as i32 * 60,
-                        k0 + 156,
-                        56,
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        theme_x,
+                        k0 + 212,
+                        theme_w[i],
+                        32,
                         IDC_THEME_BASE + i,
                     );
+                    theme_x += theme_w[i] + 6;
                 }
                 let theme_idx = crate::config::THEMES
                     .iter()
@@ -4252,208 +6112,211 @@ fn settings_wndproc_impl(
                     "透明度",
                     WINDOW_STYLE(0),
                     PAD,
-                    k0 + 182,
-                    64,
-                    22,
+                    k0 + 257,
+                    124,
+                    18,
                     IDC_CAP_LBL_OPACITY,
                 );
-                let opacity_now = state.config.capsule.opacity;
-                let opacity_idx = OPACITY_STEPS
-                    .iter()
-                    .position(|v| (v - opacity_now).abs() < 0.01)
-                    .unwrap_or(0);
-                for (i, label) in ["100%", "85%", "70%", "55%"].iter().enumerate() {
-                    mk_child(
-                        "BUTTON",
-                        label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        PAD + 72 + i as i32 * 68,
-                        k0 + 182,
-                        64,
-                        22,
-                        IDC_OPACITY_BASE + i,
-                    );
-                }
-                set_check(IDC_OPACITY_BASE + opacity_idx, true);
+                // 透明度：无极滑条（30% ~ 100%），右侧实时百分比
+                let per_mille = ((state.config.capsule.opacity.clamp(0.30, 1.00) * 1000.0).round()
+                    as u32)
+                    .clamp(OPACITY_MIN_PER_MILLE, OPACITY_MAX_PER_MILLE);
+                let slider = mk_child(
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 132,
+                    k0 + 250,
+                    300,
+                    32,
+                    IDC_OPACITY_SLIDER,
+                );
+                let _ = SetPropW(slider, opacity_prop(), HANDLE(per_mille as *mut c_void));
+                mk_child(
+                    "STATIC",
+                    &format!("{}%", per_mille / 10),
+                    WINDOW_STYLE(0),
+                    PAD + 440,
+                    k0 + 257,
+                    60,
+                    18,
+                    IDC_OPACITY_VALUE,
+                );
+                subclass_slider(slider, opacity_slider_proc);
                 mk_child(
                     "STATIC",
                     "显示方向",
                     WINDOW_STYLE(0),
                     PAD,
-                    k0 + 208,
-                    64,
-                    22,
+                    k0 + 295,
+                    124,
+                    18,
                     IDC_CAP_LBL_ORIENT,
                 );
+                let orient_w = [90, 90, 90];
+                let mut orient_x = PAD + 132;
                 for (i, label) in ORIENT_LABELS.iter().enumerate() {
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        PAD + 72 + i as i32 * 60,
-                        k0 + 208,
-                        56,
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        orient_x,
+                        k0 + 288,
+                        orient_w[i],
+                        32,
                         IDC_ORIENT_BASE + i,
                     );
+                    orient_x += orient_w[i];
                 }
                 let orient_idx = crate::config::ORIENTATIONS
                     .iter()
                     .position(|v| *v == state.config.capsule.orientation)
                     .unwrap_or(0);
                 set_check(IDC_ORIENT_BASE + orient_idx, true);
-                // 展开样式：小面板（320 宽）/ 超大卡片（贴屏幕侧边滑出，尺寸对齐任务栏天气面板）
                 mk_child(
                     "STATIC",
                     "展开样式",
                     WINDOW_STYLE(0),
                     PAD,
-                    k0 + 234,
-                    64,
-                    22,
+                    k0 + 333,
+                    124,
+                    18,
                     IDC_CAP_LBL_STYLE,
                 );
+                let style_w = [110, 110];
+                let mut style_x = PAD + 132;
                 for (i, label) in STYLE_LABELS.iter().enumerate() {
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        PAD + 72 + i as i32 * 76,
-                        k0 + 234,
-                        72,
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        style_x,
+                        k0 + 326,
+                        style_w[i],
+                        32,
                         IDC_STYLE_BASE + i,
                     );
+                    style_x += style_w[i];
                 }
                 let style_idx = crate::config::EXPAND_STYLES
                     .iter()
                     .position(|v| *v == state.config.capsule.expand_style)
                     .unwrap_or(0);
                 set_check(IDC_STYLE_BASE + style_idx, true);
-                // 两个勾选并排一行：左「面板自动收起」、右「胶囊/三环切换」
+                mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
+                    PAD,
+                    k0 + 370,
+                    CW,
+                    1,
+                    IDC_CAP_SEP2,
+                );
+                // 行为：三个开关
+                mk_child(
+                    "STATIC",
+                    "行为",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    k0 + 382,
+                    200,
+                    16,
+                    IDC_CAP_LBL_BEHAVIOR,
+                );
                 mk_child(
                     "BUTTON",
                     "面板自动收起",
-                    WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
                     PAD,
-                    k0 + 260,
-                    140,
-                    22,
+                    k0 + 404,
+                    CW / 2 - 8,
+                    34,
                     IDC_CLICK_OUTSIDE_CHK,
                 );
                 set_check(
                     IDC_CLICK_OUTSIDE_CHK,
                     state.config.capsule.click_outside_collapse,
                 );
-                // 与托盘右键菜单里的「胶囊/三环切换」是同一个开关，两处都能改
-                mk_child(
-                    "BUTTON",
-                    "胶囊/三环切换",
-                    WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    PAD + 150,
-                    k0 + 260,
-                    220,
-                    22,
-                    IDC_TASKBAR_CHK,
-                );
-                set_check(IDC_TASKBAR_CHK, state.config.capsule.taskbar_pin);
-                // 全屏应用（游戏 / 放映）运行时隐藏悬浮窗，退出后自动恢复
                 mk_child(
                     "BUTTON",
                     "全屏应用时自动隐藏",
-                    WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    PAD,
-                    k0 + 286,
-                    260,
-                    22,
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + CW / 2 + 8,
+                    k0 + 404,
+                    CW / 2 - 8,
+                    34,
                     IDC_FS_CHK,
                 );
                 set_check(IDC_FS_CHK, state.config.capsule.hide_on_fullscreen);
 
-                // ---- 页三：小屏（开关 + 状态 + 方向 + 显示项目 + 主题，都写进 config.screen）----
-                // 顶部一行：连接状态 + 开屏 / 关屏 / 重连
+                // ---- 页三：小屏（状态 + 方向 + 可收起的显示项目 + 主题 + 刷新）----
+                let s0 = 84;
                 mk_child(
                     "STATIC",
                     "连接状态",
                     WINDOW_STYLE(0),
                     PAD,
-                    20,
-                    72,
-                    26,
+                    s0 + 9,
+                    80,
+                    18,
                     IDC_SCREEN_LBL_STATUS,
                 );
                 mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(0),
-                    PAD + 76,
-                    20,
-                    132,
-                    26,
+                    PAD + 88,
+                    s0 + 9,
+                    210,
+                    18,
                     IDC_SCREEN_STATUS,
                 );
-                mk_child(
-                    "BUTTON",
-                    "开屏",
-                    WINDOW_STYLE(BS_OWNERDRAW as u32),
-                    PAD + CW - 180,
-                    18,
-                    56,
-                    26,
-                    IDC_SCREEN_BTN_ON,
-                );
-                mk_child(
-                    "BUTTON",
-                    "关屏",
-                    WINDOW_STYLE(BS_OWNERDRAW as u32),
-                    PAD + CW - 120,
-                    18,
-                    56,
-                    26,
-                    IDC_SCREEN_BTN_OFF,
-                );
-                mk_child(
-                    "BUTTON",
-                    "重连",
-                    WINDOW_STYLE(BS_OWNERDRAW as u32),
-                    PAD + CW - 60,
-                    18,
-                    60,
-                    26,
-                    IDC_SCREEN_BTN_RE,
-                );
-                // 方向行起的小屏页基准 y
-                let s0 = 58;
-                // 外接小屏（图灵智显）显示方向：screen.ps1 读取 [screen] orientation 后自动切换
+                // 右上角：开屏 / 关屏 / 重连
+                let screen_btns = [
+                    ("开屏", 60, IDC_SCREEN_BTN_ON),
+                    ("关屏", 60, IDC_SCREEN_BTN_OFF),
+                    ("重连", 76, IDC_SCREEN_BTN_RE),
+                ];
+                let mut screen_btn_x = SETTINGS_CLIENT_W - 28 - 76 - 66 - 66;
+                for (label, w, id) in screen_btns {
+                    mk_child(
+                        "BUTTON",
+                        label,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        screen_btn_x,
+                        s0,
+                        w,
+                        30,
+                        id,
+                    );
+                    screen_btn_x += w + 6;
+                }
+                // 外接小屏（图灵智显）显示方向
                 mk_child(
                     "STATIC",
                     "小屏方向",
                     WINDOW_STYLE(0),
                     PAD,
-                    s0,
-                    72,
-                    22,
+                    s0 + 53,
+                    124,
+                    18,
                     IDC_SCREEN_LBL_DIR,
                 );
+                let dir_w = [82, 96, 82, 96];
+                let mut dir_x = PAD + 132;
                 for (i, label) in SCREEN_LABELS.iter().enumerate() {
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(
-                            BS_AUTORADIOBUTTON as u32 | if i == 0 { WS_GROUP.0 } else { 0 },
-                        ),
-                        PAD + 76 + i as i32 * 76,
-                        s0,
-                        74,
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        dir_x,
+                        s0 + 46,
+                        dir_w[i],
+                        32,
                         IDC_SCREEN_BASE + i,
                     );
+                    dir_x += dir_w[i];
                 }
                 let screen_idx = crate::config::SCREEN_ORIENTATIONS
                     .iter()
@@ -4463,132 +6326,86 @@ fn settings_wndproc_impl(
                 mk_child(
                     "STATIC",
                     "",
-                    WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
                     PAD,
-                    s0 + 30,
+                    s0 + 88,
                     CW,
-                    2,
+                    1,
                     IDC_SCREEN_SEP,
                 );
+                // 显示项目：标题行右侧 ⌄ 收起 / 展开
                 mk_child(
                     "STATIC",
                     "显示项目",
                     WINDOW_STYLE(0),
                     PAD,
-                    s0 + 38,
-                    64,
+                    s0 + 102,
+                    80,
                     18,
                     IDC_SCREEN_LBL_ITEMS,
                 );
+                // 「显示项目」标题旁的 ⓘ：悬停查看与卡片开关的关系
                 mk_child(
-                    "STATIC",
-                    "与胶囊面板的卡片开关相互独立",
-                    WINDOW_STYLE(0),
-                    PAD + 76,
-                    s0 + 38,
-                    CW - 76,
-                    18,
-                    IDC_SCREEN_HINT,
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 60,
+                    s0 + 104,
+                    16,
+                    16,
+                    IDC_HINT_ICON_BASE + 2,
                 );
-                // 小屏显示项目：只读写 config.screen，和胶囊面板的 cards 互不影响
+                mk_child(
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + CW - 32,
+                    s0 + 96,
+                    32,
+                    28,
+                    IDC_ITEMS_TOGGLE,
+                );
+                // 5 个项目：单行 5 列，开关在每格右侧
                 let screen_items = [
                     state.config.screen.cpu,
                     state.config.screen.memory,
                     state.config.screen.gpu,
                     state.config.screen.network,
                     state.config.screen.disk,
-                    state.config.screen.storage,
-                    state.config.screen.temp,
-                    state.config.screen.clock,
                 ];
                 for (i, label) in SCREEN_ITEM_LABELS.iter().enumerate() {
-                    // 8 个项目分两行，每行 4 个勾选
                     mk_child(
                         "BUTTON",
                         label,
-                        WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                        PAD + (i % 4) as i32 * 78,
-                        s0 + 62 + (i / 4) as i32 * 24,
-                        78,
-                        22,
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        PAD + i as i32 * 105,
+                        s0 + 130,
+                        105,
+                        34,
                         IDC_SCREEN_ITEM_BASE + i,
                     );
                     set_check(IDC_SCREEN_ITEM_BASE + i, screen_items[i]);
                 }
 
-                // 主题：Dark / 白色双显 / Light / 黑色双显，保存后下一帧直接换配色
+                // 刷新频率：1 / 2 / 3 / 5 秒（主题已移到「小屏主题」页）
                 mk_child(
                     "STATIC",
                     "",
-                    WINDOW_STYLE(SS_ETCHEDHORZ_STYLE),
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
                     PAD,
-                    s0 + 118,
+                    s0 + 180,
                     CW,
-                    2,
-                    IDC_SCREEN_THEME_SEP,
+                    1,
+                    IDC_SCREEN_SEP2,
                 );
-                // 小屏幕主题：标题单独一行，下一行是下拉框，右侧放大预览图
-                mk_child(
-                    "STATIC",
-                    "小屏幕主题",
-                    WINDOW_STYLE(0),
-                    PAD,
-                    s0 + 126,
-                    140,
-                    22,
-                    IDC_SCREEN_LBL_THEME,
-                );
-                let theme_idx = crate::config::SCREEN_THEMES
-                    .iter()
-                    .position(|v| *v == state.config.screen.theme)
-                    .unwrap_or(0);
-                let combo = mk_child(
-                    "COMBOBOX",
-                    "",
-                    WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
-                    PAD,
-                    s0 + 150,
-                    140,
-                    140,
-                    IDC_SCREEN_THEME_COMBO,
-                );
-                for label in SCREEN_THEME_LABELS.iter() {
-                    let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
-                    let _ = SendMessageW(
-                        combo,
-                        CB_ADDSTRING_MSG,
-                        WPARAM(0),
-                        LPARAM(wide.as_ptr() as isize),
-                    );
-                }
-                let _ = SendMessageW(combo, CB_SETCURSEL_MSG, WPARAM(theme_idx), LPARAM(0));
-                let preview = mk_child(
-                    "STATIC",
-                    "",
-                    WINDOW_STYLE(SS_BITMAP_STYLE | SS_CENTERIMAGE_STYLE),
-                    PAD + 200,
-                    s0 + 126,
-                    192,
-                    288,
-                    IDC_SCREEN_PREVIEW,
-                );
-                if let Some(&hbm) = screen_preview_bitmaps().get(theme_idx) {
-                    let _ = SendMessageW(
-                        preview,
-                        STM_SETIMAGE_MSG,
-                        WPARAM(IMAGE_BITMAP_TYPE),
-                        LPARAM(hbm),
-                    );
-                }
-                // 刷新频率：1 / 2 / 3 / 5 秒，screen.ps1 每帧读配置，改完下一帧就按新节奏走
                 mk_child(
                     "STATIC",
                     "刷新频率",
                     WINDOW_STYLE(0),
                     PAD,
-                    s0 + 184,
-                    72,
-                    22,
+                    s0 + 196,
+                    80,
+                    18,
                     IDC_SCREEN_LBL_REFRESH,
                 );
                 let refresh_idx = crate::config::SCREEN_INTERVALS
@@ -4599,10 +6416,10 @@ fn settings_wndproc_impl(
                     "COMBOBOX",
                     "",
                     WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
-                    PAD + 72,
-                    s0 + 180,
-                    80,
-                    140,
+                    PAD + 88,
+                    s0 + 190,
+                    92,
+                    160,
                     IDC_SCREEN_REFRESH_COMBO,
                 );
                 for label in SCREEN_REFRESH_LABELS.iter() {
@@ -4620,20 +6437,133 @@ fn settings_wndproc_impl(
                     WPARAM(refresh_idx),
                     LPARAM(0),
                 );
+                // 亮度：无极滑条（10% ~ 100%），渲染端按百分比调暗整帧
+                mk_child(
+                    "STATIC",
+                    "亮度",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    s0 + 240,
+                    80,
+                    18,
+                    IDC_SCREEN_LBL_BRIGHT,
+                );
+                let bright = state.config.screen.brightness.clamp(10, 100);
+                let bright_slider = mk_child(
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 88,
+                    s0 + 233,
+                    340,
+                    32,
+                    IDC_BRIGHT_SLIDER,
+                );
+                let _ = SetPropW(
+                    bright_slider,
+                    brightness_prop(),
+                    HANDLE(bright as *mut c_void),
+                );
+                mk_child(
+                    "STATIC",
+                    &format!("{bright}%"),
+                    WINDOW_STYLE(0),
+                    PAD + 440,
+                    s0 + 240,
+                    60,
+                    18,
+                    IDC_BRIGHT_VALUE,
+                );
+                subclass_slider(bright_slider, brightness_slider_proc);
                 settings_refresh_screen_buttons(hwnd);
 
-                // ---- 页四：关于（logo + 名称 + 版本/作者 + 标语 + 博客）----
+                // ---- 页四：小屏主题（2×2 卡片，选中蓝框 + 圆形对勾）----
+                mk_child(
+                    "STATIC",
+                    "小屏配色",
+                    WINDOW_STYLE(0),
+                    PAD,
+                    78,
+                    100,
+                    18,
+                    IDC_SCREEN_LBL_COLOR,
+                );
+                mk_child(
+                    "BUTTON",
+                    "",
+                    WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    PAD + 60,
+                    79,
+                    16,
+                    16,
+                    IDC_HINT_ICON_BASE + 3,
+                );
+                // 当前主题不在内置列表（自定义主题）时，所有卡片都不选中，
+                // 这样保存设置不会被默默改回 dark。
+                let theme_idx = crate::config::SCREEN_THEMES
+                    .iter()
+                    .position(|v| *v == state.config.screen.theme);
+                // 可滚动容器：卡片是它的子窗口，超出部分自动裁剪，不会盖住页头和底部按钮
+                let theme_view = mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(WS_CLIPCHILDREN.0),
+                    PAD - 8,
+                    96,
+                    544,
+                    486,
+                    IDC_THEME_VIEW,
+                );
+                // 右侧垂直滚动条：内容高 634，可视 486，最大偏移 148
+                let theme_sb = mk_child(
+                    "SCROLLBAR",
+                    "",
+                    WINDOW_STYLE(SBS_VERT as u32),
+                    752,
+                    96,
+                    16,
+                    486,
+                    IDC_THEME_SCROLL,
+                );
+                let _ = SendMessageW(
+                    theme_sb,
+                    SBM_SETRANGE_MSG,
+                    WPARAM(0),
+                    LPARAM(THEME_SCROLL_MAX as isize),
+                );
+                // 子类化容器：把卡片的绘制 / 点击 / 滚轮消息转回设置窗
+                THEME_VIEW_PROC =
+                    SetWindowLongPtrW(theme_view, GWLP_WNDPROC, theme_view_proc as usize as isize);
+                for (pos, theme_pos) in THEME_CARD_ORDER.iter().enumerate() {
+                    let _ = mk_in(
+                        theme_view,
+                        "BUTTON",
+                        SCREEN_THEME_LABELS[*theme_pos],
+                        WINDOW_STYLE(BS_OWNERDRAW as u32),
+                        8 + (pos % 2) as i32 * 272,
+                        (pos / 2) as i32 * 216,
+                        256,
+                        SCREEN_THEME_CARD_TOTAL_H,
+                        IDC_SCREEN_THEME_CARD_BASE + pos,
+                    );
+                    set_check(
+                        IDC_SCREEN_THEME_CARD_BASE + pos,
+                        Some(*theme_pos) == theme_idx,
+                    );
+                }
+
+                // ---- 页五：关于（logo + 名称 + 版本/作者 + 标语 + 博客）----
                 let about_logo = mk_child(
                     "STATIC",
                     "",
                     WINDOW_STYLE(SS_ICON_STYLE | SS_CENTERIMAGE_STYLE),
-                    PAD + (CW - 112) / 2,
-                    62,
-                    112,
-                    112,
+                    PAD + (CW - 96) / 2,
+                    92,
+                    96,
+                    96,
                     IDC_ABOUT_LOGO,
                 );
-                let about_icon = app_icon_at(112);
+                let about_icon = app_icon_at(96);
                 if !about_icon.is_invalid() {
                     let _ = SendMessageW(
                         about_logo,
@@ -4647,7 +6577,7 @@ fn settings_wndproc_impl(
                     "核桃胶囊",
                     WINDOW_STYLE(SS_CENTER_STYLE),
                     PAD,
-                    192,
+                    208,
                     CW,
                     34,
                     IDC_ABOUT_NAME,
@@ -4665,7 +6595,7 @@ fn settings_wndproc_impl(
                     concat!("版本 ", env!("CARGO_PKG_VERSION"), "  ·  作者：蓝胖纸"),
                     WINDOW_STYLE(SS_CENTER_STYLE),
                     PAD,
-                    234,
+                    248,
                     CW,
                     22,
                     IDC_ABOUT_VERSION,
@@ -4675,7 +6605,7 @@ fn settings_wndproc_impl(
                     "让 NAS 状态一眼可见",
                     WINDOW_STYLE(SS_CENTER_STYLE),
                     PAD,
-                    272,
+                    288,
                     CW,
                     20,
                     IDC_ABOUT_HINT,
@@ -4685,7 +6615,7 @@ fn settings_wndproc_impl(
                     &format!("博客：{ABOUT_BLOG_URL}"),
                     WINDOW_STYLE(SS_CENTER_STYLE | SS_NOTIFY_STYLE),
                     PAD,
-                    308,
+                    324,
                     CW,
                     20,
                     IDC_ABOUT_BLOG,
@@ -4695,27 +6625,16 @@ fn settings_wndproc_impl(
                     "问题反馈 QQ 群：2153084440",
                     WINDOW_STYLE(SS_CENTER_STYLE),
                     PAD,
-                    342,
+                    358,
                     CW,
                     20,
                     IDC_ABOUT_QQ,
                 );
 
-                // ---- 底部按钮（右下角：取消＝浅灰，确定＝墨绿实心，均自绘）----
+                // ---- 底部按钮（右下角：取消＝浅灰，确定＝蓝实心，均自绘）----
                 let btn_w = 96;
-                let ok_x = SETTINGS_CLIENT_W - 16 - btn_w;
+                let ok_x = SETTINGS_CLIENT_W - 28 - btn_w;
                 let cancel_x = ok_x - 12 - btn_w;
-                // 应用：把当前页选项立刻落盘，实体小屏下一帧就刷新
-                mk_child(
-                    "BUTTON",
-                    "应用",
-                    WINDOW_STYLE(BS_OWNERDRAW as u32),
-                    cancel_x - 12 - btn_w,
-                    btn_y,
-                    btn_w,
-                    30,
-                    IDC_SCREEN_APPLY,
-                );
                 mk_child(
                     "BUTTON",
                     "取消",
@@ -4737,10 +6656,26 @@ fn settings_wndproc_impl(
                     1,
                 ); // IDOK
 
+                // 说明气泡：最后创建，保证盖在其他控件之上（默认隐藏）
+                let tip = mk_child(
+                    "STATIC",
+                    "",
+                    WINDOW_STYLE(SS_OWNERDRAW_STYLE),
+                    0,
+                    0,
+                    TOOLTIP_W,
+                    44,
+                    IDC_TOOLTIP,
+                );
+                let _ = ShowWindow(tip, SW_HIDE);
+
                 // 建完控件先只显示当前页（连接），其余页隐藏
                 settings_show_page(hwnd, state.settings_tab);
+                settings_apply_page_header(hwnd, state.settings_tab);
+                state.settings_items_collapsed = false;
                 // 自绘按钮挂鼠标跟踪，补上悬停/按下的交互反馈
                 subclass_round_buttons(hwnd);
+                subclass_hint_icons(hwnd);
                 // 小屏连接状态：先填一次，再每秒刷新（脚本 2s 一帧心跳）
                 settings_update_screen_status(hwnd, &state.config.screen);
                 let _ = SetTimer(hwnd, IDT_SETTINGS_STATUS, 1000, None);
@@ -4749,6 +6684,52 @@ fn settings_wndproc_impl(
             // 小屏连接状态：定时读脚本心跳刷新，切页时也立刻刷一次
             WM_TIMER if wparam.0 == IDT_SETTINGS_STATUS => {
                 settings_update_screen_status(hwnd, &state.config.screen);
+                LRESULT(0)
+            }
+            // 透明度滑条被拖动：即时预览（不写盘）；松手后由 WM_SETTINGS_OPACITY_DONE 落盘
+            WM_SETTINGS_OPACITY => {
+                apply_settings_preview(state, hwnd);
+                LRESULT(0)
+            }
+            // 透明度滑条松手：立即保存并生效
+            WM_SETTINGS_OPACITY_DONE => {
+                settings_commit_options(state, hwnd);
+                LRESULT(0)
+            }
+            // 亮度滑条拖动：百分比文字已由滑条更新，松手再统一落盘
+            WM_SETTINGS_BRIGHTNESS => LRESULT(0),
+            WM_SETTINGS_BRIGHTNESS_DONE => {
+                settings_commit_options(state, hwnd);
+                LRESULT(0)
+            }
+            // 悬停说明图标：显示 / 收起气泡
+            // 主题页滚动：拖滚动条 / 点箭头 / 滚轮
+            WM_VSCROLL => {
+                if state.settings_tab == 3 {
+                    if let Ok(sb) = unsafe { GetDlgItem(hwnd, IDC_THEME_SCROLL as i32) } {
+                        let pos = unsafe {
+                            SendMessageW(sb, SBM_GETPOS_MSG, WPARAM(0), LPARAM(0)).0 as i32
+                        };
+                        apply_theme_scroll(state, hwnd, pos);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                if state.settings_tab == 3 {
+                    let delta = ((wparam.0 >> 16) as i16) as i32;
+                    let step = if delta > 0 { -40 } else { 40 };
+                    let next = state.theme_scroll + step;
+                    apply_theme_scroll(state, hwnd, next);
+                }
+                LRESULT(0)
+            }
+            WM_SETTINGS_HINT_SHOW => {
+                settings_show_hint(state, hwnd, wparam.0);
+                LRESULT(0)
+            }
+            WM_SETTINGS_HINT_HIDE => {
+                settings_hide_hint(state, hwnd);
                 LRESULT(0)
             }
             // 背景：左侧浅灰导航栏 + 右侧白色内容卡 + 1px 分隔线
@@ -4779,28 +6760,35 @@ fn settings_wndproc_impl(
                 let _ = FillRect(hdc, &line, cached_brush("set_line", set_line()));
                 LRESULT(1)
             }
-            // 分组标题用墨绿、提示行用灰，普通文字用深灰；背景一律白色内容卡
+            // 侧栏用侧栏底色；内容区：分组小标题与提示行用灰、博客链接用蓝、其余深灰
             WM_CTLCOLORSTATIC => {
                 let hdc = HDC(wparam.0 as *mut c_void);
                 let ctl = HWND(lparam.0 as *mut c_void);
                 let _ = SetBkMode(hdc, TRANSPARENT);
                 let same = |id: usize| GetDlgItem(hwnd, id as i32).ok() == Some(ctl);
-                if same(IDC_SIDEBAR_TITLE) || same(IDC_SIDEBAR_NAME) {
-                    let _ = SetTextColor(hdc, set_teal());
+                if same(IDC_SIDEBAR_TITLE) || same(IDC_SIDEBAR_NAME) || same(IDC_SIDEBAR_VERSION) {
+                    let color = if same(IDC_SIDEBAR_NAME) {
+                        set_text()
+                    } else {
+                        set_hint()
+                    };
+                    let _ = SetTextColor(hdc, color);
                     return LRESULT(cached_brush("set_side", set_side_bg()).0 as isize);
                 }
-                let is_section = same(IDC_SEC_CONN)
+                let is_link = same(IDC_ABOUT_BLOG);
+                let is_hint = same(IDC_SEC_CONN)
                     || same(IDC_SEC_CARDS)
-                    || same(IDC_ABOUT_NAME)
-                    || same(IDC_ABOUT_BLOG);
-                let is_hint = same(IDC_CARDS_HINT)
-                    || same(IDC_CONN_HINT)
-                    || same(IDC_SCREEN_HINT)
+                    || same(IDC_CONN_LBL_UI)
+                    || same(IDC_CAP_LBL_LOOK)
+                    || same(IDC_CAP_LBL_BEHAVIOR)
+                    || same(IDC_SCREEN_LBL_COLOR)
+                    || same(IDC_CARDS_HINT)
                     || same(IDC_SCREEN_STATUS)
+                    || same(IDC_ABOUT_VERSION)
                     || same(IDC_ABOUT_HINT);
                 let _ = SetTextColor(
                     hdc,
-                    if is_section {
+                    if is_link {
                         set_teal()
                     } else if is_hint {
                         set_hint()
@@ -4815,6 +6803,193 @@ fn settings_wndproc_impl(
                 let dis = &*(lparam.0 as *const SettingsDrawItem);
                 let rc = dis.rc_item;
                 let id = dis.ctl_id as usize;
+
+                // ---- 说明图标 ⓘ ----
+                if (IDC_HINT_ICON_BASE..IDC_HINT_ICON_BASE + HINT_COUNT).contains(&id) {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+                    blit_ctl_bitmap(
+                        dis.hdc,
+                        ctl_bitmap(w, h, CTL_KIND_INFO),
+                        rc.left,
+                        rc.top,
+                        w,
+                        h,
+                    );
+                    return LRESULT(1);
+                }
+
+                // ---- 说明气泡 ----
+                if id == IDC_TOOLTIP {
+                    if let Some(text) = HINT_TEXTS.get(state.settings_hint_on) {
+                        draw_tooltip(dis.hdc, rc, text, state.settings_font);
+                    }
+                    return LRESULT(1);
+                }
+
+                // ---- 1px 分隔线（SS_OWNERDRAW 静态控件）----
+                if id == IDC_HEAD_SEP
+                    || id == IDC_CONN_SEP
+                    || id == IDC_CAP_SEP1
+                    || id == IDC_CAP_SEP2
+                    || id == IDC_SCREEN_SEP
+                    || id == IDC_SCREEN_SEP2
+                {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_line", set_line()));
+                    return LRESULT(1);
+                }
+
+                // ---- 透明度滑条 ----
+                if id == IDC_OPACITY_SLIDER {
+                    draw_opacity_slider(dis.hdc, rc, opacity_per_mille(hwnd));
+                    return LRESULT(1);
+                }
+                // ---- 小屏亮度滑条 ----
+                if id == IDC_BRIGHT_SLIDER {
+                    draw_level_slider(
+                        dis.hdc,
+                        rc,
+                        brightness_percent(hwnd),
+                        BRIGHT_MIN,
+                        BRIGHT_MAX,
+                    );
+                    return LRESULT(1);
+                }
+
+                // ---- 显示模式卡片（胶囊 / 三环 / 小屏）----
+                if (IDC_SCREEN_MODE_BASE..IDC_SCREEN_MODE_BASE + SCREEN_MODE_LABELS.len())
+                    .contains(&id)
+                {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    let mut buf = [0u16; 64];
+                    let n = GetWindowTextW(dis._hwnd_item, &mut buf).max(0) as usize;
+                    let label = String::from_utf16_lossy(&buf[..n]);
+                    draw_mode_card(
+                        dis.hdc,
+                        rc,
+                        &label,
+                        ctl_checked(dis._hwnd_item),
+                        id - IDC_SCREEN_MODE_BASE,
+                        state.settings_font,
+                    );
+                    return LRESULT(1);
+                }
+
+                // ---- 小屏主题卡片（3×2）----
+                if (IDC_SCREEN_THEME_CARD_BASE..IDC_SCREEN_THEME_CARD_BASE + THEME_CARD_ORDER.len())
+                    .contains(&id)
+                {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    let mut buf = [0u16; 64];
+                    let n = GetWindowTextW(dis._hwnd_item, &mut buf).max(0) as usize;
+                    let label = String::from_utf16_lossy(&buf[..n]);
+                    draw_screen_theme_card(
+                        dis.hdc,
+                        rc,
+                        &label,
+                        ctl_checked(dis._hwnd_item),
+                        THEME_CARD_ORDER
+                            .get(id - IDC_SCREEN_THEME_CARD_BASE)
+                            .copied()
+                            .unwrap_or(0),
+                        state.settings_font,
+                    );
+                    return LRESULT(1);
+                }
+
+                // ---- 主题色卡（亮色白底 / 暗色黑底）----
+                if (IDC_THEME_BASE..IDC_THEME_BASE + 2).contains(&id) {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    let mut buf = [0u16; 64];
+                    let n = GetWindowTextW(dis._hwnd_item, &mut buf).max(0) as usize;
+                    let label = String::from_utf16_lossy(&buf[..n]);
+                    draw_theme_card(
+                        dis.hdc,
+                        rc,
+                        &label,
+                        ctl_checked(dis._hwnd_item),
+                        id == IDC_THEME_BASE + 1,
+                        state.settings_font,
+                    );
+                    return LRESULT(1);
+                }
+
+                // ---- 页头「恢复默认」：纯文字按钮，悬停给一层浅蓝底 ----
+                if id == IDC_PAGE_RESET {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    if HOT_BTN.load(Ordering::Relaxed) == id {
+                        let old_brush = SelectObject(
+                            dis.hdc,
+                            HGDIOBJ(cached_brush("set_hover_soft", set_hover_soft()).0),
+                        );
+                        let old_pen = SelectObject(dis.hdc, GetStockObject(NULL_PEN));
+                        let _ = RoundRect(dis.hdc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+                        let _ = SelectObject(dis.hdc, old_brush);
+                        let _ = SelectObject(dis.hdc, old_pen);
+                    }
+                    if !state.settings_font.is_invalid() {
+                        let _ = SelectObject(dis.hdc, HGDIOBJ(state.settings_font.0));
+                    }
+                    let _ = SetBkMode(dis.hdc, TRANSPARENT);
+                    let _ = SetTextColor(dis.hdc, set_hint());
+                    let mut text: Vec<u16> = "恢复默认".encode_utf16().collect();
+                    let mut trc = rc;
+                    let fmt = DRAW_TEXT_FORMAT(
+                        DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0,
+                    );
+                    let _ = DrawTextW(dis.hdc, &mut text, &mut trc, fmt);
+                    return LRESULT(1);
+                }
+
+                // ---- 显示项目 收起 / 展开箭头 ----
+                if id == IDC_ITEMS_TOGGLE {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    if HOT_BTN.load(Ordering::Relaxed) == id {
+                        let old_brush = SelectObject(
+                            dis.hdc,
+                            HGDIOBJ(cached_brush("set_hover_soft", set_hover_soft()).0),
+                        );
+                        let old_pen = SelectObject(dis.hdc, GetStockObject(NULL_PEN));
+                        let _ = RoundRect(dis.hdc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
+                        let _ = SelectObject(dis.hdc, old_brush);
+                        let _ = SelectObject(dis.hdc, old_pen);
+                    }
+                    draw_chevron(dis.hdc, rc, state.settings_items_collapsed);
+                    return LRESULT(1);
+                }
+
+                // ---- 开关行（卡片 / 小屏显示项目 / 行为）----
+                if is_switch_id(id) {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    let mut buf = [0u16; 64];
+                    let n = GetWindowTextW(dis._hwnd_item, &mut buf).max(0) as usize;
+                    let label = String::from_utf16_lossy(&buf[..n]);
+                    draw_switch_row(
+                        dis.hdc,
+                        rc,
+                        &label,
+                        ctl_checked(dis._hwnd_item),
+                        state.settings_font,
+                    );
+                    return LRESULT(1);
+                }
+
+                // ---- 分段控件（主题 / 透明度 / 方向 / 样式 / 小屏方向 / 显示模式）----
+                if segment_group(id).is_some() {
+                    let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
+                    let mut buf = [0u16; 64];
+                    let n = GetWindowTextW(dis._hwnd_item, &mut buf).max(0) as usize;
+                    let label = String::from_utf16_lossy(&buf[..n]);
+                    draw_segment(
+                        dis.hdc,
+                        rc,
+                        &label,
+                        ctl_checked(dis._hwnd_item),
+                        state.settings_font,
+                        id,
+                    );
+                    return LRESULT(1);
+                }
 
                 // ---- 底部按钮 ----
                 if id == 1 || id == 2 {
@@ -4851,7 +7026,7 @@ fn settings_wndproc_impl(
                     return LRESULT(1);
                 }
 
-                // ---- 圆角次按钮：测试连接 / 令牌显隐 / 小屏页开关与重连、应用 ----
+                // ---- 圆角次按钮：测试连接 / 令牌显隐 / 小屏页开关与重连 ----
                 if matches!(
                     id,
                     IDC_TEST_BUTTON
@@ -4859,7 +7034,6 @@ fn settings_wndproc_impl(
                         | IDC_SCREEN_BTN_ON
                         | IDC_SCREEN_BTN_OFF
                         | IDC_SCREEN_BTN_RE
-                        | IDC_SCREEN_APPLY
                 ) {
                     let _ = FillRect(dis.hdc, &rc, cached_brush("set_card", set_card_bg()));
                     // ODS_DISABLED：小屏已在跑时「开启」不可点，用浅一档的底色 + 灰字
@@ -4910,27 +7084,26 @@ fn settings_wndproc_impl(
                         right: rc.right - 2,
                         bottom: rc.bottom - 2,
                     };
-                    let old_brush =
-                        SelectObject(dis.hdc, HGDIOBJ(cached_brush("set_teal", set_teal()).0));
-                    let old_pen = SelectObject(dis.hdc, GetStockObject(NULL_PEN));
+                    let old_brush = SelectObject(
+                        dis.hdc,
+                        HGDIOBJ(cached_brush("set_accent_soft", set_accent_soft()).0),
+                    );
+                    let old_pen =
+                        SelectObject(dis.hdc, HGDIOBJ(cached_pen("set_nav_pen", set_teal()).0));
                     let _ = RoundRect(
                         dis.hdc,
                         inner.left,
                         inner.top,
                         inner.right,
                         inner.bottom,
-                        10,
-                        10,
+                        16,
+                        16,
                     );
                     let _ = SelectObject(dis.hdc, old_brush);
                     let _ = SelectObject(dis.hdc, old_pen);
                 }
                 let _ = SetBkMode(dis.hdc, TRANSPARENT);
-                let text_color = if active {
-                    settings_rgb(255, 255, 255)
-                } else {
-                    set_text()
-                };
+                let text_color = set_text();
                 let _ = SetTextColor(dis.hdc, text_color);
                 // 文字前面画图标：胶囊用药丸形状，其余用图标字体里的字形
                 let has_icon = !state.nav_icon_font.is_invalid();
@@ -4960,7 +7133,8 @@ fn settings_wndproc_impl(
                 }
                 let mut text: Vec<u16> = TAB_LABELS[idx].encode_utf16().collect();
                 let mut text_rc = rc;
-                text_rc.left += if has_icon || idx == 1 { 34 } else { 16 };
+                // 图标墨迹右缘约在 +27，文字从 +42 起，留出约一个汉字的呼吸位
+                text_rc.left += if has_icon || idx == 1 { 42 } else { 16 };
                 let fmt =
                     DRAW_TEXT_FORMAT(DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0);
                 let _ = DrawTextW(dis.hdc, &mut text, &mut text_rc, fmt);
@@ -4970,13 +7144,61 @@ fn settings_wndproc_impl(
                 let id = (wparam.0 as u32) & 0xFFFF;
                 let code = ((wparam.0 as u32) >> 16) & 0xFFFF;
 
+                // 自绘控件：BS_OWNERDRAW 不会自动切换选中态，这里先按控件类型维护状态；
+                // 开关 / 分段点一下立即写盘生效，不再等「确定」
+                if code == BN_CLICKED_CODE {
+                    let mut instant = false;
+                    if is_switch_id(id as usize) {
+                        let cur = is_checked(hwnd, id as usize);
+                        let is_screen_item = (IDC_SCREEN_ITEM_BASE
+                            ..IDC_SCREEN_ITEM_BASE + SCREEN_ITEM_COUNT)
+                            .contains(&(id as usize));
+                        // 显示项目至少保留 3 项：已到下限时拒绝关闭并提示
+                        let on_count = read_screen_items(hwnd).iter().filter(|v| **v).count();
+                        if is_screen_item && cur && on_count <= MIN_SCREEN_ITEMS {
+                            show_min_items_hint(hwnd);
+                            return LRESULT(0);
+                        }
+                        set_check_state(hwnd, id as usize, !cur);
+                        instant = true;
+                    } else if let Some((base, n)) = segment_group(id as usize) {
+                        for i in 0..n {
+                            set_check_state(hwnd, base + i, base + i == id as usize);
+                        }
+                        instant = true;
+                    }
+                    // 卡片开关要等下面的勾选顺序更新完再提交
+                    let is_card =
+                        (IDC_CARD_BASE..IDC_CARD_BASE + CARD_COUNT).contains(&(id as usize));
+                    if instant && !is_card {
+                        settings_commit_options(state, hwnd);
+                    }
+                }
+
+                // 页头「恢复默认」：重置当前页选项并立即生效
+                if code == BN_CLICKED_CODE && id as usize == IDC_PAGE_RESET {
+                    settings_restore_defaults(state, hwnd);
+                    settings_commit_options(state, hwnd);
+                    return LRESULT(0);
+                }
+
+                // 小屏页「显示项目」收起 / 展开
+                if code == BN_CLICKED_CODE && id as usize == IDC_ITEMS_TOGGLE {
+                    state.settings_items_collapsed = !state.settings_items_collapsed;
+                    settings_apply_items_collapsed(hwnd, state.settings_items_collapsed, true);
+                    return LRESULT(0);
+                }
+
                 // 标签页：只显示被点中的那一页，其余页整组隐藏
                 if (IDC_TAB_BASE..IDC_TAB_BASE + TAB_LABELS.len()).contains(&(id as usize))
                     && code == BN_CLICKED_CODE
                 {
                     let page = id as usize - IDC_TAB_BASE;
                     state.settings_tab = page;
+                    settings_hide_hint(state, hwnd);
                     settings_show_page(hwnd, page);
+                    settings_apply_page_header(hwnd, page);
+                    settings_apply_items_collapsed(hwnd, state.settings_items_collapsed, page == 2);
                     settings_update_screen_status(hwnd, &state.config.screen);
                     settings_refresh_screen_buttons(hwnd);
                     // 自绘标签按新选中项重画
@@ -4985,6 +7207,8 @@ fn settings_wndproc_impl(
                             let _ = InvalidateRect(ctl, None, TRUE);
                         }
                     }
+                    // 整块客户区强制重绘：把上一页残留的自绘像素擦干净
+                    let _ = InvalidateRect(hwnd, None, TRUE);
                     return LRESULT(0);
                 }
 
@@ -5021,62 +7245,24 @@ fn settings_wndproc_impl(
                     return LRESULT(0);
                 }
 
-                // 小屏主题下拉框：换选项即换右侧预览图（保存仍在「确定」时）
-                if code == CBN_SELCHANGE_CODE && id as usize == IDC_SCREEN_THEME_COMBO {
-                    let combo = GetDlgItem(hwnd, IDC_SCREEN_THEME_COMBO as i32).unwrap_or_default();
-                    let sel = SendMessageW(combo, CB_GETCURSEL_MSG, WPARAM(0), LPARAM(0)).0;
-                    if sel >= 0 {
-                        let idx = sel as usize;
-                        if idx < SCREEN_THEME_LABELS.len() {
-                            state.config.screen.theme =
-                                crate::config::SCREEN_THEMES[idx].to_string();
-                            if let Ok(pv) = GetDlgItem(hwnd, IDC_SCREEN_PREVIEW as i32) {
-                                if let Some(&hbm) = screen_preview_bitmaps().get(idx) {
-                                    let _ = SendMessageW(
-                                        pv,
-                                        STM_SETIMAGE_MSG,
-                                        WPARAM(IMAGE_BITMAP_TYPE),
-                                        LPARAM(hbm),
-                                    );
-                                }
-                            }
-                        }
+                // 小屏主题卡片：点一张即切主题，其余三张取消选中，并立即生效
+                if code == BN_CLICKED_CODE
+                    && (IDC_SCREEN_THEME_CARD_BASE
+                        ..IDC_SCREEN_THEME_CARD_BASE + SCREEN_THEME_LABELS.len())
+                        .contains(&(id as usize))
+                {
+                    let pos = id as usize - IDC_SCREEN_THEME_CARD_BASE;
+                    for i in 0..SCREEN_THEME_LABELS.len() {
+                        set_check_state(hwnd, IDC_SCREEN_THEME_CARD_BASE + i, i == pos);
                     }
+                    // 选中的卡片由 settings_commit_options 统一换算并落盘
+                    settings_commit_options(state, hwnd);
                     return LRESULT(0);
                 }
 
-                // 「应用到小屏」：把当前页选项立刻写盘，实体小屏下一帧就变
-                if code == BN_CLICKED_CODE && id as usize == IDC_SCREEN_APPLY {
-                    let screen_idx = (0..SCREEN_LABELS.len())
-                        .find(|&i| is_checked(hwnd, IDC_SCREEN_BASE + i))
-                        .unwrap_or(0);
-                    state.config.screen.orientation =
-                        crate::config::SCREEN_ORIENTATIONS[screen_idx].to_string();
-                    let combo = GetDlgItem(hwnd, IDC_SCREEN_THEME_COMBO as i32).unwrap_or_default();
-                    let sel = SendMessageW(combo, CB_GETCURSEL_MSG, WPARAM(0), LPARAM(0)).0;
-                    let theme_idx = if sel > 0 {
-                        (sel as usize).min(SCREEN_THEME_LABELS.len() - 1)
-                    } else {
-                        0
-                    };
-                    state.config.screen.theme = crate::config::SCREEN_THEMES[theme_idx].to_string();
-                    let items = read_screen_items(hwnd);
-                    state.config.screen.cpu = items[0];
-                    state.config.screen.memory = items[1];
-                    state.config.screen.gpu = items[2];
-                    state.config.screen.network = items[3];
-                    state.config.screen.disk = items[4];
-                    state.config.screen.storage = items[5];
-                    state.config.screen.temp = items[6];
-                    state.config.screen.clock = items[7];
-                    state.config.screen.interval = read_screen_interval(hwnd);
-                    let _ = crate::config::save(&state.config);
-                    if state.config.screen.enabled {
-                        restart_native_screen(&state.shared, &state.config.screen);
-                    } else {
-                        stop_screen_engine();
-                    }
-                    settings_update_screen_status(hwnd, &state.config.screen);
+                // 「刷新间隔」下拉：选中即生效
+                if code == 1 && id as usize == IDC_SCREEN_REFRESH_COMBO {
+                    settings_commit_options(state, hwnd);
                     return LRESULT(0);
                 }
 
@@ -5135,26 +7321,16 @@ fn settings_wndproc_impl(
                             &format!("面板顺序：{}", names.join(" → ")),
                         );
                     } else {
-                        let ctl = GetDlgItem(hwnd, id as i32).unwrap_or_default();
-                        let _ = SendMessageW(ctl, BM_SETCHECK, WPARAM(1), LPARAM(0));
+                        set_check_state(hwnd, id as usize, true);
                         set_dlg_text(hwnd, IDC_CARDS_HINT as i32, "请至少保留一张卡片");
                     }
-                    return LRESULT(0);
-                }
-
-                // 透明度 / 明暗主题：点选**即时预览**——只改内存配置并重绘一帧，不落盘。
-                // 点"确定"才写盘生效；点"取消"或直接关窗由 WM_NCDESTROY 用快照还原。
-                let is_opacity = (IDC_OPACITY_BASE..IDC_OPACITY_BASE + OPACITY_STEPS.len())
-                    .contains(&(id as usize));
-                let is_theme =
-                    (IDC_THEME_BASE..IDC_THEME_BASE + THEME_LABELS.len()).contains(&(id as usize));
-                if (is_opacity || is_theme) && code == BN_CLICKED_CODE {
-                    apply_settings_preview(state, hwnd);
+                    // 勾选顺序已更新，立即落盘生效
+                    settings_commit_options(state, hwnd);
                     return LRESULT(0);
                 }
 
                 if id == 1 {
-                    // IDOK：地址非法只拦地址本身，其余开关照常保存并立即生效
+                    // IDOK：只提交地址 / 令牌；开关类在点击时已即时生效
                     let text = get_dlg_text(hwnd, IDC_ADDR_EDIT as i32);
                     let token_text = get_dlg_text(hwnd, IDC_TOKEN_EDIT as i32);
                     let mut nas = state.config.nas.clone();
@@ -5163,122 +7339,9 @@ fn settings_wndproc_impl(
                         nas.token = token_text.trim().to_string();
                         state.config.nas = nas;
                     }
+                    settings_commit_options(state, hwnd);
 
-                    let was_pinned = state.config.capsule.taskbar_pin;
-                    let theme_idx = (0..THEME_LABELS.len())
-                        .find(|&i| is_checked(hwnd, IDC_THEME_BASE + i))
-                        .unwrap_or(0);
-                    state.config.capsule.theme = crate::config::THEMES[theme_idx].to_string();
-                    state.config.capsule.taskbar_pin = is_checked(hwnd, IDC_TASKBAR_CHK);
-                    state.config.capsule.opacity = read_opacity(hwnd);
-                    state.config.capsule.click_outside_collapse =
-                        is_checked(hwnd, IDC_CLICK_OUTSIDE_CHK);
-                    state.config.capsule.hide_on_fullscreen = is_checked(hwnd, IDC_FS_CHK);
-                    let orient_idx = (0..ORIENT_LABELS.len())
-                        .find(|&i| is_checked(hwnd, IDC_ORIENT_BASE + i))
-                        .unwrap_or(0);
-                    state.config.capsule.orientation =
-                        crate::config::ORIENTATIONS[orient_idx].to_string();
-                    let was_big = state.config.capsule.expand_big();
-                    let style_idx = (0..STYLE_LABELS.len())
-                        .find(|&i| is_checked(hwnd, IDC_STYLE_BASE + i))
-                        .unwrap_or(0);
-                    state.config.capsule.expand_style =
-                        crate::config::EXPAND_STYLES[style_idx].to_string();
-                    let screen_idx = (0..SCREEN_LABELS.len())
-                        .find(|&i| is_checked(hwnd, IDC_SCREEN_BASE + i))
-                        .unwrap_or(0);
-                    state.config.screen.orientation =
-                        crate::config::SCREEN_ORIENTATIONS[screen_idx].to_string();
-                    // 小屏配色主题（下拉框选项），screen.ps1 每帧读配置，保存后下一帧就换
-                    let combo = GetDlgItem(hwnd, IDC_SCREEN_THEME_COMBO as i32).unwrap_or_default();
-                    let sel = SendMessageW(combo, CB_GETCURSEL_MSG, WPARAM(0), LPARAM(0)).0;
-                    let theme_idx = if sel > 0 {
-                        (sel as usize).min(SCREEN_THEME_LABELS.len() - 1)
-                    } else {
-                        0
-                    };
-                    state.config.screen.theme = crate::config::SCREEN_THEMES[theme_idx].to_string();
-                    // 显示模式：胶囊模式 / 机箱小屏模式（决定是否隐藏悬浮胶囊与任务栏三环）
-                    let mode_idx = (0..SCREEN_MODE_LABELS.len())
-                        .find(|&i| is_checked(hwnd, IDC_SCREEN_MODE_BASE + i))
-                        .unwrap_or(0);
-                    state.config.screen.mode = crate::config::SCREEN_MODES[mode_idx].to_string();
-                    // 三环模式＝固定到任务栏；小屏模式＝取消固定（悬浮窗整体隐藏）
-                    if state.config.screen.mode == crate::config::SCREEN_MODE_RINGS {
-                        state.config.capsule.taskbar_pin = true;
-                    } else if state.config.screen.mode == crate::config::SCREEN_MODE_SCREEN {
-                        state.config.capsule.taskbar_pin = false;
-                    }
-                    // 小屏显示项目：独立于 config.capsule.cards，单独读写
-                    let items = read_screen_items(hwnd);
-                    state.config.screen.cpu = items[0];
-                    state.config.screen.memory = items[1];
-                    state.config.screen.gpu = items[2];
-                    state.config.screen.network = items[3];
-                    state.config.screen.disk = items[4];
-                    state.config.screen.storage = items[5];
-                    state.config.screen.temp = items[6];
-                    state.config.screen.clock = items[7];
-                    state.config.screen.interval = read_screen_interval(hwnd);
-                    // 展开样式只影响展开形态：切换时先收起，避免旧面板几何残留
-                    if was_big != state.config.capsule.expand_big() && state.view.expanded() {
-                        collapse(state);
-                    }
-                    let mut picked = read_cards(hwnd);
-                    // 兜底：手改配置把六项全关掉时，按"至少保留一张卡片"回到全开
-                    if !picked.any() {
-                        picked = CardVis::default();
-                    } else {
-                        // 顺序取设置窗里记录的勾选先后
-                        picked.order = state.settings_card_order;
-                    }
-                    state.config.capsule.cards = picked;
-
-                    // 方向变了：先落到该方向的默认位置（竖条贴右缘 / 横条贴顶边），
-                    // 免得横竖互相"卡"在对方的位置上；再统一应用布局
-                    let want_v = state.config.capsule.orientation_hint() == Some(true);
-                    let cur_v = match state.shared.read() {
-                        Ok(g) => g.vertical,
-                        Err(e) => {
-                            eprintln!("[App] RwLock poisoned in settings_wndproc cur_v: {:?}", e);
-                            return LRESULT(0);
-                        }
-                    };
-                    if want_v != cur_v {
-                        let (cw, _) = collapsed_main_size(want_v);
-                        let (dx, dy) = default_capsule_pos(cw as i32, want_v);
-                        state.config.capsule.x = Some(dx);
-                        state.config.capsule.y = Some(dy);
-                        let _ = SetWindowPos(
-                            state.hwnd,
-                            None,
-                            dx,
-                            dy,
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    let _ = crate::config::save(&state.config);
-
-                    // 小屏配置变化：重启进程才会读取新配置（未启用时收掉残留进程）
-                    if state.config.screen.enabled {
-                        restart_native_screen(&state.shared, &state.config.screen);
-                    } else {
-                        stop_screen_engine();
-                    }
-
-                    // "点击面板外自动收起"即时生效：面板正开着就立刻挂/撤全局鼠标钩子
-                    if state.view.expanded() {
-                        if state.config.capsule.click_outside_collapse {
-                            mouse_hook_install();
-                        } else {
-                            mouse_hook_remove();
-                        }
-                    }
-
-                    // 立即生效：主题/掩码/主机名同步给渲染侧并强制重绘一帧
+                    // 主机名同步给渲染侧并重绘一帧
                     {
                         let mut sh = match state.shared.write() {
                             Ok(g) => g,
@@ -5291,28 +7354,8 @@ fn settings_wndproc_impl(
                             }
                         };
                         sh.nas_host = state.config.nas.host.clone();
-                        sh.dark = state.config.capsule.theme_dark();
-                        sh.cards = state.config.capsule.cards;
-                        sh.big = state.config.capsule.expand_big();
                         sh.bump_seq();
                     }
-                    if state.config.capsule.taskbar_pin != was_pinned {
-                        apply_taskbar_pin(state);
-                    } else {
-                        // 方向/位置变化在这里落定，再强制重绘一帧
-                        apply_layout(state, true);
-                        resize_window(state);
-                        paint_frame(state, true);
-                    }
-
-                    // 刚关掉"全屏应用时自动隐藏"时，若此前正被全屏藏起来，这里立刻恢复
-                    sync_fullscreen_state(state);
-
-                    // 显示模式：小屏模式隐藏悬浮窗/三环，切回胶囊模式按当前固定/展开状态恢复
-                    apply_screen_mode(state);
-
-                    // 已经落盘生效，快照作废：之后关窗不该再"还原"
-                    state.settings_orig = None;
                     if addr_ok {
                         let _ = state.cmd_tx.send(SourceCmd::SetTarget(
                             state.config.nas.addr(),
@@ -5357,9 +7400,6 @@ fn settings_wndproc_impl(
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                // 窗口没了但快照还在 = 用户是"取消/直接关窗"退出的，
-                // 把即时预览过的主题与透明度还原回打开设置窗时的样子
-                restore_settings_preview(state);
                 state.settings_hwnd = HWND(null_mut());
                 // 释放设置窗字体（每开一次窗建一个，关窗即回收）
                 if !state.settings_font.is_invalid() {

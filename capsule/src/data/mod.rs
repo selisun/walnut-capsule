@@ -82,6 +82,9 @@ pub struct Cpu {
     pub usage: Option<f64>,
     #[serde(default)]
     pub temp: Option<f64>,
+    /// CPU 厂商（amd / intel），服务端读 /proc/cpuinfo 得到；老服务端没有该字段
+    #[serde(default)]
+    pub vendor: Option<String>,
     /// 平均负载（1 / 5 / 15 分钟），老服务端没有这三个字段
     #[serde(default)]
     pub load1: Option<f64>,
@@ -141,6 +144,13 @@ pub struct Gpu {
     pub index: i32,
     #[serde(default)]
     pub name: String,
+    /// 显卡厂商（nvidia / amd / intel），小屏按它选品牌底图
+    #[serde(default)]
+    pub vendor: Option<String>,
+    /// 显卡形态（igpu / dgpu / unknown），NAS 0.1.76 起上报；旧版 NAS 不提供时为空。
+    /// 小屏只有一卡位，选卡时用它在「都有数据」时优先独显。
+    #[serde(default, rename = "type")]
+    pub gpu_type: Option<String>,
     #[serde(default)]
     pub temp: Option<i64>,
     #[serde(default)]

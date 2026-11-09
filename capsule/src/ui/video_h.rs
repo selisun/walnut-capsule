@@ -65,6 +65,7 @@ fn mock_snap(frame: u32) -> Snapshot {
         cpu: Some(Cpu {
             usage: Some(35.0 + (t * 2.3).sin() * 15.0),
             temp: Some(48.0 + (t * 1.7).cos() * 8.0),
+            vendor: None,
             load1: None,
             load5: None,
             load15: None,
@@ -108,6 +109,8 @@ fn mock_snap(frame: u32) -> Snapshot {
         gpus: Some(vec![Gpu {
             index: 0,
             name: "Intel UHD 770".into(),
+            vendor: Some("intel".into()),
+            gpu_type: Some("igpu".into()),
             utilization: Some((28.0 + (t * 1.8).sin() * 12.0) as i32),
             temp: Some((42.0 + (t * 1.3).cos() * 6.0) as i64),
             memory_used: Some(2 * 1024 * 1024 * 1024),

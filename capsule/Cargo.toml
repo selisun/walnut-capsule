@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "hetao-capsule"
-version = "0.2.34"
+version = "0.3.12"
 edition = "2021"
 
 [dependencies]
@@ -20,9 +20,14 @@ windows = { version = "0.58", features = [
     "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    # 安装器：SHBrowseForFolderW / BROWSEINFOW 选择安装目录
+    "Win32_UI_Shell_Common",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_Networking_WinSock",
+    # 双显右列：GetIfTable2 取本机网卡累计收发字节，算电脑网络速率
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Media",
     "Win32_System_Com",
     "Win32_Security",

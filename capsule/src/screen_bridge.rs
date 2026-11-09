@@ -57,6 +57,11 @@ pub struct OutPc {
     pub gpu_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_temp: Option<f32>,
+    /// 本机网络：收 / 发速率（字节每秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_rx: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_tx: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
@@ -65,6 +70,9 @@ pub struct OutCpu {
     pub usage_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_c: Option<f32>,
+    /// 厂商（amd / intel），小屏按 NAS 硬件选品牌底图
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_1m: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +101,9 @@ pub struct OutMemory {
 pub struct OutGpu {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 厂商（nvidia / amd / intel），小屏按 NAS 硬件选品牌底图
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,6 +199,10 @@ pub fn map_snapshot_with(
     let cpu = src.cpu.as_ref().map(|c| OutCpu {
         usage_pct: c.usage.map(|v| v as f32),
         temp_c: c.temp.map(|v| v as f32),
+        vendor: c
+            .vendor
+            .as_deref()
+            .and_then(|v| vendor_tag(v, &["amd", "intel"])),
         load_1m: c.load1.map(|v| v as f32),
         load_5m: c.load5.map(|v| v as f32),
         load_15m: c.load15.map(|v| v as f32),
@@ -208,6 +223,10 @@ pub fn map_snapshot_with(
         } else {
             Some(g.name.clone())
         },
+        vendor: g
+            .vendor
+            .as_deref()
+            .and_then(|v| vendor_tag(v, &["nvidia", "amd", "intel"])),
         usage_pct: g.utilization.map(|v| v as f32),
         temp_c: g.temp.map(|v| v as f32),
         vram_used_bytes: g.memory_used,
@@ -272,6 +291,12 @@ pub fn map_snapshot_with(
     }
 }
 
+/// 只放行已知厂商标识（小写），其余一律视为未知，避免把服务端脏字符串透传给小屏。
+fn vendor_tag(raw: &str, allowed: &[&str]) -> Option<String> {
+    let v = raw.trim().to_ascii_lowercase();
+    allowed.iter().find(|a| **a == v).map(|a| (*a).to_string())
+}
+
 fn pick_disk(src: &data::Snapshot) -> Option<&data::Disk> {
     let disks = src.disks.as_ref()?;
     disks.iter().min_by(|a, b| a.device.cmp(&b.device))
@@ -279,7 +304,28 @@ fn pick_disk(src: &data::Snapshot) -> Option<&data::Disk> {
 
 fn pick_gpu(src: &data::Snapshot) -> Option<&data::Gpu> {
     let gpus = src.gpus.as_ref()?;
-    gpus.iter().min_by_key(|g| g.index)
+    gpus.iter().min_by(|a, b| {
+        gpu_rank(a)
+            .cmp(&gpu_rank(b))
+            .then_with(|| a.index.cmp(&b.index))
+            .then_with(|| a.vendor.cmp(&b.vendor))
+    })
+}
+
+/// 小屏单卡位的选卡权重，越小越优先。
+///
+/// 1. **有任一可用指标**的卡优先：无驱动独显只是临时态（驱动没装好或刚换卡），
+///    不该把正在出数的核显挤掉；
+/// 2. 同为有数据或同为无数据时，按形态：独显 > 未知 > 核显——双显卡都正常时用户关心的是独显；
+/// 3. `index` 与厂商只作稳定兜底（见 `pick_gpu`）。
+fn gpu_rank(g: &data::Gpu) -> (u8, u8) {
+    let has_data = g.utilization.is_some() || g.temp.is_some() || g.memory_total.is_some();
+    let kind = match g.gpu_type.as_deref().map(str::trim) {
+        Some(t) if t.eq_ignore_ascii_case("dgpu") => 0u8,
+        Some(t) if t.eq_ignore_ascii_case("igpu") => 2,
+        _ => 1, // unknown / 旧版 NAS 未上报：按中间处理，不猜
+    };
+    (if has_data { 0 } else { 1 }, kind)
 }
 
 impl ScreenSnapshot {
@@ -450,6 +496,8 @@ pub fn run_push_loop(
                 mem_pct: sample.mem_pct,
                 gpu_pct: sample.gpu_pct,
                 gpu_temp: sample.gpu_temp,
+                net_rx: sample.net_rx_bps,
+                net_tx: sample.net_tx_bps,
             });
             let mapped = map_snapshot_with(&snapshot, online, seq, now(), pc, Some(&nas_host));
             if let Ok(bytes) = encode_snapshot(&mapped) {
@@ -600,6 +648,7 @@ mod tests {
             cpu: Some(data::Cpu {
                 usage: Some(12.5),
                 temp: Some(45.0),
+                vendor: Some("intel".to_string()),
                 load1: Some(0.5),
                 load5: Some(0.4),
                 load15: Some(0.3),
@@ -639,6 +688,8 @@ mod tests {
                 data::Gpu {
                     index: 1,
                     name: "card1".to_string(),
+                    vendor: Some("nvidia".to_string()),
+                    gpu_type: None,
                     temp: Some(60),
                     utilization: Some(10),
                     memory_used: Some(0),
@@ -647,6 +698,8 @@ mod tests {
                 data::Gpu {
                     index: 0,
                     name: "card0".to_string(),
+                    vendor: Some("amd".to_string()),
+                    gpu_type: None,
                     temp: Some(50),
                     utilization: Some(30),
                     memory_used: Some(1_073_741_824),
@@ -664,7 +717,7 @@ mod tests {
     }
 
     /// 与 `windows-screen/crates/screen-ipc/tests/b10_golden.rs` 中的常量**必须逐字节一致**。
-    const GOLDEN_JSON: &str = "{\"seq\":42,\"ts_ms\":1700000000000,\"nas\":{\"name\":\"nas\",\"online\":true},\"metrics\":{\"cpu\":{\"usage_pct\":12.5,\"temp_c\":45.0,\"load_1m\":0.5,\"load_5m\":0.4,\"load_15m\":0.3},\"memory\":{\"usage_pct\":55.0,\"used_bytes\":8589934592,\"total_bytes\":17179869184,\"cached_bytes\":2147483648,\"available_bytes\":8589934592},\"gpu\":{\"name\":\"card0\",\"usage_pct\":30.0,\"temp_c\":50.0,\"vram_used_bytes\":1073741824,\"vram_total_bytes\":8589934592},\"network\":{\"iface\":\"eth0\",\"up_bps\":200,\"down_bps\":100},\"disk\":{\"device\":\"/dev/sda\",\"read_bps\":1024,\"write_bps\":2048},\"storage\":[{\"name\":\"vol1\",\"used_bytes\":1000,\"total_bytes\":2000}]}}";
+    const GOLDEN_JSON: &str = "{\"seq\":42,\"ts_ms\":1700000000000,\"nas\":{\"name\":\"nas\",\"online\":true},\"metrics\":{\"cpu\":{\"usage_pct\":12.5,\"temp_c\":45.0,\"vendor\":\"intel\",\"load_1m\":0.5,\"load_5m\":0.4,\"load_15m\":0.3},\"memory\":{\"usage_pct\":55.0,\"used_bytes\":8589934592,\"total_bytes\":17179869184,\"cached_bytes\":2147483648,\"available_bytes\":8589934592},\"gpu\":{\"name\":\"card0\",\"vendor\":\"amd\",\"usage_pct\":30.0,\"temp_c\":50.0,\"vram_used_bytes\":1073741824,\"vram_total_bytes\":8589934592},\"network\":{\"iface\":\"eth0\",\"up_bps\":200,\"down_bps\":100},\"disk\":{\"device\":\"/dev/sda\",\"read_bps\":1024,\"write_bps\":2048},\"storage\":[{\"name\":\"vol1\",\"used_bytes\":1000,\"total_bytes\":2000}]}}";
 
     #[test]
     fn golden_json_is_stable_and_cross_checked() {
@@ -694,6 +747,7 @@ mod tests {
             cpu: Some(data::Cpu {
                 usage: None,
                 temp: None,
+                vendor: None,
                 load1: None,
                 load5: None,
                 load15: None,
@@ -719,10 +773,202 @@ mod tests {
         let gpu = mapped.metrics.gpu.expect("gpu");
         assert_eq!(gpu.name.as_deref(), Some("card0"));
         assert_eq!(gpu.usage_pct, Some(30.0));
+        assert_eq!(gpu.vendor.as_deref(), Some("amd"));
         let net = mapped.metrics.network.expect("network");
         assert_eq!(net.iface.as_deref(), Some("eth0"));
         assert_eq!(net.up_bps, Some(200));
         assert_eq!(net.down_bps, Some(100));
+    }
+
+    #[test]
+    fn vendor_passes_through_and_unknown_is_dropped() {
+        let mapped = map_snapshot(&fixture_source(), true, 1, 0);
+        assert_eq!(
+            mapped.metrics.cpu.expect("cpu").vendor.as_deref(),
+            Some("intel"),
+            "NAS 的 CPU 厂商要透传给小屏选底图"
+        );
+
+        // 服务端给了不认识的字符串：不透传，交给小屏保留原底图
+        let src = data::Snapshot {
+            cpu: Some(data::Cpu {
+                usage: Some(1.0),
+                temp: None,
+                vendor: Some(" Cyrix ".to_string()),
+                load1: None,
+                load5: None,
+                load15: None,
+                load30: None,
+            }),
+            gpus: Some(vec![data::Gpu {
+                index: 0,
+                name: "odd".to_string(),
+                vendor: Some("3dfx".to_string()),
+                gpu_type: None,
+                temp: None,
+                utilization: Some(1),
+                memory_used: None,
+                memory_total: None,
+            }]),
+            ..Default::default()
+        };
+        let mapped = map_snapshot(&src, true, 1, 0);
+        assert!(mapped.metrics.cpu.expect("cpu").vendor.is_none());
+        assert!(mapped.metrics.gpu.expect("gpu").vendor.is_none());
+    }
+
+    #[test]
+    fn pick_gpu_prefers_data_then_discrete() {
+        fn gpu(index: i32, vendor: &str, kind: Option<&str>, util: Option<i32>) -> data::Gpu {
+            data::Gpu {
+                index,
+                name: format!("{vendor}{index}"),
+                vendor: Some(vendor.to_string()),
+                gpu_type: kind.map(str::to_string),
+                temp: None,
+                utilization: util,
+                memory_used: None,
+                memory_total: None,
+            }
+        }
+        fn pick(gpus: Vec<data::Gpu>) -> Option<String> {
+            let src = data::Snapshot {
+                gpus: Some(gpus),
+                ..Default::default()
+            };
+            pick_gpu(&src).map(|g| g.name.clone())
+        }
+
+        // 双显卡都正常：选独显，不能因为核显 index 小就选核显
+        assert_eq!(
+            pick(vec![
+                gpu(0, "intel", Some("igpu"), Some(5)),
+                gpu(1, "nvidia", Some("dgpu"), Some(40)),
+            ])
+            .as_deref(),
+            Some("nvidia1")
+        );
+        // 独显没数据（驱动未就绪）：选正在出数的核显
+        assert_eq!(
+            pick(vec![
+                gpu(0, "intel", Some("igpu"), Some(5)),
+                gpu(1, "nvidia", Some("dgpu"), None),
+            ])
+            .as_deref(),
+            Some("intel0")
+        );
+        // 只有核显
+        assert_eq!(
+            pick(vec![gpu(0, "amd", Some("igpu"), Some(12))]).as_deref(),
+            Some("amd0")
+        );
+        // 双独显一好一坏：选有数据的那张
+        assert_eq!(
+            pick(vec![
+                gpu(0, "nvidia", Some("dgpu"), None),
+                gpu(1, "nvidia", Some("dgpu"), Some(10)),
+            ])
+            .as_deref(),
+            Some("nvidia1")
+        );
+        // 旧版 NAS 不报 type：不猜形态，有数据的优先，其次 index
+        assert_eq!(
+            pick(vec![
+                gpu(0, "intel", None, Some(1)),
+                gpu(2, "nvidia", None, Some(40)),
+            ])
+            .as_deref(),
+            Some("intel0")
+        );
+        // 只有品牌没有数值（N 卡无驱动）：仍要选中它，品牌底图才切得过去
+        assert_eq!(
+            pick(vec![gpu(0, "nvidia", Some("dgpu"), None)]).as_deref(),
+            Some("nvidia0")
+        );
+        assert!(pick(vec![]).is_none());
+    }
+
+    #[test]
+    fn dual_gpu_nas_payload_picks_discrete_end_to_end() {
+        // 用 NAS /metrics 的真实 JSON 形状走完整链路：反序列化 → 选卡 → 小屏 payload。
+        // 顺带守住 `type` 的 serde 重命名：写错时这里会退化成「无 type」，双显卡规则静默失效。
+        let json = r#"{
+            "timestamp": 1,
+            "hostname": "nas",
+            "cpu": {"usage": 10.0, "vendor": "intel"},
+            "memory": {"usage": 30.0, "used": 1, "total": 2},
+            "gpus": [
+                {"index": 0, "name": "Intel 核显", "vendor": "intel", "type": "igpu",
+                 "temp": 45, "utilization": 5},
+                {"index": 1, "name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "type": "dgpu",
+                 "temp": 60, "utilization": 40, "memory_used": 1073741824, "memory_total": 12884901888}
+            ]
+        }"#;
+        let src: data::Snapshot = serde_json::from_str(json).expect("NAS JSON");
+        assert_eq!(
+            src.gpus.as_ref().expect("gpus")[1].gpu_type.as_deref(),
+            Some("dgpu"),
+            "type 字段必须能反序列化"
+        );
+
+        let mapped = map_snapshot(&src, true, 1, 0);
+        let gpu = mapped.metrics.gpu.expect("gpu");
+        assert_eq!(gpu.vendor.as_deref(), Some("nvidia"), "双显卡都正常时应选独显");
+        assert_eq!(gpu.usage_pct, Some(40.0));
+
+        // 独显驱动未就绪（只有品牌、没有数值）：选正在出数的核显
+        let json = r#"{
+            "gpus": [
+                {"index": 0, "name": "Intel 核显", "vendor": "intel", "type": "igpu",
+                 "temp": 45, "utilization": 5},
+                {"index": 0, "name": "NVIDIA 显卡", "vendor": "nvidia", "type": "dgpu",
+                 "status": "unavailable", "temp": null, "utilization": null}
+            ]
+        }"#;
+        let src: data::Snapshot = serde_json::from_str(json).expect("NAS JSON");
+        let mapped = map_snapshot(&src, true, 1, 0);
+        let gpu = mapped.metrics.gpu.expect("gpu");
+        assert_eq!(gpu.vendor.as_deref(), Some("intel"), "独显无数据时选核显");
+        assert_eq!(gpu.usage_pct, Some(5.0));
+    }
+
+    #[test]
+    fn gpu_brand_only_card_still_passes_vendor() {
+        // NAS 认出实体卡但驱动/工具不可用时会推一条「只有厂商、没有数值」的占位卡：
+        // 小屏必须据此切到对应品牌底图，数值留空（显示 --），不能因为没指标就把整项丢掉。
+        let src = data::Snapshot {
+            cpu: Some(data::Cpu {
+                usage: Some(5.0),
+                temp: None,
+                vendor: Some("amd".to_string()),
+                load1: None,
+                load5: None,
+                load15: None,
+                load30: None,
+            }),
+            gpus: Some(vec![data::Gpu {
+                index: 0,
+                name: "NVIDIA 显卡".to_string(),
+                vendor: Some("nvidia".to_string()),
+                gpu_type: Some("dgpu".to_string()),
+                temp: None,
+                utilization: None,
+                memory_used: None,
+                memory_total: None,
+            }]),
+            ..Default::default()
+        };
+        let mapped = map_snapshot(&src, true, 1, 0);
+        let gpu = mapped.metrics.gpu.as_ref().expect("gpu 品牌卡应保留");
+        assert_eq!(gpu.vendor.as_deref(), Some("nvidia"));
+        assert!(gpu.usage_pct.is_none() && gpu.temp_c.is_none());
+        let json = mapped.payload_json().expect("json");
+        assert!(json.contains("\"vendor\":\"nvidia\""));
+        let gpu_json = json.split("\"gpu\":").nth(1).expect("gpu json");
+        assert!(
+            !gpu_json.contains("usage_pct") && !gpu_json.contains("temp_c"),
+            "占位卡缺失值不得写成 0：{gpu_json}"
+        );
     }
 
     #[test]

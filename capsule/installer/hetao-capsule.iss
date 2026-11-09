@@ -1,9 +1,9 @@
-; 核桃胶囊 电脑端安装程序（Inno Setup 6）
+﻿; 核桃胶囊 电脑端安装程序（Inno Setup 6）
 ; 编译：ISCC.exe hetao-capsule.iss
 ; 说明：免管理员安装（装到用户目录），创建开始菜单/桌面快捷方式，可选开机自启。
 
 #define AppName "核桃胶囊"
-#define AppVer "0.2.34"
+#define AppVer "0.3.12"
 #define AppExe "hetao-capsule.exe"
 #define AppPublisher "蓝胖纸"
 ; 小屏进程必须随安装包一起分发，缺失时直接让编译失败，避免静默产出「没有小屏」的安装包
@@ -24,7 +24,8 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=output
-OutputBaseFilename=hetao-capsule-setup-{#AppVer}
+; 核心安装包固定输出名：自绘安装界面 setup_ui.exe 会在同目录按这个名字调用它
+OutputBaseFilename=hetao-capsule-setup-core
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -54,6 +55,13 @@ Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; B-10 native 引擎的小屏进程，必须与主 exe 同目录；缺失时编译期已报错，不再静默跳过
 Source: "{#ScreenExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "使用说明.txt"; DestDir: "{app}"; Flags: ignoreversion
+; MIT 许可全文随包落地，安装向导不再单独占一屏
+Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+; 官方皮肤主题（深/白 × 横/竖 × 品牌）：写入用户主题目录
+; JSON 必须随版本覆盖：新增品牌变体/修正哈希后，老用户也能拿到；
+; 图片用 onlyifdoesntexist 避免覆盖用户自行替换的底图；uninsneveruninstall 卸载不删
+Source: "themes\*.json"; DestDir: "{userappdata}\hetao-capsule\screen\themes"; Flags: ignoreversion
+Source: "themes\*"; DestDir: "{userappdata}\hetao-capsule\screen\themes"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
