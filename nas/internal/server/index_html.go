@@ -26,6 +26,10 @@ header{display:flex;align-items:center;justify-content:space-between;gap:12px;ma
 /* 进程用量胶囊（徽章左侧） */
 .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 12px;border-radius:999px;background:#eef2f7;color:#475569;font-variant-numeric:tabular-nums}
 .chip .dot{color:#cbd5e1}
+/* 反馈入口：图标 + 文字，放在顶栏右侧 */
+.fb{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 12px;border-radius:999px;background:#eef2f7;color:#475569;text-decoration:none;transition:background .15s,color .15s}
+.fb:hover{background:#e0e7ff;color:#3730a3}
+.fb svg{width:14px;height:14px;flex:none}
 /* 概览信息条 */
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
 .stat{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
@@ -75,6 +79,10 @@ pre#logs{margin:12px 0 0;padding:12px;background:#0b1020;color:#d1e0ff;border-ra
   <div class="head-right">
     <span class="chip" id="usage">CPU — <span class="dot">·</span> 内存 —</span>
     <span class="badge" id="badge">连接中</span>
+    <a class="fb" href="https://hetao.mzl.cc/" target="_blank" rel="noopener noreferrer" title="反馈问题">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-4-.9L3 21l1.9-4.6A8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5z"/><path d="M12 8v4"/><path d="M12 15h.01"/></svg>
+      反馈问题
+    </a>
   </div>
 </header>
 

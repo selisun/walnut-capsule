@@ -1,5 +1,5 @@
 ﻿appname=hetaocapsule
-version=0.1.71
+version=0.1.77
 display_name=核桃胶囊
 desc=<p>核桃胶囊是一款轻量 NAS 状态监控应用：在电脑桌面以悬浮胶囊实时显示 NAS 的 CPU、内存、网络速率、硬盘读写与存储卷用量。</p><p>应用内置管理页，可查看并复制配对令牌、选择监控网卡、手动设置网卡协商速率、查看运行日志，并直接下载 Windows 电脑客户端。数据仅在局域网内传输，不监听公网、不收集任何用户数据。</p>
 platform=x86
@@ -21,4 +21,4 @@ disable_authorization_path=true
 # 注意：appname 不能含点（如 com.hetao.capsule），否则 appcenter 不解析 gateway 字段导致桌面图标 404
 os_min_version=1.1.3100
 ctl_stop=true
-changelog=新增：1、展开样式新增大卡片样式；2、卡片顺序按勾选先后排列；3、安装端口可自定义。修复：1、一些设备 CPU 持续占用较高的问题；2、若干已知问题；3、安全加固若干功能。
+changelog=【电脑端】优化：小屏显卡卡位改为「有数据优先、同为有数据时独显优先」，双显卡机器不再只显示核显；读不到的指标继续显示 --。【NAS 端】沿用上版的多卡并列采集与品牌占位能力（NVIDIA 驱动未就绪时仍上报厂商并明确提示状态）。

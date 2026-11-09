@@ -22,6 +22,30 @@ func writeSys(t *testing.T, root, rel, content string) {
 	}
 }
 
+// CPU 厂商只用于小屏品牌底图：认 GenuineIntel / AuthenticAMD，其它一律留空。
+func TestReadCPUVendor(t *testing.T) {
+	cases := []struct {
+		name    string
+		cpuinfo string
+		want    string
+	}{
+		{"intel", "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel\n", "intel"},
+		{"amd", "processor\t: 0\nvendor_id\t: AuthenticAMD\n", "amd"},
+		{"arm", "processor\t: 0\nCPU implementer\t: 0x41\n", ""},
+		{"unknown-vendor", "vendor_id\t: CyrixInstead\n", ""},
+	}
+	for _, c := range cases {
+		root := t.TempDir()
+		writeSys(t, root, "cpuinfo", c.cpuinfo)
+		if got := readCPUVendor(root); got != c.want {
+			t.Fatalf("%s: readCPUVendor=%q，期望 %q", c.name, got, c.want)
+		}
+	}
+	if got := readCPUVendor(filepath.Join(t.TempDir(), "missing")); got != "" {
+		t.Fatalf("cpuinfo 不存在时应返回空串，实际 %q", got)
+	}
+}
+
 // hwChan 一个 hwmon 温度通道：num 为 tempN 的 N，val 为毫摄氏度，label 可空
 type hwChan struct {
 	num   string

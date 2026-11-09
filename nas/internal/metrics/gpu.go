@@ -1,68 +1,122 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// gpuSampler 采集显卡占用，独显优先、核显兜底（两者不同时展示）：
-//   - 独显：nvidia-smi（2~5s 间隔，由外层调度）；未安装、驱动未加载或执行失败时跳过；
-//   - 核显：/sys/class/drm 下的 Intel(i915) / AMD(amdgpu)，无需额外工具，
-//     仅在检测不到独显时才作为数据源。
+// gpuSampler 采集所有可用显卡（多卡并列，不再「独显优先、核显兜底」）：
+//   - Intel / AMD：只读 /sys/class/drm（核显、独显都走这条，零外部进程）；
+//   - NVIDIA：nvidia-smi，调用前做驱动/设备节点前置检查，失败退避，绝不触发驱动加载。
+//
+// 资源约束：设备发现低频（30s）缓存，指标采样跟随外层 3s 调度；任何一路失败
+// 都不影响其它显卡，也不向外抛错。
 type gpuSampler struct {
-	path string
-	sys  string
+	sys string
+	// nvidia 相关路径与执行函数可注入，便于用假 sysfs 做单测。
+	nvPath    string
+	nvModDir  string
+	nvDevNode string
+	nvRun     func(ctx context.Context, path string) ([]byte, error)
 
-	// 采集状态：短文案给管理页展示，reason 给日志（只在变化时打一条）。
-	status string
-	reason string
-	// 连续失败次数与退避到期时间：nvidia-smi 执行失败后按 60s → 300s 退避，
-	// 不再每个采样周期都重试。
+	// sampleMu 串行化整轮采样：RC6 基线、发现缓存、NVIDIA 退避只在采样线程内读写。
+	// 用 TryLock：上一轮还没结束（例如 nvidia-smi 卡住）时直接跳过本轮，不排队堆积。
+	sampleMu sync.Mutex
+
+	// 以下字段只在持有 sampleMu 时访问。
+	devs      []gpuDevice
+	devAt     time.Time
+	nvPresent bool
+	igPrev    map[string]rc6Sample
 	nvFails   int
 	nvNextTry time.Time
+	nvState   string
+	nvReason  string
 
-	// 核显 RC6 基线：i915 不导出 gpu_busy_percent，用 rc6_residency_ms
-	// 的增量反推活跃度，需要保留上一次的读数与时间。
-	igPrev   map[string]uint64
-	igPrevAt map[string]time.Time
-
-	mu   sync.RWMutex
-	gpus []GPU
+	// mu 只保护对外可见的数据；采样时绝不在持锁状态下执行外部命令。
+	mu     sync.RWMutex
+	gpus   []GPU
+	status string
+	reason string
 }
 
-// NVIDIA 驱动的两个判据（两者都要满足才会调用 nvidia-smi）：
-//   - /sys/module/nvidia：内核模块是否已加载；
-//   - /dev/nvidiactl：模块初始化后由 udev 创建的控制设备。
+type rc6Sample struct {
+	v  uint64
+	at time.Time
+}
+
 const (
+	// NVIDIA 驱动的两个判据（两者都要满足才会调用 nvidia-smi）：
+	//   - /sys/module/nvidia：内核模块是否已加载；
+	//   - /dev/nvidiactl：模块初始化后由 udev 创建的控制设备。
 	nvidiaModDir  = "/sys/module/nvidia"
 	nvidiaDevNode = "/dev/nvidiactl"
+
+	// nvidia-smi 单次执行上限与输出上限（异常输出不得把内存撑爆）。
+	nvTimeout   = 3 * time.Second
+	nvMaxOutput = 256 * 1024
+
+	// 设备发现缓存：/sys/class/drm 低频扫描，指标采样复用缓存路径。
+	drmRescanInterval = 30 * time.Second
+
+	// RC6 反推使用率的时间窗上限；超过视为基线失效（休眠唤醒、采样被阻塞）。
+	rc6MaxGap = 10 * time.Second
+
+	// 失败退避：60s → 300s → 600s → 1200s → 1800s 封顶。
+	nvBackoffMin = 60 * time.Second
+	nvBackoffMax = 30 * time.Minute
+
+	// 单块卡的显存上限（MiB）：16 TiB，超过视为脏数据，避免字节换算溢出。
+	maxVRAMMiB = 1 << 24
 )
 
 // 管理页展示的显卡采集状态（尽量短，表格一列放得下）。
 const (
 	gpuStatusPending = "检测中"
 	gpuStatusOK      = "正常"
+	gpuStatusPartial = "部分可用"
 	gpuStatusNoTool  = "无驱动工具"
 	gpuStatusNoDrv   = "驱动未加载"
 	gpuStatusNoNode  = "设备未就绪"
 	gpuStatusFailed  = "采集异常"
+	gpuStatusNone    = "未检测到"
 )
+
+// 显卡形态与单卡状态（写进 GPU.Type / GPU.Status，供前端区分展示）。
+const (
+	gpuTypeIGPU    = "igpu"
+	gpuTypeDGPU    = "dgpu"
+	gpuTypeUnknown = "unknown"
+
+	gpuItemOK      = "ok"
+	gpuItemPartial = "partial"
+	gpuItemError   = "error"
+	// gpuItemUnavailable：认出了实体卡（PCI 上有），但驱动/工具不可用，一个指标都读不到。
+	// 与 error 的区别：error 是「驱动在、但读到的值不可用」，unavailable 是「根本没驱动」。
+	gpuItemUnavailable = "unavailable"
+)
+
+// nvidia-smi 超时哨兵错误（用于把「超时」和「执行失败」分类记录）。
+var errNvTimeout = errors.New("nvidia-smi 执行超时")
 
 func newGPUSampler(sys string) *gpuSampler {
 	path, _ := exec.LookPath("nvidia-smi")
 	return &gpuSampler{
-		path:     path,
-		sys:      sys,
-		igPrev:   map[string]uint64{},
-		igPrevAt: map[string]time.Time{},
+		sys:       sys,
+		nvPath:    path,
+		nvModDir:  nvidiaModDir,
+		nvDevNode: nvidiaDevNode,
+		igPrev:    map[string]rc6Sample{},
 	}
 }
 
@@ -74,82 +128,7 @@ func (s *gpuSampler) snapshot() []GPU {
 	return out
 }
 
-// sample 采集显卡：有独显只报独显，没有独显才回退到核显（两者不并列显示）。
-// 核显每轮都采样（即便本轮不展示），以保持 RC6 基线——独显拔除/驱动异常时
-// 下一轮即可直接给出核显占用，而不必再等一个采样周期。
-func (s *gpuSampler) sample() {
-	ig := s.sampleIGPU()
-	gpus := s.sampleNvidia()
-	if len(gpus) == 0 {
-		gpus = ig
-	}
-	s.mu.Lock()
-	s.gpus = gpus
-	s.mu.Unlock()
-}
-
-// sampleNvidia 经 nvidia-smi 采集独显信息；未安装、驱动未加载或执行失败返回 nil。
-//
-// 关键：先确认驱动真的加载了再调用 nvidia-smi。设备节点缺失时调用 nvidia-smi，
-// 它会连带触发 nvidia-modprobe → modprobe，把上百 MB 的 nvidia.ko 读进来尝试
-// insmod；在驱动被安全策略拒绝的机器上（老笔记本转 NAS 很常见）这每次要烧掉
-// 几百毫秒内核态 CPU，且 nvidia-smi 进程只活零点几秒，按秒采样的进程列表根本
-// 抓不到——表现为「查不到进程的持续 20~30% CPU 占用」。
-func (s *gpuSampler) sampleNvidia() []GPU {
-	if s.path == "" {
-		s.setState(gpuStatusNoTool, "未检测到 nvidia-smi（未安装 NVIDIA 驱动工具）")
-		return nil
-	}
-	if _, err := os.Stat(nvidiaModDir); err != nil {
-		s.setState(gpuStatusNoDrv, "NVIDIA 驱动未加载（缺少 "+nvidiaModDir+"）")
-		return nil
-	}
-	if _, err := os.Stat(nvidiaDevNode); err != nil {
-		s.setState(gpuStatusNoNode, "NVIDIA 驱动已加载，但缺少 "+nvidiaDevNode+"（udev 未创建或权限受限）")
-		return nil
-	}
-	if time.Now().Before(s.nvNextTry) {
-		return nil // 上次执行失败，退避中（状态保持「采集异常」）
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, s.path,
-		"--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total",
-		"--format=csv,noheader,nounits").Output()
-	if err != nil {
-		s.backoff()
-		s.setState(gpuStatusFailed, "nvidia-smi 执行失败："+err.Error()+"，已退避")
-		return nil
-	}
-	s.nvFails = 0
-	s.nvNextTry = time.Time{}
-	s.setState(gpuStatusOK, "")
-	var gpus []GPU
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		f := strings.Split(line, ",")
-		if len(f) < 6 {
-			continue
-		}
-		for i := range f {
-			f[i] = strings.TrimSpace(f[i])
-		}
-		idx, err := strconv.Atoi(f[0])
-		if err != nil {
-			continue
-		}
-		gpus = append(gpus, GPU{
-			Index:       idx,
-			Name:        f[1],
-			Temp:        parseIntOrNil(f[2]),
-			Utilization: parseIntOrNil(f[3]),
-			MemUsed:     parseMiBPtr(f[4]),
-			MemTotal:    parseMiBPtr(f[5]),
-		})
-	}
-	return gpus
-}
-
-// Status 返回显卡采集状态短文案（管理页展示，说明为什么没有显卡数据）。
+// Status 返回显卡采集状态短文案（管理页展示）。
 func (s *gpuSampler) Status() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -159,115 +138,360 @@ func (s *gpuSampler) Status() string {
 	return s.status
 }
 
-// setState 更新采集状态；reason 非空表示不可用/异常，仅在原因变化时记一条日志，
-// 避免老机器上日志刷屏。
-func (s *gpuSampler) setState(short, reason string) {
+// sample 采集一轮：DRM（Intel/AMD）+ NVIDIA，多卡并列输出。
+// 任一路失败只影响该路，不影响其它显卡。
+func (s *gpuSampler) sample() {
+	if !s.sampleMu.TryLock() {
+		return // 上一轮尚未结束：跳过本轮，避免采样任务堆积
+	}
+	defer s.sampleMu.Unlock()
+
+	now := time.Now()
+	devs := s.discover(now)
+	seenIntel := make(map[string]bool, len(devs))
+
+	var out []GPU
+	missing := false
+	for _, d := range devs {
+		if d.vendor == 0x8086 {
+			seenIntel[d.id] = true
+		}
+		g, ok := s.sampleDRMDevice(d, now)
+		if !ok {
+			missing = true // 设备刚被拔掉：下一轮强制重新发现
+			continue
+		}
+		out = append(out, g)
+	}
+	// 清掉已消失设备的 RC6 基线，避免设备编号复用后继承旧基线。
+	for k := range s.igPrev {
+		if !seenIntel[k] {
+			delete(s.igPrev, k)
+		}
+	}
+	if missing {
+		s.devAt = time.Time{}
+	}
+
+	nvGPUs := s.sampleNvidia(now)
+	out = append(out, nvGPUs...)
+	// 认出了 NVIDIA 实体卡，但驱动/工具不可用：补一条「只有品牌、没有指标」的占位卡。
+	// 小屏官方皮肤靠厂商选品牌底图，缺了这条就会按 CPU 猜成核显品牌（如 AMD 平台显示 AMD 卡图）；
+	// 指标一律留空，客户端按既有约定显示 N/A，绝不伪造 0。
+	if s.nvPresent && len(nvGPUs) == 0 && s.nvState != "" && s.nvState != gpuStatusOK {
+		out = append(out, GPU{
+			Index:  0,
+			Name:   "NVIDIA 显卡",
+			Vendor: "nvidia",
+			Type:   gpuTypeDGPU,
+			Dev:    "nvidia:0",
+			Status: gpuItemUnavailable,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Index != out[j].Index {
+			return out[i].Index < out[j].Index
+		}
+		return out[i].Vendor < out[j].Vendor
+	})
+
+	status, reason := s.aggregate(out)
+	s.publish(out, status, reason)
+}
+
+// publish 原子替换对外数据，并只在状态变化时打一条日志（避免每轮刷屏）。
+func (s *gpuSampler) publish(gpus []GPU, status, reason string) {
 	s.mu.Lock()
-	changed := s.status != short || s.reason != reason
-	s.status, s.reason = short, reason
+	changed := s.status != status || s.reason != reason
+	s.gpus = gpus
+	s.status = status
+	s.reason = reason
 	s.mu.Unlock()
 	if !changed {
 		return
 	}
-	if reason == "" {
-		log.Printf("NVIDIA 驱动可用，开始通过 nvidia-smi 采集独显")
-		return
+	switch {
+	case reason != "":
+		log.Printf("GPU 采集状态：%s（%s）", status, reason)
+	case len(gpus) == 0:
+		log.Printf("GPU 采集状态：%s", status)
+	default:
+		if status == gpuStatusOK {
+			log.Printf("GPU 采集状态：%s（共 %d 块，全部正常）", status, len(gpus))
+		} else {
+			log.Printf("GPU 采集状态：%s（共 %d 块）", status, len(gpus))
+		}
 	}
-	log.Printf("%s；已跳过独显采集，避免反复触发 nvidia-modprobe 加载驱动", reason)
 }
 
-// backoff 为执行失败的 nvidia-smi 设置退避：首次 60s，之后 300s。
-func (s *gpuSampler) backoff() {
-	s.nvFails++
-	d := 60 * time.Second
-	if s.nvFails >= 2 {
-		d = 300 * time.Second
+// aggregate 汇总总体状态：只要有一块卡可用就不算整体故障。
+func (s *gpuSampler) aggregate(gpus []GPU) (string, string) {
+	if len(gpus) == 0 {
+		switch s.nvState {
+		case gpuStatusFailed:
+			return gpuStatusFailed, s.nvReason
+		case gpuStatusNoDrv:
+			if s.nvPresent {
+				return gpuStatusNoDrv, s.nvReason
+			}
+		case gpuStatusNoNode:
+			return gpuStatusNoNode, s.nvReason
+		case gpuStatusNoTool:
+			// 有实体卡但 PATH 里没有 nvidia-smi：同样要明确提示，不能笼统报「未检测到」。
+			if s.nvPresent {
+				return gpuStatusNoTool, s.nvReason
+			}
+		}
+		return gpuStatusNone, ""
 	}
-	s.nvNextTry = time.Now().Add(d)
+
+	okCount, partial, failed, unavailable := 0, 0, 0, 0
+	for _, g := range gpus {
+		switch g.Status {
+		case gpuItemOK:
+			okCount++
+		case gpuItemPartial:
+			partial++
+		case gpuItemUnavailable:
+			unavailable++
+		default:
+			failed++
+		}
+	}
+	// NVIDIA 有实体卡但采集不可用（含未装工具）：即便核显正常，也应明确是「部分可用」，
+	// 不能把「有一块卡没采到」隐藏成整体正常。
+	nvDegraded := s.nvPresent && s.nvState != "" && s.nvState != gpuStatusOK
+
+	switch {
+	case failed > 0 && okCount+partial == 0:
+		return gpuStatusFailed, "所有 GPU 指标均不可读"
+	case okCount == 0 && partial == 0 && unavailable > 0:
+		// 只认出卡、一个指标都读不到：如实回报驱动/工具状态（驱动未加载 / 无驱动工具 …）。
+		if s.nvState != "" {
+			return s.nvState, s.nvReason
+		}
+		return gpuStatusFailed, "GPU 指标不可读"
+	case partial > 0 || failed > 0 || unavailable > 0 || nvDegraded:
+		return gpuStatusPartial, ""
+	default:
+		return gpuStatusOK, ""
+	}
 }
 
-// sampleIGPU 扫描 /sys/class/drm/card*，采集核显使用率与温度，编号从 0 起。
-// 取不到使用率的卡直接跳过，避免出现一块只有温度的“假”占用。
-func (s *gpuSampler) sampleIGPU() []GPU {
-	if s.sys == "" {
+// ---------------- NVIDIA ----------------
+
+// sampleNvidia 经 nvidia-smi 采集独显；未安装/驱动未加载/节点缺失/退避中一律跳过。
+//
+// 关键：先确认驱动真的加载了再调用 nvidia-smi。设备节点缺失时调用 nvidia-smi，
+// 它会连带触发 nvidia-modprobe → modprobe，把上百 MB 的 nvidia.ko 读进来尝试
+// insmod；在驱动被安全策略拒绝的机器上（老笔记本转 NAS 很常见）这每次要烧掉
+// 几百毫秒内核态 CPU，且 nvidia-smi 进程只活零点几秒，按秒采样的进程列表根本
+// 抓不到——表现为「查不到进程的持续 20~30% CPU 占用」。
+func (s *gpuSampler) sampleNvidia(now time.Time) []GPU {
+	if s.nvPath == "" {
+		s.nvSet(gpuStatusNoTool, "未检测到 nvidia-smi（未安装 NVIDIA 驱动工具）")
 		return nil
 	}
-	cards, _ := filepath.Glob(filepath.Join(s.sys, "class", "drm", "card[0-9]*"))
-	now := time.Now()
-	var out []GPU
-	for _, card := range cards {
-		vendor, ok := readHex(filepath.Join(card, "device", "vendor"))
-		if !ok || (vendor != 0x8086 && vendor != 0x1002) {
-			continue // 只认 Intel / AMD 核显
+	if _, err := os.Stat(s.nvModDir); err != nil {
+		// 驱动没加载：只 stat，绝不调用 nvidia-smi / modprobe。
+		s.nvSet(gpuStatusNoDrv, "NVIDIA 驱动未加载（缺少 "+s.nvModDir+"）")
+		return nil
+	}
+	if _, err := os.Stat(s.nvDevNode); err != nil {
+		// 模块在但设备节点没出来：可能是 udev 未创建或权限受限，同样不调用。
+		s.nvSet(gpuStatusNoNode, "NVIDIA 驱动已加载，但缺少 "+s.nvDevNode+"（udev 未创建或权限不足）")
+		return nil
+	}
+	// 驱动从「不可用」恢复为「可用」时清空退避，允许立刻尝试一次。
+	if s.nvState == gpuStatusNoDrv || s.nvState == gpuStatusNoNode {
+		s.nvFails = 0
+		s.nvNextTry = time.Time{}
+	}
+	if now.Before(s.nvNextTry) {
+		return nil // 退避中：不启动进程，状态保持上一次的失败原因
+	}
+
+	out, err := s.runNvidia()
+	if err != nil {
+		s.nvFails++
+		s.nvNextTry = now.Add(nvBackoff(s.nvFails))
+		s.nvSet(gpuStatusFailed, classifyNvError(err))
+		return nil
+	}
+	gpus := parseNvidiaCSV(out)
+	s.nvFails = 0
+	s.nvNextTry = time.Time{}
+	s.nvSet(gpuStatusOK, "")
+	return gpus
+}
+
+// runNvidia 参数化调用（无 shell），带超时与输出上限。
+func (s *gpuSampler) runNvidia() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), nvTimeout)
+	defer cancel()
+	if s.nvRun != nil {
+		return s.nvRun(ctx, s.nvPath)
+	}
+	cmd := exec.CommandContext(ctx, s.nvPath,
+		"--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total",
+		"--format=csv,noheader,nounits")
+	var stdout limitedBuffer
+	stdout.max = nvMaxOutput
+	cmd.Stdout = &stdout
+	var stderr limitedBuffer
+	stderr.max = 4 * 1024
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, errNvTimeout
+	}
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, fmt.Errorf("%w：%s", err, truncate(msg, 200))
 		}
-		util := s.igpuUtil(card, filepath.Base(card), now)
-		if util == nil {
+		return nil, err
+	}
+	return stdout.Bytes(), nil
+}
+
+// nvSet 记录 NVIDIA 采集状态；原因变化时才写日志（由 publish 统一打印总体状态）。
+func (s *gpuSampler) nvSet(state, reason string) {
+	s.nvState = state
+	s.nvReason = reason
+}
+
+// nvBackoff 失败退避：60s → 300s → 600s → 1200s → 1800s 封顶。
+func nvBackoff(fails int) time.Duration {
+	if fails <= 1 {
+		return nvBackoffMin
+	}
+	if fails == 2 {
+		return 300 * time.Second
+	}
+	d := 300 * time.Second
+	for i := 3; i <= fails; i++ {
+		if d >= nvBackoffMax {
+			return nvBackoffMax
+		}
+		d *= 2
+	}
+	if d > nvBackoffMax {
+		return nvBackoffMax
+	}
+	return d
+}
+
+// classifyNvError 把失败原因分类，便于日志定位（超时 / 权限 / 退出码 / 其它）。
+func classifyNvError(err error) string {
+	switch {
+	case errors.Is(err, errNvTimeout):
+		return "nvidia-smi 执行超时（" + nvTimeout.String() + "）"
+	case errors.Is(err, os.ErrPermission):
+		return "nvidia-smi 权限不足"
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return fmt.Sprintf("nvidia-smi 退出码 %d", ee.ExitCode())
+	}
+	return "nvidia-smi 执行失败：" + truncate(err.Error(), 160)
+}
+
+// parseNvidiaCSV 解析 `--format=csv,noheader,nounits` 输出；脏行直接跳过。
+func parseNvidiaCSV(raw []byte) []GPU {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return nil
+	}
+	var out []GPU
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Split(line, ",")
+		if len(f) < 6 {
 			continue
 		}
-		out = append(out, GPU{
-			Index:       len(out),
-			Name:        igpuName(vendor),
-			Temp:        hwmonTemp(card),
-			Utilization: util,
-		})
+		for i := range f {
+			f[i] = strings.TrimSpace(f[i])
+		}
+		idx, err := strconv.Atoi(f[0])
+		if err != nil || idx < 0 {
+			continue
+		}
+		g := GPU{
+			Index:       idx,
+			Name:        sanitizeGPUName(f[1], "NVIDIA GPU"),
+			Vendor:      "nvidia",
+			Type:        gpuTypeDGPU,
+			Dev:         fmt.Sprintf("nvidia:%d", idx),
+			Temp:        parseTempC(f[2]),
+			Utilization: parsePercent(f[3]),
+			MemUsed:     parseMiB(f[4]),
+			MemTotal:    parseMiB(f[5]),
+		}
+		// 异常数据：显存已用大于总量时不展示总量，避免出现 >100% 的假数据。
+		if g.MemUsed != nil && g.MemTotal != nil && *g.MemUsed > *g.MemTotal {
+			g.MemTotal = nil
+		}
+		g.Status = itemStatus(g)
+		out = append(out, g)
 	}
 	return out
 }
 
-// igpuUtil 返回核显使用率（0~100）：
-//   - amdgpu 直接读 device/gpu_busy_percent；
-//   - i915 无该文件，用 RC6 驻留时间反推——RC6 是空闲低功耗态，
-//     其以外的时间都算活跃：使用率 = 100 × (1 − Δrc6 / Δt)。
-//
-// 首次采样只建立基线，返回 nil；rc6_enable 为 0（未启用统计）时同样返回 nil。
-func (s *gpuSampler) igpuUtil(card, id string, now time.Time) *int {
-	if v, ok := readInt(filepath.Join(card, "device", "gpu_busy_percent")); ok && v >= 0 && v <= 100 {
-		return &v
+// ---------------- 通用工具 ----------------
+
+// itemStatus 单卡状态：有使用率算正常；只有温度/显存算部分可用；都没有算失败。
+func itemStatus(g GPU) string {
+	switch {
+	case g.Utilization != nil:
+		return gpuItemOK
+	case g.Temp != nil || g.MemTotal != nil:
+		return gpuItemPartial
+	default:
+		return gpuItemError
 	}
-	gt := filepath.Join(card, "gt", "gt0")
-	cur, ok := readUint(filepath.Join(gt, "rc6_residency_ms"))
-	if !ok {
-		return nil
-	}
-	if en, ok := readUint(filepath.Join(gt, "rc6_enable")); !ok || en == 0 {
-		return nil
-	}
-	prev, had := s.igPrev[id]
-	prevAt := s.igPrevAt[id]
-	s.igPrev[id] = cur
-	s.igPrevAt[id] = now
-	if !had || cur < prev {
-		return nil
-	}
-	dt := now.Sub(prevAt).Seconds()
-	if dt <= 0 {
-		return nil
-	}
-	busy := 100 * (1 - (float64(cur-prev)/1000)/dt)
-	v := int(math.Round(math.Max(0, math.Min(100, busy))))
-	return &v
 }
 
-// igpuName 核显显示名（区分厂商，便于多显卡时辨认）。
-// 不探测具体型号：型号要靠 PCI ID 去查系统 pci.ids，而那个库的版本随发行版走，
-// 老库查不到新核显、同号设备还可能跨厂商撞名，取到的"型号"未必可信——不如稳定的通用名。
-func igpuName(vendor uint64) string {
-	if vendor == 0x1002 {
-		return "AMD 核显"
-	}
-	return "Intel 核显"
+// limitedBuffer 只保留前 max 字节，多余输出静默丢弃（防止异常输出撑爆内存）。
+type limitedBuffer struct {
+	buf bytes.Buffer
+	max int
 }
 
-// hwmonTemp 读核显温度：hwmon 的 temp1_input（毫摄氏度）。
-func hwmonTemp(card string) *int {
-	files, _ := filepath.Glob(filepath.Join(card, "device", "hwmon", "hwmon*", "temp1_input"))
-	for _, f := range files {
-		if v, ok := readInt(f); ok && v > 0 && v < 200000 {
-			t := v / 1000
-			return &t
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := b.max - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
 		}
+		b.buf.Write(p)
 	}
-	return nil
+	return n, nil
+}
+
+func (b *limitedBuffer) Bytes() []byte { return b.buf.Bytes() }
+
+func (b *limitedBuffer) String() string { return b.buf.String() }
+
+// truncate 截断日志文本，避免超长错误串刷屏。
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// sanitizeGPUName 清理驱动返回的名称：控制字符转空格、折叠空白、限长。
+func sanitizeGPUName(name, fallback string) string {
+	s := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, name)
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return fallback
+	}
+	return truncate(s, 64)
 }
 
 func readUint(path string) (uint64, bool) {
@@ -308,18 +532,28 @@ func readHex(path string) (uint64, bool) {
 	return v, true
 }
 
-func parseIntOrNil(s string) *int {
-	v, err := strconv.Atoi(s)
-	if err != nil {
+// parsePercent 使用率：只接受 0~100，其它一律视为不可用（不伪造数据）。
+func parsePercent(s string) *int {
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || v < 0 || v > 100 {
 		return nil
 	}
 	return &v
 }
 
-// parseMiBPtr MiB → 字节；解析失败返回 nil（JSON 里省略该字段）。
-func parseMiBPtr(s string) *uint64 {
-	v, err := strconv.ParseUint(s, 10, 64)
-	if err != nil {
+// parseTempC 温度：只接受 -20~150℃，越界视为不可用。
+func parseTempC(s string) *int {
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || v < -20 || v > 150 {
+		return nil
+	}
+	return &v
+}
+
+// parseMiB MiB → 字节；解析失败、超上限（16 TiB）返回 nil。
+func parseMiB(s string) *uint64 {
+	v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil || v > maxVRAMMiB {
 		return nil
 	}
 	b := v * 1024 * 1024

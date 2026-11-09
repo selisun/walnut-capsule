@@ -43,6 +43,15 @@ func (t *TokenStore) Get() string {
 	return t.v
 }
 
+// Snapshot 在同一把锁下返回"令牌 + 对应变更通道"。
+// WS 握手用它避免两次取样之间发生 Reset：旧令牌的会话会拿到旧通道（已关闭），
+// 不会被漏踢下线。
+func (t *TokenStore) Snapshot() (string, <-chan struct{}) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.v, t.ch
+}
+
 // Ensure 保证令牌非空：为空则生成一枚。
 func (t *TokenStore) Ensure() {
 	if t.Get() != "" {

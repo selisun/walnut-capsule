@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"crypto/sha256"
@@ -27,11 +27,11 @@ const defaultPort = 8765
 
 // appVersion 仅作 TRIM_APPVER 缺失时的兜底显示，正常由 fpk 注入。
 // 需与 hetaocapsule/manifest 的 version 保持一致。
-const appVersion = "0.1.71"
+const appVersion = "0.1.77"
 
 // clientVersion 电脑端安装器版本，需与 capsule/installer/hetao-capsule.iss 的 AppVer 一致。
 // 版本策略：客户端与 fpk 各自独立计数——客户端每改一次递增；fpk 有改动也递增。
-const clientVersion = "0.1.60"
+const clientVersion = "0.3.12"
 
 func main() {
 	flagAddr := flag.String("addr", "", "监听地址（默认取安装时填写的端口，缺失回落 :8765）")
@@ -182,7 +182,8 @@ func serveAdmin(appDest, stateDir string, col *metrics.Collector, tok *server.To
 	if err != nil {
 		return err
 	}
-	// 网关 worker（nobody）需要连接该 socket。
+	// 网关 worker（nobody）需要连接该 socket，因此权限位放开；
+	// 真正的访问控制由 peercred.go 的对端 UID 白名单负责（未配置时只允许 root/nobody）。
 	_ = os.Chmod(sock, 0o666)
 
 	logPath := ""
@@ -191,7 +192,35 @@ func serveAdmin(appDest, stateDir string, col *metrics.Collector, tok *server.To
 	}
 	// 电脑端安装器随 fpk 下发到 target/ui/download/，管理页据此提供下载；
 	// 启动时算一次大小与 SHA256，供页面展示核对。
-	setupPath := filepath.Join(appDest, "ui", "download", "hetao-capsule-setup-"+clientVersion+".exe")
+	setupDir := filepath.Join(appDest, "ui", "download")
+	setupVer := clientVersion
+	setupPath := filepath.Join(setupDir, "hetao-capsule-setup-"+clientVersion+".exe")
+	if _, err := os.Stat(setupPath); err != nil {
+		// 版本号未对齐时回退到目录里最新的安装器，避免管理页下载按钮 404。
+		// 页面展示的版本也改用实际文件名，避免“显示 0.2.28、实际给 0.1.60”。
+		if entries, derr := os.ReadDir(setupDir); derr == nil {
+			var newest string
+			var newestMod time.Time
+			for _, e := range entries {
+				name := e.Name()
+				if !strings.HasPrefix(name, "hetao-capsule-setup-") || !strings.HasSuffix(name, ".exe") {
+					continue
+				}
+				info, ierr := e.Info()
+				if ierr != nil {
+					continue
+				}
+				if newest == "" || info.ModTime().After(newestMod) {
+					newest, newestMod = name, info.ModTime()
+				}
+			}
+			if newest != "" {
+				setupPath = filepath.Join(setupDir, newest)
+				setupVer = strings.TrimSuffix(strings.TrimPrefix(newest, "hetao-capsule-setup-"), ".exe")
+				log.Printf("安装器版本不匹配：期望 %s，回退使用 %s", clientVersion, newest)
+			}
+		}
+	}
 	var setupSize int64
 	var setupSHA string
 	if st, err := os.Stat(setupPath); err == nil {
@@ -216,7 +245,7 @@ func serveAdmin(appDest, stateDir string, col *metrics.Collector, tok *server.To
 		ServicePort:   servicePort,
 		IconPath:      filepath.Join(appDest, "ui", "images", "icon_64.png"),
 		SetupPath:     setupPath,
-		ClientVersion: clientVersion,
+		ClientVersion: setupVer,
 		ClientSize:    setupSize,
 		ClientSHA256:  setupSHA,
 		Start:         time.Now(),
@@ -229,6 +258,8 @@ func serveAdmin(appDest, stateDir string, col *metrics.Collector, tok *server.To
 			ReadTimeout:       15 * time.Second,
 			WriteTimeout:      120 * time.Second, // 安装包约 4MB，慢速局域网也要传完
 			IdleTimeout:       60 * time.Second,
+			// 记录 unix socket 对端 UID：用于观察网关 worker 身份并收紧管理接口。
+			ConnContext: server.ConnContext,
 		}
 		if err := s.Serve(ln); err != nil {
 			log.Printf("admin socket serve: %v", err)

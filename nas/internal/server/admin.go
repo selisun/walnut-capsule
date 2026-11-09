@@ -74,6 +74,12 @@ func securityHeaders(next http.Handler) http.Handler {
 // 只读展示类接口（/、/api/state、/api/usage、图标与安装包）不在此列，且都不含密钥。
 func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 先校验 unix socket 对端 UID：防止本机任意进程绕过网关直连 socket。
+		// 白名单见 ADMIN_SOCKET_ALLOW_UIDS；未配置时默认只允许 root 与网关 worker（nobody）。
+		if !peerAllowed(r.Context()) {
+			http.Error(w, "forbidden: peer not allowed", http.StatusForbidden)
+			return
+		}
 		if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Trim-Isadmin")), "true") {
 			next(w, r)
 			return

@@ -95,7 +95,7 @@ func (c *Collector) Snapshot() Snapshot {
 	usage, temp := c.cpu.snapshot()
 	l1, l5, l15, hasLoad, l30 := c.cpu.loadSnapshot()
 	memUsage, memUsed, memTotal, memCache, memFree := c.mem.snapshot()
-	cpu := CPU{Usage: usage, Temp: temp}
+	cpu := CPU{Usage: usage, Temp: temp, Vendor: c.cpu.vendorName()}
 	if hasLoad {
 		cpu.Load1, cpu.Load5, cpu.Load15 = &l1, &l5, &l15
 		cpu.Load30 = l30

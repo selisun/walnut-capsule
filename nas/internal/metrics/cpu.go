@@ -18,6 +18,9 @@ type cpuSampler struct {
 	proc string
 	sys  string
 
+	// vendor 是启动时读一次的 CPU 厂商（amd / intel），供小屏品牌底图选择。
+	vendor string
+
 	mu      sync.RWMutex
 	usage   float64
 	temp    *float64
@@ -40,7 +43,33 @@ type loadSample struct {
 }
 
 func newCPUSampler(proc, sys string) *cpuSampler {
-	return &cpuSampler{proc: proc, sys: sys}
+	return &cpuSampler{proc: proc, sys: sys, vendor: readCPUVendor(proc)}
+}
+
+// vendorName 返回启动时探测到的 CPU 厂商（amd / intel），未知为空串。
+func (s *cpuSampler) vendorName() string { return s.vendor }
+
+// readCPUVendor 从 /proc/cpuinfo 的 vendor_id 判断厂商。
+// x86 上固定是 GenuineIntel / AuthenticAMD；ARM 机器没有该字段，返回空。
+func readCPUVendor(procDir string) string {
+	b, err := os.ReadFile(filepath.Join(procDir, "cpuinfo"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		key, val, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(key) != "vendor_id" {
+			continue
+		}
+		switch strings.TrimSpace(val) {
+		case "GenuineIntel":
+			return "intel"
+		case "AuthenticAMD":
+			return "amd"
+		}
+		return ""
+	}
+	return ""
 }
 
 func (s *cpuSampler) snapshot() (float64, *float64) {

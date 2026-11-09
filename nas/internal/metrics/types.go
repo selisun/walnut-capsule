@@ -36,6 +36,9 @@ type Traffic struct {
 type CPU struct {
 	Usage float64  `json:"usage"` // 0~100
 	Temp  *float64 `json:"temp"`  // 摄氏度，无法读取时为 null
+	// Vendor 是 CPU 厂商（amd / intel），读 /proc/cpuinfo 的 vendor_id；读不到为空。
+	// 小屏官方皮肤按厂商选品牌底图，必须用 NAS 的硬件而不是运行小屏的电脑。
+	Vendor string `json:"vendor,omitempty"`
 	// 平均负载（/proc/loadavg 的 1 / 5 / 15 分钟值），无法读取时为 null
 	Load1  *float64 `json:"load1,omitempty"`
 	Load5  *float64 `json:"load5,omitempty"`
@@ -74,8 +77,17 @@ type Volume struct {
 }
 
 type GPU struct {
-	Index       int     `json:"index"`
-	Name        string  `json:"name"`
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+	// Vendor 是显卡厂商（nvidia / amd / intel），供小屏品牌底图选择。
+	Vendor string `json:"vendor,omitempty"`
+	// Type 是形态：igpu（核显）| dgpu（独显）| unknown（无法可靠判断）。
+	Type string `json:"type,omitempty"`
+	// Dev 是稳定设备标识：sysfs 卡用 PCI 地址（0000:01:00.0），NVIDIA 用 nvidia:<index>。
+	// 热插拔后 Index 可能变化，Dev 用于内部基线与排障，不参与排序。
+	Dev string `json:"dev,omitempty"`
+	// Status 是单卡采集状态：ok | partial | error。
+	Status      string  `json:"status,omitempty"`
 	Temp        *int    `json:"temp"`
 	Utilization *int    `json:"utilization"`           // 0~100
 	MemUsed     *uint64 `json:"memory_used,omitempty"` // 核显共享内存，无独立显存时为 null

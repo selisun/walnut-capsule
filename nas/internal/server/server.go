@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -14,10 +16,18 @@ import (
 	"hetao-nas/internal/metrics"
 )
 
+const (
+	wsMaxConns   = 64
+	wsPongWait   = 60 * time.Second
+	wsPingPeriod = 45 * time.Second
+	wsWriteWait  = 5 * time.Second
+)
+
 type Server struct {
 	col      *metrics.Collector
 	tok      *TokenStore
 	upgrader websocket.Upgrader
+	conns    int32
 }
 
 func New(col *metrics.Collector, tok *TokenStore) *Server {
@@ -27,7 +37,15 @@ func New(col *metrics.Collector, tok *TokenStore) *Server {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 4096,
-			CheckOrigin:     func(*http.Request) bool { return true }, // 局域网工具
+			// 桌面客户端不带 Origin（放行）；浏览器跨源 WS 只允许同源。
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true
+				}
+				u, err := url.Parse(origin)
+				return err == nil && strings.EqualFold(u.Host, r.Host)
+			},
 		},
 	}
 }
@@ -144,11 +162,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// WS 子协议难以携带标准鉴权头，统一用 ?token=<配对令牌>；
 	// 校验失败直接 401，不升级、不暴露任何内部状态。
 	// 注意：令牌为空时也必须拒绝（否则空 token 与空明文相等会误判为通过）。
-	token := s.tok.Get()
+	// 令牌与变更通道同锁取样：Reset 发生在两次取样之间时不会再漏踢旧会话。
+	token, tokenChanged := s.tok.Snapshot()
 	if token == "" || subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(token)) != 1 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// 连接上限：每连接 2 goroutine + 读/写缓冲，15MB 限额下不能无限接。
+	if atomic.AddInt32(&s.conns, 1) > wsMaxConns {
+		atomic.AddInt32(&s.conns, -1)
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer atomic.AddInt32(&s.conns, -1)
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
@@ -159,17 +185,23 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	sub := newSubscription()
 	done := make(chan struct{})
 
-	go s.wsWritePump(conn, sub, done)
+	go s.wsWritePump(conn, sub, done, tokenChanged)
 	s.wsReadPump(conn, sub, done)
 }
 
 func (s *Server) wsReadPump(conn *websocket.Conn, sub *subscription, done chan<- struct{}) {
 	defer close(done)
 	conn.SetReadLimit(4096)
+	// 心跳：客户端每 45 秒收到 ping 并自动回 pong；60 秒没 pong 视为半开连接。
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
 	for {
 		var m subscribeMsg
 		if err := conn.ReadJSON(&m); err != nil {
-			return // 对端关闭或协议错误
+			return // 对端关闭、超时或协议错误
 		}
 		if m.Type == "subscribe" {
 			sub.update(m)
@@ -177,13 +209,14 @@ func (s *Server) wsReadPump(conn *websocket.Conn, sub *subscription, done chan<-
 	}
 }
 
-func (s *Server) wsWritePump(conn *websocket.Conn, sub *subscription, done <-chan struct{}) {
+func (s *Server) wsWritePump(conn *websocket.Conn, sub *subscription, done <-chan struct{}, tokenChanged <-chan struct{}) {
 	_, interval := sub.get()
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	ping := time.NewTicker(wsPingPeriod)
+	defer ping.Stop()
 	// 令牌重置时立即断开本连接：WS 只在握手时校验令牌，不主动踢会一直收推送。
 	// 客户端随后重连会拿到 401，进入“令牌错误”并停止重连。
-	tokenChanged := s.tok.Changed()
 	for {
 		select {
 		case <-done:
@@ -198,12 +231,18 @@ func (s *Server) wsWritePump(conn *websocket.Conn, sub *subscription, done <-cha
 		case <-sub.changed:
 			_, interval = sub.get()
 			t.Reset(interval)
+		case <-ping.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)); err != nil {
+				_ = conn.Close() // 写失败必须关连接，否则 readPump 永远阻塞
+				return
+			}
 		case <-t.C:
 			prefixes, _ := sub.get()
 			snap := s.col.Snapshot()
 			payload := buildPayload(&snap, prefixes)
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 			if err := conn.WriteJSON(payload); err != nil {
+				_ = conn.Close() // 让阻塞在 ReadJSON 的 readPump 立即返回
 				return
 			}
 		}

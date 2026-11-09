@@ -4,7 +4,7 @@
 # 注意：磁盘 SMART 温度需要 CAP_SYS_RAWIO（root），与本应用"非 root 上架"要求冲突，
 # 因此本应用不采集磁盘温度（客户端显示 --°C）；CPU 温度经 hwmon 非 root 可读，正常采集。
 # 这里确保二进制具备可执行位，并确保 ${TRIM_PKGVAR}/port 里有有效端口。
-# 端口优先级：安装向导字段（install_init 已先行落盘）> 平台 TRIM_SERVICE_PORT > 已有配置 > 8765。
+# 端口优先级：已有 ${TRIM_PKGVAR}/port（install_init 已先行落盘）> 向导字段 > 平台 TRIM_SERVICE_PORT > 8765。
 
 BIN="${TRIM_APPDEST}/hetao-nas"
 chmod 0755 "${BIN}" 2>/dev/null || true
@@ -49,14 +49,14 @@ fail() {
     [ -n "${TRIM_PKGVAR:-}" ] || fail "缺少 TRIM_PKGVAR，无法保存端口配置。"
     mkdir -p "${TRIM_PKGVAR}"
 
-    PORT="$(pick_port | tr -d '[:space:]')"
-    if valid_port "$PORT"; then
-        printf '%s' "$PORT" > "${PORT_FILE}"
+    # 已有合法 port 文件优先：install_init 已把用户端口落盘，callback 只兜底不覆盖。
+    if [ -f "${PORT_FILE}" ] && valid_port "$(tr -d '[:space:]' < "${PORT_FILE}")"; then
         exit 0
     fi
 
-    # 回调阶段拿不到向导值：保留 install_init 写下的结果，避免回退成默认端口。
-    if [ -f "${PORT_FILE}" ] && valid_port "$(tr -d '[:space:]' < "${PORT_FILE}")"; then
+    PORT="$(pick_port | tr -d '[:space:]')"
+    if valid_port "$PORT"; then
+        printf '%s' "$PORT" > "${PORT_FILE}"
         exit 0
     fi
 

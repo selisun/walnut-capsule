@@ -36,7 +36,7 @@ var dataVolRe = regexp.MustCompile(`^(vol(ume)?[0-9]+|share/.+|mnt/.+)$`)
 
 type diskState struct {
 	name       string
-	status     string // active / standby / unknown
+	status     string // active / standby / sleeping / idle / unknown
 	temp       *int
 	readBPS    uint64
 	writeBPS   uint64
@@ -57,6 +57,11 @@ type diskSampler struct {
 	disks   map[string]*diskState
 	order   []string // 稳定输出顺序
 	volumes []Volume // 逻辑存储空间（fnOS /volN 等）
+
+	// statusMu 串行化 sampleStatus：启动 goroutine 与 45s 定时器可能并发，
+	// 并发跑 SMART 会击穿节流、重复 fork smartctl。
+	statusMu      sync.Mutex
+	smartDisabled bool // smartctl 权限/设备失败后永久关闭，避免每 45 秒重试
 }
 
 func newDiskSampler(proc, sys, root string) *diskSampler {
@@ -130,20 +135,47 @@ func (s *diskSampler) sampleRates() {
 }
 
 // sampleStatus 低频调用（30~60s）：hdparm -C 查询电源状态；
-// 仅 active/idle 且距上次 SMART ≥30 分钟才执行 smartctl。
+// 只有明确 active 且距上次 SMART ≥30 分钟才执行 smartctl。
+// 铁律：standby / sleeping / idle / unknown 一律不碰 SMART。
 func (s *diskSampler) sampleStatus() {
+	// 启动时的 sampleStatus goroutine 与 45s 定时器可能并发；串行化避免双跑。
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+
 	s.mu.RLock()
 	names := make([]string, len(s.order))
 	copy(names, s.order)
 	s.mu.RUnlock()
 
 	for _, name := range names {
+		s.mu.RLock()
+		d, exists := s.disks[name]
+		if !exists {
+			s.mu.RUnlock()
+			continue
+		}
+		lastSMART := d.lastSMART
+		cachedTemp := d.temp
+		s.mu.RUnlock()
+
 		// NVMe：绝不调 hdparm（不支持）。温度优先读 sysfs hwmon（纯文本、零 IO）；
-		// 读不到再兜底 smartctl -n standby（NVMe 无休眠概念，-n standby 是安全冗余）。
+		// 读不到再按 30 分钟节流兜底 smartctl -n standby。
 		if strings.HasPrefix(name, "nvme") {
 			temp := readNvmeTempSysfs(s.sys, name)
-			if temp == nil {
-				temp = readSMARTTemp(name)
+			if temp == nil && !s.smartDisabled && time.Since(lastSMART) >= smartInterval {
+				var ok bool
+				temp, ok = readSMARTTemp(name)
+				s.mu.Lock()
+				if d, exists := s.disks[name]; exists {
+					d.lastSMART = time.Now()
+				}
+				s.mu.Unlock()
+				if !ok {
+					s.disableSMART("nvme", name)
+				}
+				if temp == nil {
+					temp = cachedTemp // 保留上次温度，避免休眠/暂不可读时闪烁
+				}
 			}
 			status := "unknown"
 			if temp != nil {
@@ -160,30 +192,32 @@ func (s *diskSampler) sampleStatus() {
 
 		status := probePowerState(name)
 
-		s.mu.RLock()
-		d := s.disks[name]
-		lastSMART := d.lastSMART
-		cachedTemp := d.temp
-		s.mu.RUnlock()
-
 		var temp *int
-		// 缓存温度为空（如曾被休眠置 null 冲掉）时不受 30 分钟节流限制，立即补采。
-		runSMART := status != "standby" && (cachedTemp == nil || time.Since(lastSMART) >= smartInterval)
-		if status == "standby" {
-			// 休眠盘：不碰 SMART，保留上次温度（置 null 会把缓存冲掉，
-			// 唤醒后 30 分钟节流期内永远无法恢复）。
-			s.mu.RLock()
-			temp = s.disks[name].temp
-			s.mu.RUnlock()
-		} else if runSMART {
-			temp = readSMARTTemp(name)
-			s.mu.Lock()
-			s.disks[name].lastSMART = time.Now()
-			s.mu.Unlock()
-		} else {
-			s.mu.RLock()
-			temp = s.disks[name].temp // 保留上次温度
-			s.mu.RUnlock()
+		switch {
+		case status == "standby", status == "sleeping", s.smartDisabled:
+			// 休眠/完全关闭/已禁用 SMART：只保留上次温度，绝不碰盘。
+			temp = cachedTemp
+		case status == "active":
+			if time.Since(lastSMART) >= smartInterval {
+				var ok bool
+				temp, ok = readSMARTTemp(name)
+				s.mu.Lock()
+				if d, exists := s.disks[name]; exists {
+					d.lastSMART = time.Now()
+				}
+				s.mu.Unlock()
+				if !ok {
+					s.disableSMART("sata", name)
+				}
+				if temp == nil {
+					temp = cachedTemp // 保留上次温度，避免休眠/暂不可读时闪烁
+				}
+			} else {
+				temp = cachedTemp // 保留上次温度
+			}
+		default:
+			// idle / unknown：宁可没温度，也不冒险让 smartctl 碰盘。
+			temp = cachedTemp
 		}
 
 		s.mu.Lock()
@@ -193,6 +227,15 @@ func (s *diskSampler) sampleStatus() {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// disableSMART 在一次权限/设备失败后永久关闭 SMART 采集路径，避免每 45 秒重试。
+func (s *diskSampler) disableSMART(kind, name string) {
+	if s.smartDisabled {
+		return
+	}
+	s.smartDisabled = true
+	log.Printf("smartctl 不可用（%s %s，权限或设备不支持），已关闭 SMART 采集", kind, name)
 }
 
 // readNvmeTempSysfs 读 NVMe 控制器温度：
@@ -261,13 +304,15 @@ func probePowerState(name string) string {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "hdparm", "-C", "/dev/"+name).CombinedOutput()
 	if err != nil {
-		// hdparm 不可用或不支持（如部分 NVMe/USB）：状态未知，后续由 smartctl -n standby 兜底。
+		// hdparm 不可用或不支持（如部分 USB）：状态未知。按铁律不碰 SMART。
 		return "unknown"
 	}
 	low := strings.ToLower(string(out))
 	switch {
 	case strings.Contains(low, "standby"):
 		return "standby"
+	case strings.Contains(low, "sleeping"):
+		return "sleeping"
 	case strings.Contains(low, "active"):
 		return "active"
 	default:
@@ -283,29 +328,38 @@ type smartJSON struct {
 }
 
 // readSMARTTemp 读取盘温。-n standby：若盘恰好在探测后进入休眠，直接退出不唤醒。
-func readSMARTTemp(name string) *int {
+// 第二个返回值表示 SMART 路径是否可用；空输出/无法解析说明权限或设备不支持，
+// 调用方据此一次性关闭后续采集，避免每 45 秒重试并刷日志。
+func readSMARTTemp(name string) (*int, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), smartTimeout)
 	defer cancel()
 	// smartctl 退出码非零也常带有效 JSON，忽略 err 直接解析 stdout。
-	out, _ := exec.CommandContext(ctx, "smartctl", "-n", "standby", "-a", "-j", "/dev/"+name).Output()
+	out, err := exec.CommandContext(ctx, "smartctl", "-n", "standby", "-a", "-j", "/dev/"+name).Output()
+	if len(out) == 0 {
+		// 退出码 2 = 盘在 standby，smartctl 按 -n standby 主动跳过，不是权限问题。
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 2 {
+			return nil, true
+		}
+		return nil, false // 打不开设备 / smartctl 不存在
+	}
 	// 边界检查：SMART JSON 正常 5-15KB，限 256KB 防御异常输出
 	if len(out) > 262144 {
 		log.Printf("smartctl %s 输出过大 (%d 字节)，跳过", name, len(out))
-		return nil
+		return nil, true
 	}
 	var sj smartJSON
 	if err := json.Unmarshal(out, &sj); err != nil {
 		log.Printf("smartctl parse %s: %v", name, err)
-		return nil
+		return nil, false
 	}
 	if sj.PowerMode != nil && strings.Contains(strings.ToUpper(*sj.PowerMode), "STANDBY") {
-		return nil // 竞态保护：盘已休眠
+		return nil, true // 竞态保护：盘已休眠
 	}
 	if sj.Temperature != nil && sj.Temperature.Current != nil {
 		v := *sj.Temperature.Current
-		return &v
+		return &v, true
 	}
-	return nil
+	return nil, true
 }
 
 // sampleCapacity 低频调用：解析挂载表 statfs 容量。只读 VFS 超级块缓存，不产生磁盘 IO。

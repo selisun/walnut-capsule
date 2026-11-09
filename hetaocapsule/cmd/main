@@ -19,15 +19,16 @@ read_pid() {
 case $1 in
 start)
     mkdir -p "${TRIM_PKGVAR}"
-    # 日志轮转：超过 4MB 就留一份 .1 覆盖旧档，避免长期累积写满数据盘
+    pid="$(read_pid)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        exit 0  # 已在运行，幂等；此时绝不能 mv 日志，否则会把运行中进程的 fd 改名
+    fi
+    rm -f "${PID_FILE}"
+    # 日志轮转：仅在新进程启动前做，超过 4MB 就留一份 .1 覆盖旧档。
+    # 不在“已运行”分支轮转，避免 mv 正在写的 inode 导致日志写到 .1 且空间不释放。
     if [ -f "${LOG_FILE}" ] && [ "$(stat -c %s "${LOG_FILE}" 2>/dev/null || echo 0)" -gt 4194304 ]; then
         mv -f "${LOG_FILE}" "${LOG_FILE}.1"
     fi
-    pid="$(read_pid)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        exit 0  # 已在运行，幂等
-    fi
-    rm -f "${PID_FILE}"
     # 原生环境不设 HOST_*：程序默认读宿主机 /proc、/sys，hostname 取宿主机。
     # program 自行在 ${TRIM_APPDEST}/app.sock 上提供网关管理页。
     nohup "${BIN}" >> "${LOG_FILE}" 2>&1 &
