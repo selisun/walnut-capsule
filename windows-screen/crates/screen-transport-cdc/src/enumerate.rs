@@ -46,14 +46,16 @@ pub fn enumerate_comports() -> Result<Vec<PortCandidate>, AdapterError> {
             let mut required = 0u32;
             let _ =
                 SetupDiGetDeviceInterfaceDetailW(set, &ifdata, None, 0, Some(&mut required), None);
-            if required == 0 {
+            let detail_size = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+            if (required as usize) < detail_size {
                 continue;
             }
 
-            let mut buf = vec![0u8; required as usize];
+            // Vec<u64> 保证 8 字节对齐（Vec<u8> 只保证 1 字节，强转结构体指针属未对齐写）；
+            // 长度向上取整到 8 的倍数，cbSize 仍写结构体自身大小。
+            let mut buf = vec![0u64; (required as usize).div_ceil(8)];
             let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-            // cbSize 必须是结构体大小（x64 为 8），不能是整个缓冲区大小。
-            (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            (*detail).cbSize = detail_size as u32;
 
             let mut devinfo = SP_DEVINFO_DATA {
                 cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
@@ -72,7 +74,8 @@ pub fn enumerate_comports() -> Result<Vec<PortCandidate>, AdapterError> {
                 continue;
             }
 
-            let path = read_device_path(&buf, required as usize);
+            let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, required as usize);
+            let path = read_device_path(bytes, required as usize);
             let instance_id = match device_instance_id(set, &devinfo) {
                 Ok(id) => id,
                 Err(_) => continue,
@@ -134,5 +137,22 @@ mod tests {
             GUID_DEVINTERFACE_COMPORT,
             GUID::from_u128(0x86e0d1e0_8089_11d0_9ce4_08003e301f73)
         );
+    }
+
+    #[test]
+    fn read_device_path_stops_at_nul() {
+        // 前 4 字节是 cbSize，DevicePath 从 offset 4 起、UTF-16 以 0 结尾
+        let mut bytes = vec![0u8; 4 + 10 * 2];
+        let wide: Vec<u16> = "COM3".encode_utf16().chain(std::iter::once(0)).collect();
+        for (i, w) in wide.iter().enumerate() {
+            bytes[4 + i * 2..4 + i * 2 + 2].copy_from_slice(&w.to_le_bytes());
+        }
+        let path = unsafe { read_device_path(&bytes, bytes.len()) };
+        assert_eq!(path, "COM3");
+    }
+
+    #[test]
+    fn read_device_path_handles_short_buffer() {
+        assert_eq!(unsafe { read_device_path(&[0u8; 4], 4) }, "");
     }
 }

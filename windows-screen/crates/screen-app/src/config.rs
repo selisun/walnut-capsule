@@ -206,6 +206,12 @@ impl Config {
         std::fs::write(path, text).map_err(|e| ConfigError::Io(format!("{}: {e}", path.display())))
     }
 
+    /// 主循环节拍（ms）：必须取自 `display.refresh_secs`。
+    /// 固定 1s 会让「刷新间隔」设置失效，整帧连续重画在设备上表现为持续闪屏。
+    pub fn tick_ms(&self) -> u64 {
+        self.display.refresh_secs.max(1).saturating_mul(1_000)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version != 1 {
             return Err(ConfigError::Invalid(format!(
@@ -339,6 +345,19 @@ flip = "mirror"
         assert_eq!(loaded.display.orientation, "landscape");
         assert_eq!(loaded.display.flip, "flipped");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tick_ms_follows_refresh_secs() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.tick_ms(), 1_000);
+        cfg.display.refresh_secs = 5;
+        assert_eq!(cfg.tick_ms(), 5_000);
+        cfg.display.refresh_secs = 10;
+        assert_eq!(cfg.tick_ms(), 10_000);
+        // 异常值不应产生 0 节拍（0 会让主循环空转）
+        cfg.display.refresh_secs = 0;
+        assert_eq!(cfg.tick_ms(), 1_000);
     }
 
     #[test]

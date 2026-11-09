@@ -29,5 +29,6 @@ pub use snapshot::{
 };
 pub use theme_model::{
     Background, Color, ComponentKind, ComponentStyle, Components, ImageAnchor, ImageFit,
-    LayoutConfig, Palette, ResourceKind, ResourceRef, ThemeConfig, Typography,
+    LayoutConfig, Overlay, OverlayMetric, OverlaySlot, Palette, RateUnit, ResourceKind,
+    ResourceRef, SlotAlign, ThemeConfig, Typography,
 };

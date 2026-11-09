@@ -8,5 +8,6 @@ pub mod types;
 
 pub use error::AdapterError;
 pub use types::{
-    public_state_label, DeviceAdapter, DeviceInfo, Health, InitReport, PortCandidate, Transport,
+    public_state_label, DeviceAdapter, DeviceInfo, Health, InitReport, PortCandidate, Region,
+    Transport,
 };

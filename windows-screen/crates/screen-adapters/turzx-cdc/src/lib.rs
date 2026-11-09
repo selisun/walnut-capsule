@@ -13,7 +13,8 @@ use screen_core::{
     TransportKind,
 };
 use screen_protocol::{
-    brightness_zero, chunk_ranges, command, frame_header, CMD_SCREEN_ON, LEGACY_CHUNK_SIZE,
+    brightness_zero, chunk_ranges, command, frame_header, frame_region_header, CMD_SCREEN_ON,
+    LEGACY_CHUNK_SIZE,
 };
 
 pub const MODEL_ID: &str = "turzx-3.5-cdc";
@@ -162,6 +163,56 @@ impl<T: Transport> TurzxCdcAdapter<T> {
         }
         Ok(())
     }
+
+    /// 写 6 字节帧头 + 像素载荷（8192 分块），并记录发送报告。
+    fn send_payload(&mut self, header: [u8; 6], payload: &[u8]) -> Result<(), AdapterError> {
+        let header_start = std::time::Instant::now();
+        self.write_all(&header)?;
+        let header_us = header_start.elapsed().as_micros();
+
+        let ranges = chunk_ranges(payload.len(), LEGACY_CHUNK_SIZE)
+            .map_err(|_| AdapterError::Unsupported("分块"))?;
+        let mut chunk_us = Vec::with_capacity(ranges.len());
+        for range in &ranges {
+            let start = std::time::Instant::now();
+            self.write_all(&payload[range.clone()])?;
+            chunk_us.push(start.elapsed().as_micros());
+        }
+        let chunks_total_us: u128 = chunk_us.iter().sum();
+        let chunk_min_us = *chunk_us.iter().min().unwrap_or(&0);
+        let chunk_max_us = *chunk_us.iter().max().unwrap_or(&0);
+        let chunk_avg_us = if chunk_us.is_empty() {
+            0
+        } else {
+            chunks_total_us / chunk_us.len() as u128
+        };
+        self.last_report = Some(SendReport {
+            header,
+            bytes: header.len() + payload.len(),
+            chunks: ranges.len(),
+            last_chunk_len: ranges.last().map(|r| r.len()).unwrap_or(0),
+            header_us,
+            chunks_total_us,
+            chunk_min_us,
+            chunk_max_us,
+            chunk_avg_us,
+        });
+        Ok(())
+    }
+}
+
+/// 物理帧基线：320×480 / RGB565LE / 307200 字节。
+fn validate_frame(frame: &Frame) -> Result<(), AdapterError> {
+    if frame.width != DEVICE_WIDTH
+        || frame.height != DEVICE_HEIGHT
+        || frame.pixel_format != PixelFormat::Rgb565Le
+    {
+        return Err(AdapterError::Unsupported("帧必须是 320×480 RGB565LE"));
+    }
+    if frame.pixels.len() != (DEVICE_WIDTH * DEVICE_HEIGHT * 2) as usize {
+        return Err(AdapterError::Io("帧长度不符".to_string()));
+    }
+    Ok(())
 }
 
 impl<T: Transport> DeviceAdapter for TurzxCdcAdapter<T> {
@@ -214,50 +265,35 @@ impl<T: Transport> DeviceAdapter for TurzxCdcAdapter<T> {
         if !self.is_open {
             return Err(AdapterError::Disconnected);
         }
-        if frame.width != DEVICE_WIDTH
-            || frame.height != DEVICE_HEIGHT
-            || frame.pixel_format != PixelFormat::Rgb565Le
-        {
-            return Err(AdapterError::Unsupported("帧必须是 320×480 RGB565LE"));
-        }
-        if frame.pixels.len() != (DEVICE_WIDTH * DEVICE_HEIGHT * 2) as usize {
-            return Err(AdapterError::Io("帧长度不符".to_string()));
-        }
+        validate_frame(frame)?;
 
         let header = frame_header(frame.width, frame.height)
             .map_err(|_| AdapterError::Unsupported("帧头尺寸"))?;
-        let header_start = std::time::Instant::now();
-        self.write_all(&header)?;
-        let header_us = header_start.elapsed().as_micros();
+        self.send_payload(header, &frame.pixels)
+    }
 
-        let ranges = chunk_ranges(frame.pixels.len(), LEGACY_CHUNK_SIZE)
-            .map_err(|_| AdapterError::Unsupported("分块"))?;
-        let mut chunk_us = Vec::with_capacity(ranges.len());
-        for range in &ranges {
-            let start = std::time::Instant::now();
-            self.write_all(&frame.pixels[range.clone()])?;
-            chunk_us.push(start.elapsed().as_micros());
+    /// 197（0xC5）子矩形：帧头携带闭区间坐标，像素只取该矩形各行。
+    fn send_frame_region(
+        &mut self,
+        frame: &Frame,
+        region: screen_adapter_api::Region,
+    ) -> Result<(), AdapterError> {
+        if !self.is_open {
+            return Err(AdapterError::Disconnected);
         }
-        let chunks_total_us: u128 = chunk_us.iter().sum();
-        let chunk_min_us = *chunk_us.iter().min().unwrap_or(&0);
-        let chunk_max_us = *chunk_us.iter().max().unwrap_or(&0);
-        let chunk_avg_us = if chunk_us.is_empty() {
-            0
-        } else {
-            chunks_total_us / chunk_us.len() as u128
-        };
-        self.last_report = Some(SendReport {
-            header,
-            bytes: header.len() + frame.pixels.len(),
-            chunks: ranges.len(),
-            last_chunk_len: ranges.last().map(|r| r.len()).unwrap_or(0),
-            header_us,
-            chunks_total_us,
-            chunk_min_us,
-            chunk_max_us,
-            chunk_avg_us,
-        });
-        Ok(())
+        validate_frame(frame)?;
+        if region.is_empty() || region.right() >= frame.width || region.bottom() >= frame.height {
+            return Err(AdapterError::Unsupported("子矩形越界"));
+        }
+        let header = frame_region_header(region.x, region.y, region.right(), region.bottom())
+            .map_err(|_| AdapterError::Unsupported("子矩形帧头"))?;
+        let row_bytes = region.width as usize * 2;
+        let mut payload = Vec::with_capacity(row_bytes * region.height as usize);
+        for y in region.y..=region.bottom() {
+            let start = ((y as usize * frame.width as usize) + region.x as usize) * 2;
+            payload.extend_from_slice(&frame.pixels[start..start + row_bytes]);
+        }
+        self.send_payload(header, &payload)
     }
 
     fn set_brightness(&mut self, level: u8) -> Result<(), AdapterError> {
@@ -521,6 +557,99 @@ mod tests {
         assert_eq!(report.bytes, 6 + 307_200);
         assert_eq!(report.chunks, 38);
         assert_eq!(report.last_chunk_len, 4096);
+    }
+
+    #[test]
+    fn sends_only_the_requested_region_with_subrect_header() {
+        let mut candidate = matching_candidate();
+        candidate.open_path = Some("path".into());
+        let mut adapter = TurzxCdcAdapter::new(MockTransport {
+            candidates: vec![candidate],
+            ..Default::default()
+        })
+        .with_init_delay_ms(0);
+        let info = adapter.discover().expect("discover");
+        adapter.open(&info).expect("open");
+        adapter.init().expect("init");
+
+        let region = screen_adapter_api::Region::new(20, 200, 80, 40);
+        let mut frame = frame();
+        for (i, byte) in frame.pixels.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        adapter.send_frame_region(&frame, region).expect("send");
+
+        let t = adapter.transport();
+        assert_eq!(t.writes.len(), 2 + 1 + 1); // 初始化 2 条 + 帧头 + 1 块（6400B < 8192B）
+        assert_eq!(
+            t.writes[2],
+            [0x05, 0x0C, 0x81, 0x8C, 0xEF, 0xC5],
+            "子矩形帧头必须是闭区间 (20,200)-(99,239)"
+        );
+
+        let mut expected = Vec::new();
+        for y in 200..=239u32 {
+            let start = ((y * DEVICE_WIDTH + 20) * 2) as usize;
+            expected.extend_from_slice(&frame.pixels[start..start + 80 * 2]);
+        }
+        assert_eq!(t.writes[3], expected);
+        let report = adapter.last_report().expect("report");
+        assert_eq!(report.bytes, 6 + 6_400);
+        assert_eq!(report.chunks, 1);
+    }
+
+    #[test]
+    fn region_payload_is_chunked_like_full_frame() {
+        let mut candidate = matching_candidate();
+        candidate.open_path = Some("path".into());
+        let mut adapter = TurzxCdcAdapter::new(MockTransport {
+            candidates: vec![candidate],
+            ..Default::default()
+        })
+        .with_init_delay_ms(0);
+        let info = adapter.discover().expect("discover");
+        adapter.open(&info).expect("open");
+        adapter.init().expect("init");
+
+        let region = screen_adapter_api::Region::new(0, 100, 320, 40);
+        adapter
+            .send_frame_region(&frame(), region)
+            .expect("send region");
+        let report = adapter.last_report().expect("report");
+        assert_eq!(report.chunks, 4); // 25,600 B = 3×8192 + 1024
+        assert_eq!(report.last_chunk_len, 1_024);
+        assert_eq!(report.header, [0x00, 0x06, 0x44, 0xFC, 0x8B, 0xC5]);
+    }
+
+    #[test]
+    fn out_of_bounds_region_is_rejected_without_writing() {
+        let mut candidate = matching_candidate();
+        candidate.open_path = Some("path".into());
+        let mut adapter = TurzxCdcAdapter::new(MockTransport {
+            candidates: vec![candidate],
+            ..Default::default()
+        })
+        .with_init_delay_ms(0);
+        let info = adapter.discover().expect("discover");
+        adapter.open(&info).expect("open");
+        adapter.init().expect("init");
+        let baseline = adapter.transport().writes.len();
+
+        let bad = screen_adapter_api::Region::new(300, 470, 40, 40);
+        assert!(matches!(
+            adapter.send_frame_region(&frame(), bad),
+            Err(AdapterError::Unsupported(_))
+        ));
+        let empty = screen_adapter_api::Region::new(10, 10, 0, 5);
+        assert!(matches!(
+            adapter.send_frame_region(&frame(), empty),
+            Err(AdapterError::Unsupported(_))
+        ));
+        assert_eq!(
+            adapter.transport().writes.len(),
+            baseline,
+            "非法区域不得写任何字节"
+        );
     }
 
     #[test]

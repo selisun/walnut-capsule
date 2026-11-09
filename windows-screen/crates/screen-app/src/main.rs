@@ -99,8 +99,13 @@ fn run(
         .config_path()
         .and_then(|p| p.parent().map(|dir| dir.join("hetao-screen.log")));
     screen_app::logging::init(&app.config().logging.level, log_file);
+    // 节拍必须跟随 display.refresh_secs：固定 1s 时「刷新间隔」设置无效，
+    // 单帧传输约 1.9s，会导致屏幕持续被整帧重画（现场表现为闪屏）。
     let options = screen_app::RunOptions {
         run_seconds,
+        tick_ms: app.config().tick_ms(),
+        // 节拍变长后每拍要多消化几条快照，避免 IPC 积压
+        max_ipc_messages_per_tick: 32,
         ..Default::default()
     };
     app.run_with_options(&options).map_err(|e| e.to_string())

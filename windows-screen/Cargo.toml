@@ -47,6 +47,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
     # 时钟组件：GetLocalTime 取本地时间（2026-11-04 用户指示继续开发，请在 15 号追认）
     "Win32_System_SystemInformation",
+    # 官方皮肤品牌 logo：DXGI 枚举适配器读 VendorId（2026-11-07 监工批准「加品牌采集 + 按品牌切底图」）
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [profile.dev]

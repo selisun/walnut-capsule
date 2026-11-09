@@ -12,5 +12,7 @@ pub mod pixels;
 pub use chunk::{chunk_ranges, LEGACY_CHUNK_SIZE};
 pub use command::{brightness_zero, command, CMD_BRIGHTNESS, CMD_SCREEN_ON};
 pub use error::ProtocolError;
-pub use header::{frame_header, END_MARKER, HEADER_LEN, LEGACY_480X320_HEADER};
+pub use header::{
+    frame_header, frame_region_header, END_MARKER, HEADER_LEN, LEGACY_480X320_HEADER,
+};
 pub use pixels::{rgba_to_rgb565le, BYTES_PER_PIXEL};

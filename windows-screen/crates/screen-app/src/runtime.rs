@@ -2,16 +2,18 @@
 //!
 //! 外部依赖通过 trait 注入，便于用 mock 做状态转移测试；生产实现位于本文件底部。
 
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use screen_adapter_api::{DeviceAdapter, DeviceInfo};
-use screen_core::{Orientation, ScreenProfile};
+use screen_adapter_api::{AdapterError, DeviceAdapter, DeviceInfo};
+use screen_core::{Frame, Orientation, ScreenProfile};
 use screen_data::DataState;
 use screen_ipc::{ConnectionState, Message};
 use screen_transport_cdc::DeviceEvent;
 
 use crate::app::{AppError, ScreenApp};
-use crate::session::DeviceSession;
+use crate::dirty::{plan_send, FrameSend};
+use crate::session::{DeviceSession, SessionError};
 
 /// 3.5 英寸物理基线恒为 320×480 / Portrait。
 pub const PHYSICAL_WIDTH: u32 = 320;
@@ -30,6 +32,20 @@ pub struct RunOptions {
     pub max_ipc_messages_per_tick: usize,
     /// 每个节拍最多处理的设备事件数。
     pub max_events_per_tick: usize,
+    /// 设备状态上报文件；None = 不写（测试用）。
+    pub status_file: Option<PathBuf>,
+    /// 周期性整帧校准间隔（ms）。
+    ///
+    /// 局部刷新依赖「发送成功 = 设备显示正确」。设备端一旦丢掉一帧，差异此后
+    /// 不会再被重发，画面会长期停在旧值。每隔这个间隔强制发一次整帧，
+    /// 把设备内容与本地缓存重新对齐。0 = 关闭校准。
+    pub full_refresh_ms: u64,
+    /// 清屏同步帧发送后、首帧内容前的间隔（ms）。
+    ///
+    /// 设备单缓冲，连续两整帧背靠背下发时，最后一分块（4096 字节，约 6 行）
+    /// 常因设备还在刷新上一帧而被丢弃，表现为屏幕底部残留一小块清屏黑。
+    /// 留出一帧的显示时间再做后续发送。0 = 不等待（测试用）。
+    pub sync_settle_ms: u64,
 }
 
 impl Default for RunOptions {
@@ -48,9 +64,18 @@ impl Default for RunOptions {
             retry_ms: 5_000,
             max_ipc_messages_per_tick: 8,
             max_events_per_tick: 4,
+            status_file: Some(status_path()),
+            full_refresh_ms: DEFAULT_FULL_REFRESH_MS,
+            sync_settle_ms: DEFAULT_SYNC_SETTLE_MS,
         }
     }
 }
+
+/// 默认整帧校准间隔：5 分钟。
+pub const DEFAULT_FULL_REFRESH_MS: u64 = 300_000;
+
+/// 清屏同步帧后的默认间隔：200ms（约 3~6 帧显示时间）。
+pub const DEFAULT_SYNC_SETTLE_MS: u64 = 200;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunReport {
@@ -64,6 +89,12 @@ pub struct RunReport {
     pub ipc_rejects: u64,
     pub stale_frames: u64,
     pub waiting_frames: u64,
+    /// 只发了脏矩形（未发整帧）的次数。
+    pub frames_partial: u64,
+    /// 与上一帧完全相同、未发送的次数。
+    pub frames_skipped: u64,
+    /// 连接建立后下发的清屏同步帧次数（每次连接恰好一帧，失败不计）。
+    pub sync_frames: u64,
 }
 
 /// 时钟与退出信号。
@@ -92,6 +123,34 @@ pub trait EventPoller {
     fn try_recv(&mut self) -> Option<DeviceEvent>;
 }
 
+/// 设备状态文件：胶囊按它显示“已连接 / 未连接”，并决定是否弹断开提示。
+fn status_path() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("hetao-capsule")
+        .join("screen")
+        .join("status.json")
+}
+
+fn status_json(connected: bool, updated_ms: u64, reason: &str) -> String {
+    format!(
+        "{{\"connected\":{},\"updated_ms\":{},\"reason\":\"{}\"}}",
+        connected, updated_ms, reason
+    )
+}
+
+fn write_device_status(path: Option<&std::path::Path>, connected: bool, reason: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let _ = std::fs::write(path, status_json(connected, ms, reason));
+}
+
 /// 主循环：直到 `run_seconds` 到期或 `clock.should_stop()`。
 pub fn run_loop(
     app: &mut ScreenApp,
@@ -109,7 +168,15 @@ pub fn run_loop(
     let retry_ms = options.retry_ms.max(5_000);
     let retry_i64 = retry_ms as i64;
     let mut device: Option<DeviceSession<dyn DeviceAdapter>> = None;
+    // 上一次成功下发到设备的帧；重连/拔出后清空，下一拍回全帧。
+    let mut last_sent: Option<Frame> = None;
+    // 上一次发整帧的时间；用于周期性校准，防止设备丢帧后差异永久不再重发。
+    let mut last_full_ms = start_ms;
     let mut next_retry_ms = start_ms;
+    let mut last_status: Option<bool> = None;
+    let mut last_status_ms = start_ms;
+    let mut last_stats_ms = start_ms;
+    let mut tick_ms = options.tick_ms;
 
     while !clock.should_stop() {
         let now = clock.now_ms();
@@ -117,6 +184,15 @@ pub fn run_loop(
             break;
         }
         report.ticks += 1;
+
+        // 0) 亮度 / 刷新间隔热更新：改完下一拍生效。
+        //    不重启进程、不重新初始化设备——重启会让屏幕重新上电初始化并闪一下。
+        if let Some(new_tick) = app.reload_display_options() {
+            if new_tick != tick_ms {
+                crate::logging::info(&format!("热更新：刷新间隔 {new_tick}ms"));
+            }
+            tick_ms = new_tick;
+        }
 
         // 1) 设备事件：Removal 关闭 Session；Arrival 立即尝试重连。
         for _ in 0..options.max_events_per_tick {
@@ -126,6 +202,7 @@ pub fn run_loop(
                         session.close();
                         crate::logging::warn("设备已移除，关闭 Session");
                     }
+                    last_sent = None;
                     next_retry_ms = now.saturating_add(retry_i64);
                 }
                 Some(DeviceEvent::Arrival) => {
@@ -141,10 +218,35 @@ pub fn run_loop(
         if device.is_none() && now >= next_retry_ms {
             report.connect_attempts += 1;
             match try_connect(provider) {
-                Ok(Some(session)) => {
+                Ok(Some(mut session)) => {
                     report.connect_successes += 1;
-                    device = Some(session);
-                    crate::logging::info("设备已连接并初始化（仅一次）");
+                    // 清屏同步帧：重启（主题/方向/卡片切换）或重连时，串口驱动队列
+                    // 里可能残留上一个进程未写完的半帧字节。先发一帧纯黑整帧，
+                    // 让设备按帧头重新对齐字节流，再进入正常差分刷新。
+                    match clear_frame(&options.physical) {
+                        Some(frame) => match session.send_frame(&frame) {
+                            Ok(()) => {
+                                report.sync_frames += 1;
+                                // 留出设备刷新清屏帧的时间：否则首帧内容与清屏帧
+                                // 尾部背靠背下发，设备丢掉最后一分块 → 底部残留黑块。
+                                if options.sync_settle_ms > 0 {
+                                    clock.sleep_ms(options.sync_settle_ms);
+                                }
+                                device = Some(session);
+                                crate::logging::info("设备已连接并初始化（仅一次），已清屏");
+                            }
+                            Err(err) => {
+                                report.send_failures += 1;
+                                crate::logging::warn(&format!("清屏同步帧发送失败：{err}"));
+                                session.close();
+                                next_retry_ms = now.saturating_add(retry_i64);
+                            }
+                        },
+                        None => {
+                            device = Some(session);
+                            crate::logging::info("设备已连接并初始化（仅一次）");
+                        }
+                    }
                 }
                 Ok(None) => {
                     crate::logging::warn(&format!("未发现设备，{}s 后重试", retry_ms / 1_000));
@@ -216,35 +318,81 @@ pub fn run_loop(
             }
         };
 
-        // 5) 发送完整帧；失败则关闭 Session 并进入退避重连。
+        // 5) 差分下发：内容不变则不发；小范围变化只发脏矩形；否则发完整帧。
+        //    设备无双缓冲，整帧重画就是现场看到的闪屏。
         if let (Some(frame), Some(session)) = (frame.as_ref(), device.as_mut()) {
             if session.is_ready() {
-                match session.send_frame(frame) {
-                    Ok(()) => report.frames_sent += 1,
-                    Err(err) => {
-                        report.send_failures += 1;
-                        crate::logging::error(&format!("发送失败：{err}"));
-                        session.close();
+                // 差分刷新依赖「发送成功 = 设备显示正确」；按固定间隔强制一次整帧，
+                // 把设备内容与本地缓存重新对齐（设备丢帧后差异否则永不重发）。
+                let calibration_due = options.full_refresh_ms > 0
+                    && now.saturating_sub(last_full_ms) >= options.full_refresh_ms as i64;
+                let plan = plan_frame(last_sent.as_ref(), frame, calibration_due);
+                match send_planned(session, frame, plan) {
+                    SendOutcome::Full => {
+                        report.frames_sent += 1;
+                        last_sent = Some(frame.clone());
+                        last_full_ms = now;
                     }
+                    SendOutcome::Partial => {
+                        report.frames_partial += 1;
+                        last_sent = Some(frame.clone());
+                    }
+                    SendOutcome::Skipped => report.frames_skipped += 1,
+                    SendOutcome::Failed => report.send_failures += 1,
                 }
             }
         }
         if device.as_ref().is_some_and(|session| !session.is_ready()) {
             device = None;
+            last_sent = None;
             next_retry_ms = now.saturating_add(retry_i64);
         }
 
-        // 6) 节拍等待（不空转）。
-        let wait = match deadline {
-            Some(deadline) => options.tick_ms.min((deadline - now).max(1) as u64),
-            None => options.tick_ms,
-        };
-        clock.sleep_ms(wait.max(1));
+        // 上报设备状态：状态变化立即写，稳定时每 5s 心跳一次。
+        let connected = device.as_ref().is_some_and(|s| s.is_ready());
+        if last_status != Some(connected) || now.saturating_sub(last_status_ms) >= 5_000 {
+            write_device_status(
+                options.status_file.as_deref(),
+                connected,
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                },
+            );
+            last_status = Some(connected);
+            last_status_ms = now;
+        }
+
+        // 每分钟一行统计：现场用它核对实际发送节拍（只记计数，不含任何凭据）。
+        if now.saturating_sub(last_stats_ms) >= 60_000 {
+            crate::logging::info(&format!(
+                "stats: ticks={} frames_sent={} frames_partial={} frames_skipped={} send_failures={} render_failures={}",
+                report.ticks,
+                report.frames_sent,
+                report.frames_partial,
+                report.frames_skipped,
+                report.send_failures,
+                report.render_failures
+            ));
+            last_stats_ms = now;
+        }
+
+        // 6) 节拍等待：扣掉本拍发送/渲染已用时间，保证刷新周期等于 tick_ms。
+        //    单帧传输约 1.9s，若再从整拍开始睡，实际周期会变成「传输 + 节拍」。
+        let after_ms = clock.now_ms();
+        clock.sleep_ms(tick_wait_ms(
+            tick_ms,
+            after_ms.saturating_sub(now).max(0) as u64,
+            deadline,
+            after_ms,
+        ));
     }
 
     if let Some(mut session) = device.take() {
         session.close();
     }
+    write_device_status(options.status_file.as_deref(), false, "stopped");
     if let Some(ipc) = ipc {
         ipc.close();
     }
@@ -260,6 +408,93 @@ pub fn run_loop(
         report.waiting_frames
     );
     Ok(report)
+}
+
+/// 本拍下发计划：到校准时间就强制整帧，否则按差分结果。
+fn plan_frame(previous: Option<&Frame>, current: &Frame, calibration_due: bool) -> FrameSend {
+    if calibration_due {
+        FrameSend::Full
+    } else {
+        plan_send(previous, current)
+    }
+}
+
+/// 一次下发的实际结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    Full,
+    Partial,
+    Skipped,
+    Failed,
+}
+
+/// 按差分计划下发；适配器不支持子矩形时回退全帧。
+fn send_planned<A: DeviceAdapter + ?Sized>(
+    session: &mut DeviceSession<A>,
+    frame: &Frame,
+    plan: FrameSend,
+) -> SendOutcome {
+    match plan {
+        FrameSend::Skip => SendOutcome::Skipped,
+        FrameSend::Full => match session.send_frame(frame) {
+            Ok(()) => SendOutcome::Full,
+            Err(err) => {
+                crate::logging::error(&format!("发送失败：{err}"));
+                session.close();
+                SendOutcome::Failed
+            }
+        },
+        FrameSend::Region(region) => match session.send_frame_region(frame, region) {
+            Ok(()) => SendOutcome::Partial,
+            // 能力缺失而非通信故障：回退整帧，不把设备判死
+            Err(SessionError::Send(AdapterError::Unsupported(_))) => {
+                match session.send_frame(frame) {
+                    Ok(()) => SendOutcome::Full,
+                    Err(err) => {
+                        crate::logging::error(&format!("发送失败：{err}"));
+                        session.close();
+                        SendOutcome::Failed
+                    }
+                }
+            }
+            Err(err) => {
+                crate::logging::error(&format!("发送失败：{err}"));
+                session.close();
+                SendOutcome::Failed
+            }
+        },
+    }
+}
+
+/// 两帧之间必须保留的静止时间（ms）。
+///
+/// 单帧（320×480 RGB565 = 307,200 B）实测传输约 1.9s；设备无双缓冲，接收期间整屏
+/// 在被逐段写入。若刷新间隔小于传输耗时，节拍会退化成「一帧接一帧」的连续重画，
+/// 现场表现就是持续闪屏。留 1s 静止时间可避免这种最坏情况。
+const MIN_IDLE_MS: u64 = 1_000;
+
+/// 本拍剩余等待：扣掉发送/渲染已用时间，并受运行截止时间约束。
+/// 保证实际刷新周期等于 `tick_ms`，而不是「单帧传输耗时 + tick_ms」。
+fn tick_wait_ms(tick_ms: u64, spent_ms: u64, deadline: Option<i64>, now_ms: i64) -> u64 {
+    let mut wait = tick_ms.saturating_sub(spent_ms).max(MIN_IDLE_MS);
+    if let Some(deadline) = deadline {
+        wait = wait.min((deadline - now_ms).max(1) as u64);
+    }
+    wait
+}
+
+/// 清屏同步帧：物理分辨率全黑整帧（RGB565LE 全 0）。连接建立后先发它，
+/// 让设备把字节流对齐到帧头，吸收上一个进程可能残留的半帧字节。
+fn clear_frame(physical: &ScreenProfile) -> Option<Frame> {
+    let len = (physical.width as usize) * (physical.height as usize) * 2;
+    Frame::new(
+        physical.width,
+        physical.height,
+        screen_core::PixelFormat::Rgb565Le,
+        vec![0u8; len],
+        None,
+    )
+    .ok()
 }
 
 fn try_connect(
@@ -525,8 +760,8 @@ pub fn run_production(_app: &mut ScreenApp, _options: RunOptions) -> Result<RunR
 mod tests {
     use super::*;
     use crate::session::test_support::{MockAdapter, MockCounters};
-    use screen_adapter_api::DeviceInfo;
-    use screen_core::{Snapshot, TransportKind};
+    use screen_adapter_api::{DeviceInfo, Region};
+    use screen_core::{Frame, PixelFormat, Snapshot, TransportKind};
     use screen_ipc::MessageKind;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -535,11 +770,16 @@ mod tests {
     struct FakeClock {
         now: i64,
         stop: bool,
+        sleeps: Vec<u64>,
     }
 
     impl FakeClock {
         fn new(now: i64) -> Self {
-            Self { now, stop: false }
+            Self {
+                now,
+                stop: false,
+                sleeps: Vec::new(),
+            }
         }
     }
 
@@ -549,6 +789,7 @@ mod tests {
         }
 
         fn sleep_ms(&mut self, ms: u64) {
+            self.sleeps.push(ms);
             self.now += ms as i64;
         }
 
@@ -693,9 +934,23 @@ mod tests {
         ScreenApp::init(Some(&missing)).expect("app")
     }
 
+    fn frame_320x480() -> Frame {
+        Frame::new(
+            PHYSICAL_WIDTH,
+            PHYSICAL_HEIGHT,
+            PixelFormat::Rgb565Le,
+            vec![0u8; (PHYSICAL_WIDTH * PHYSICAL_HEIGHT * 2) as usize],
+            Some(8192),
+        )
+        .expect("frame")
+    }
+
     fn options(seconds: u64) -> RunOptions {
         RunOptions {
             run_seconds: Some(seconds),
+            status_file: None,
+            // 测试用虚拟时钟，清屏后的真实等待没有必要
+            sync_settle_ms: 0,
             ..Default::default()
         }
     }
@@ -722,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_snapshots_are_rendered_and_sent_each_tick() {
+    fn first_frame_is_full_and_repeated_identical_ticks_are_skipped() {
         let mut app = app();
         let mut provider = MockProvider::new(vec![Some(info())]);
         let mut ipc = MockIpc::new(vec![
@@ -742,14 +997,127 @@ mod tests {
         )
         .expect("run");
 
-        assert_eq!(report.frames_sent, 3);
+        // 同一分钟内渲染出的帧完全相同：首拍整帧，后续拍不重发
+        assert_eq!(report.frames_sent + report.frames_skipped, 3);
+        assert!(report.frames_skipped >= 1, "内容未变不应重画整帧");
         assert_eq!(report.ipc_messages, 3);
         assert_eq!(report.ipc_rejects, 0);
         assert_eq!(provider.opens, 1, "只应打开一次");
         assert_eq!(provider.counters.open_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.counters.init_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.counters.send_calls.load(Ordering::SeqCst), 3);
+        // 发送调用 = 差分/整帧下发 + 连接时的清屏同步帧
+        assert_eq!(
+            provider.counters.send_calls.load(Ordering::SeqCst),
+            report.frames_sent as u32 + report.sync_frames as u32
+        );
         assert!(ipc.closed);
+    }
+
+    #[test]
+    fn connect_sends_clear_frame_before_content() {
+        let mut app = app();
+        let mut provider = MockProvider::new(vec![Some(info())]);
+        let mut ipc = MockIpc::new(vec![snapshot_message(1, 0)]);
+        let mut events = ScheduledEvents::new(Vec::new());
+        let mut clock = FakeClock::new(0);
+        let report = run_loop(
+            &mut app,
+            &mut provider,
+            Some(&mut ipc),
+            &mut events,
+            &mut clock,
+            &options(2),
+        )
+        .expect("run");
+
+        assert_eq!(report.sync_frames, 1, "每次连接恰好一帧清屏帧");
+        let frames = provider.counters.frames.lock().expect("frames lock");
+        assert!(frames.len() >= 2, "清屏帧后必须还有内容帧");
+        let clear = &frames[0];
+        assert_eq!(clear.width, PHYSICAL_WIDTH);
+        assert_eq!(clear.height, PHYSICAL_HEIGHT);
+        assert_eq!(clear.pixel_format, PixelFormat::Rgb565Le);
+        assert!(
+            clear.pixels.iter().all(|b| *b == 0),
+            "清屏帧必须是全黑整帧，让设备按帧头重新对齐字节流"
+        );
+        assert!(
+            frames[1..].iter().any(|f| f.pixels.iter().any(|b| *b != 0)),
+            "清屏帧之后必须下发真实内容帧"
+        );
+    }
+
+    #[test]
+    fn clear_frame_send_failure_drops_session() {
+        let mut app = app();
+        let mut provider = MockProvider::new(vec![Some(info())]);
+        provider.fail_send = Arc::new(AtomicBool::new(true));
+        let mut ipc = MockIpc::new(vec![snapshot_message(1, 0)]);
+        let mut events = ScheduledEvents::new(Vec::new());
+        let mut clock = FakeClock::new(0);
+        let report = run_loop(
+            &mut app,
+            &mut provider,
+            Some(&mut ipc),
+            &mut events,
+            &mut clock,
+            &options(3),
+        )
+        .expect("run");
+
+        assert_eq!(report.sync_frames, 0);
+        assert_eq!(report.send_failures, 1, "清屏帧发送失败计为发送失败");
+        assert!(provider.counters.close_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn clear_frame_settles_before_content_frame() {
+        let mut app = app();
+        let mut provider = MockProvider::new(vec![Some(info())]);
+        let mut ipc = MockIpc::new(vec![snapshot_message(1, 0)]);
+        let mut events = ScheduledEvents::new(Vec::new());
+        let mut clock = FakeClock::new(0);
+        let mut opts = options(2);
+        opts.sync_settle_ms = 250;
+        let report = run_loop(
+            &mut app,
+            &mut provider,
+            Some(&mut ipc),
+            &mut events,
+            &mut clock,
+            &opts,
+        )
+        .expect("run");
+
+        assert_eq!(report.sync_frames, 1);
+        assert!(
+            clock.sleeps.contains(&250),
+            "清屏帧后必须留出设备刷新时间，否则底部残留黑块：{:?}",
+            clock.sleeps
+        );
+    }
+
+    #[test]
+    fn sync_settle_can_be_disabled() {
+        let mut app = app();
+        let mut provider = MockProvider::new(vec![Some(info())]);
+        let mut ipc = MockIpc::new(vec![snapshot_message(1, 0)]);
+        let mut events = ScheduledEvents::new(Vec::new());
+        let mut clock = FakeClock::new(0);
+        let mut opts = options(2);
+        opts.sync_settle_ms = 0;
+        let report = run_loop(
+            &mut app,
+            &mut provider,
+            Some(&mut ipc),
+            &mut events,
+            &mut clock,
+            &opts,
+        )
+        .expect("run");
+
+        assert_eq!(report.sync_frames, 1);
+        assert!(!clock.sleeps.contains(&0), "0 表示不额外等待");
     }
 
     #[test]
@@ -770,7 +1138,8 @@ mod tests {
         .expect("run");
 
         assert!(report.stale_frames >= 1);
-        assert_eq!(report.frames_sent, 5);
+        assert_eq!(report.frames_sent + report.frames_skipped, report.ticks);
+        assert!(report.frames_skipped >= 1, "重复占位画面不应反复重画");
         assert!(app.snapshot().is_some(), "过期不清空快照，但不再用于渲染");
     }
 
@@ -905,5 +1274,107 @@ mod tests {
         )
         .expect("run");
         assert_eq!(report.ticks, 0);
+    }
+
+    #[test]
+    fn tick_wait_subtracts_send_time() {
+        // 5s 拍长、发送用掉 1.9s → 只再睡 3.1s，实际周期仍是 5s
+        assert_eq!(tick_wait_ms(5_000, 1_900, None, 0), 3_100);
+        assert_eq!(tick_wait_ms(1_000, 0, None, 0), 1_000);
+    }
+
+    #[test]
+    fn tick_wait_keeps_idle_gap_when_send_exceeds_tick() {
+        // 1s/2s 刷新小于单帧传输耗时（约 1.9s）：不能退化成连续重画，
+        // 必须留出 MIN_IDLE_MS 的静止时间，否则屏幕持续闪。
+        assert_eq!(tick_wait_ms(1_000, 1_900, None, 0), MIN_IDLE_MS);
+        assert_eq!(tick_wait_ms(2_000, 1_900, None, 0), MIN_IDLE_MS);
+        assert_eq!(tick_wait_ms(1_900, 1_900, None, 0), MIN_IDLE_MS);
+        // 3s 拍长仍有 >1s 的静止时间，不受影响
+        assert_eq!(tick_wait_ms(3_000, 1_900, None, 0), 1_100);
+    }
+
+    #[test]
+    fn tick_wait_respects_run_deadline() {
+        assert_eq!(tick_wait_ms(5_000, 0, Some(1_200), 1_000), 200);
+        assert_eq!(tick_wait_ms(5_000, 0, Some(1_000), 1_000), 1);
+    }
+
+    #[test]
+    fn calibration_overrides_diff_only_when_due() {
+        let frame = frame_320x480();
+        assert_eq!(plan_frame(Some(&frame), &frame, false), FrameSend::Skip);
+        assert_eq!(plan_frame(Some(&frame), &frame, true), FrameSend::Full);
+        assert_eq!(plan_frame(None, &frame, false), FrameSend::Full);
+    }
+
+    #[test]
+    fn periodic_calibration_sends_full_frame_even_with_static_content() {
+        let mut app = app();
+        let mut provider = MockProvider::new(vec![Some(info())]);
+        let mut ipc = MockIpc::new(vec![
+            snapshot_message(1, 0),
+            snapshot_message(2, 0),
+            snapshot_message(3, 0),
+            snapshot_message(4, 0),
+            snapshot_message(5, 0),
+            snapshot_message(6, 0),
+        ]);
+        let mut events = ScheduledEvents::new(Vec::new());
+        let mut clock = FakeClock::new(0);
+        let mut opts = options(6);
+        opts.full_refresh_ms = 2_500;
+        let report = run_loop(
+            &mut app,
+            &mut provider,
+            Some(&mut ipc),
+            &mut events,
+            &mut clock,
+            &opts,
+        )
+        .expect("run");
+
+        // 首帧 + 至少一次校准整帧
+        assert!(report.frames_sent >= 2, "校准应再发整帧：{report:?}");
+        assert!(
+            report.frames_partial + report.frames_skipped >= 1,
+            "非校准拍不应全是整帧：{report:?}"
+        );
+    }
+
+    #[test]
+    fn skip_plan_writes_nothing() {
+        let adapter = MockAdapter::new();
+        let counts = adapter.counters.clone();
+        let mut session = DeviceSession::connect(Box::new(adapter), &info()).expect("connect");
+        assert_eq!(
+            send_planned(&mut session, &frame_320x480(), FrameSend::Skip),
+            SendOutcome::Skipped
+        );
+        assert_eq!(counts.send_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unsupported_region_falls_back_to_full_frame_without_faulting() {
+        let adapter = MockAdapter::new();
+        let counts = adapter.counters.clone();
+        let mut session = DeviceSession::connect(Box::new(adapter), &info()).expect("connect");
+        let outcome = send_planned(
+            &mut session,
+            &frame_320x480(),
+            FrameSend::Region(Region::new(0, 100, 320, 40)),
+        );
+        assert_eq!(outcome, SendOutcome::Full, "无子矩形能力时必须回退整帧");
+        assert_eq!(counts.send_calls.load(Ordering::SeqCst), 1);
+        assert!(session.is_ready(), "能力缺失不得把 Session 判为故障");
+    }
+
+    #[test]
+    fn status_json_carries_connected_flag_and_timestamp() {
+        let text = status_json(false, 1_234_567, "disconnected");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(v["connected"], false);
+        assert_eq!(v["updated_ms"], 1_234_567u64);
+        assert_eq!(v["reason"], "disconnected");
     }
 }

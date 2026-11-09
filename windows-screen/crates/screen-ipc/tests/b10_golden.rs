@@ -9,7 +9,7 @@
 use screen_ipc::{Header, Message, MessageKind, HEADER_LEN, SCHEMA_MAJOR};
 
 /// 与 `capsule/src/screen_bridge.rs` 中的 `GOLDEN_JSON` **必须逐字节一致**。
-const GOLDEN_JSON: &str = "{\"seq\":42,\"ts_ms\":1700000000000,\"nas\":{\"name\":\"nas\",\"online\":true},\"metrics\":{\"cpu\":{\"usage_pct\":12.5,\"temp_c\":45.0,\"load_1m\":0.5,\"load_5m\":0.4,\"load_15m\":0.3},\"memory\":{\"usage_pct\":55.0,\"used_bytes\":8589934592,\"total_bytes\":17179869184,\"cached_bytes\":2147483648,\"available_bytes\":8589934592},\"gpu\":{\"name\":\"card0\",\"usage_pct\":30.0,\"temp_c\":50.0,\"vram_used_bytes\":1073741824,\"vram_total_bytes\":8589934592},\"network\":{\"iface\":\"eth0\",\"up_bps\":200,\"down_bps\":100},\"disk\":{\"device\":\"/dev/sda\",\"read_bps\":1024,\"write_bps\":2048},\"storage\":[{\"name\":\"vol1\",\"used_bytes\":1000,\"total_bytes\":2000}]}}";
+const GOLDEN_JSON: &str = "{\"seq\":42,\"ts_ms\":1700000000000,\"nas\":{\"name\":\"nas\",\"online\":true},\"metrics\":{\"cpu\":{\"usage_pct\":12.5,\"temp_c\":45.0,\"vendor\":\"intel\",\"load_1m\":0.5,\"load_5m\":0.4,\"load_15m\":0.3},\"memory\":{\"usage_pct\":55.0,\"used_bytes\":8589934592,\"total_bytes\":17179869184,\"cached_bytes\":2147483648,\"available_bytes\":8589934592},\"gpu\":{\"name\":\"card0\",\"vendor\":\"amd\",\"usage_pct\":30.0,\"temp_c\":50.0,\"vram_used_bytes\":1073741824,\"vram_total_bytes\":8589934592},\"network\":{\"iface\":\"eth0\",\"up_bps\":200,\"down_bps\":100},\"disk\":{\"device\":\"/dev/sda\",\"read_bps\":1024,\"write_bps\":2048},\"storage\":[{\"name\":\"vol1\",\"used_bytes\":1000,\"total_bytes\":2000}]}}";
 
 /// 按 capsule 编码器的字节布局拼装（不使用 `Header::encode`，避免「自证」）。
 fn capsule_bytes(seq: u64, json: &str) -> Vec<u8> {

@@ -33,6 +33,11 @@ pub trait TextRenderer {
         size: f32,
         color: Color,
     ) -> Result<(), RenderError>;
+
+    /// 量宽（像素）。默认实现返回 None，调用方退回按字符数估算。
+    fn measure_text(&mut self, _text: &str, _size: f32) -> Option<f32> {
+        None
+    }
 }
 
 /// 占位实现：明确返回“未实现”，不伪造文字。

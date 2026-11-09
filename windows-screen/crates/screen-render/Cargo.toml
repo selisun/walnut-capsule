@@ -12,3 +12,4 @@ windows.workspace = true
 
 [dev-dependencies]
 screen-layout = { path = "../screen-layout" }
+screen-theme = { path = "../screen-theme" }

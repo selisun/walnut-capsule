@@ -13,12 +13,13 @@ use screen_ipc::{ConnectionState, Message, MessageKind};
 use screen_layout::{build, TemplateKind};
 use screen_protocol::rgba_to_rgb565le;
 use screen_render::{
-    bind_with_clock, create_text_renderer, local_clock, render_legacy, render_notice_bg,
+    bind_with_clock, create_text_renderer, local_clock, render_legacy_bg, render_notice_bg,
     render_with_bg, render_with_metrics_bg, BackgroundImage, FontSpec, LegacyData,
 };
 use screen_theme::{load_dir, load_str, ThemeStore};
 use screen_transport_cdc::CdcTransport;
 
+use crate::brand;
 use crate::config::{Config, ConfigError};
 use crate::orientation::{Direction, DirectionError};
 use crate::runtime::RunOptions;
@@ -90,6 +91,9 @@ pub struct ScreenApp {
     themes: ThemeStore,
     current_theme: ThemeConfig,
     background_image: Option<BackgroundImage>,
+    /// 品牌底图键（`{cpu}-{gpu}`）。初始用本机硬件兜底；收到 NAS 快照后
+    /// 改用 NAS 上报的厂商，保证底图 LOGO 与屏上显数值的机器一致。
+    brand_key: String,
     devices: DeviceManager,
     gate: SnapshotGate,
     ipc_state: ConnectionState,
@@ -151,10 +155,14 @@ impl ScreenApp {
         let gate = SnapshotGate::new(config.integration.stale_ms, period_ms)
             .map_err(|e| AppError::Config(e.to_string()))?;
 
+        // 初始底图按本机硬件兜底；NAS 快照到达后改用 NAS 的品牌（见 receive_snapshot）。
+        let brand_key = brand::variant_key(brand::cpu_brand(), brand::gpu_brand());
         let background_image = load_background_image(
             &current_theme,
             resolved.as_deref(),
             themes.is_builtin(&current_theme.id),
+            &config.display.orientation,
+            &brand_key,
         );
 
         Ok(Self {
@@ -164,6 +172,7 @@ impl ScreenApp {
             themes,
             current_theme,
             background_image,
+            brand_key,
             devices: DeviceManager::single_device(),
             gate,
             ipc_state: ConnectionState::WaitingClient,
@@ -180,6 +189,33 @@ impl ScreenApp {
     /// 实际使用的配置文件路径（未找到默认路径时为 `None`）。
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+
+    /// 运行期热更新：重读配置里的「亮度 / 刷新间隔」。
+    ///
+    /// 只改这两个值时**不重启进程、不重新初始化设备**——重启会让设备重新上电初始化，
+    /// 屏幕会闪一下。返回 `Some(节拍ms)` 表示有变化；文件缺失/解析失败返回 `None`，
+    /// 主题、方向、显示项目等其它字段仍需重启才生效。
+    pub fn reload_display_options(&mut self) -> Option<u64> {
+        let path = self.config_path.clone()?;
+        let loaded = crate::config::Config::load(&path).ok()?;
+        let mut changed = false;
+        if loaded.display.brightness != self.config.display.brightness {
+            self.config.display.brightness = loaded.display.brightness;
+            changed = true;
+        }
+        if loaded.display.refresh_secs != self.config.display.refresh_secs {
+            let period_ms = (loaded.display.refresh_secs as i64).saturating_mul(1_000);
+            if self
+                .gate
+                .update_threshold(self.config.integration.stale_ms, period_ms)
+                .is_ok()
+            {
+                self.config.display.refresh_secs = loaded.display.refresh_secs;
+                changed = true;
+            }
+        }
+        changed.then(|| self.config.tick_ms())
     }
 
     pub fn theme(&self) -> &ThemeConfig {
@@ -229,9 +265,50 @@ impl ScreenApp {
             .accept(snapshot, now_ms)
             .map_err(|e: DataError| AppError::Data(e.to_string()))?;
         self.snapshot = Some(snapshot.clone());
+        // 屏上数值来自 NAS，品牌底图也跟随 NAS 的硬件，避免 LOGO 与数据不是同一台机器。
+        self.apply_nas_brand(snapshot);
         self.ipc_state = ConnectionState::Connected;
         self.state = AppState::Running;
         Ok(self.gate.state())
+    }
+
+    /// 品牌键（`{cpu}-{gpu}`），供主题选官方皮肤底图。
+    pub fn brand_key(&self) -> &str {
+        &self.brand_key
+    }
+
+    /// 快照里带了 NAS 厂商信息且与当前不同，才重新读底图（避免每帧读盘）。
+    fn apply_nas_brand(&mut self, snapshot: &Snapshot) {
+        let cpu = snapshot
+            .metrics
+            .cpu
+            .as_ref()
+            .and_then(|c| c.vendor.as_deref());
+        let gpu = snapshot
+            .metrics
+            .gpu
+            .as_ref()
+            .and_then(|g| g.vendor.as_deref());
+        let Some(key) = brand::variant_key_from_vendors(cpu, gpu) else {
+            return; // NAS 未上报厂商（老服务端）：保留当前底图
+        };
+        if key == self.brand_key {
+            return;
+        }
+        self.brand_key = key;
+        self.reload_background();
+    }
+
+    /// 按当前方向 + 品牌键重新读主题底图。
+    fn reload_background(&mut self) {
+        let is_builtin = self.themes.is_builtin(&self.current_theme.id);
+        self.background_image = load_background_image(
+            &self.current_theme,
+            self.config_path.as_deref(),
+            is_builtin,
+            &self.config.display.orientation,
+            &self.brand_key,
+        );
     }
 
     pub fn tick(&mut self, now_ms: i64) -> DataState {
@@ -367,21 +444,35 @@ impl ScreenApp {
             let visible = &self.config.components.visible;
             let set = create_text_renderer(&FontSpec {
                 family: self.current_theme.typography.family.clone(),
-                size_px: 16.0,
+                // 旧版四主题字号跨度大（11~48px），按 32px 取字形轮廓再缩放，大字更细腻
+                size_px: 32.0,
                 weight: theme_weight(&self.current_theme),
             });
             let logical = match set {
-                Ok(mut renderer) => render_legacy(
+                Ok(mut renderer) => render_legacy_bg(
                     &plan.logical,
                     &self.current_theme,
                     &data,
                     visible,
                     Some(renderer.as_mut()),
+                    self.background_image.as_ref(),
                 ),
-                Err(_) => render_legacy(&plan.logical, &self.current_theme, &data, visible, None),
+                Err(_) => render_legacy_bg(
+                    &plan.logical,
+                    &self.current_theme,
+                    &data,
+                    visible,
+                    None,
+                    self.background_image.as_ref(),
+                ),
             }
             .map_err(|e| AppError::State(e.to_string()))?;
-            return finish_frame(direction, physical, &logical);
+            return finish_frame(
+                direction,
+                physical,
+                &logical,
+                self.config.display.brightness,
+            );
         }
 
         let bound = bind_with_clock(
@@ -426,7 +517,12 @@ impl ScreenApp {
             ),
         }
         .map_err(|e| AppError::State(e.to_string()))?;
-        finish_frame(direction, physical, &logical)
+        finish_frame(
+            direction,
+            physical,
+            &logical,
+            self.config.display.brightness,
+        )
     }
 
     /// 生成占位物理帧（等待客户端/数据过期/版本不兼容），不显示任何旧数值。
@@ -579,6 +675,8 @@ impl ScreenApp {
             next.save(path)?;
         }
         self.config = next;
+        // 方向变了底图可能也不同（官方皮肤横竖两套图），立即重新选图。
+        self.reload_background();
         Ok(())
     }
 
@@ -626,15 +724,17 @@ impl ScreenApp {
     }
 }
 
-/// 逻辑帧 → 按方向旋转 → RGB565LE 物理帧。
+/// 逻辑帧 → 按方向旋转 → 按亮度调暗 → RGB565LE 物理帧。
 fn finish_frame(
     direction: Direction,
     physical: &ScreenProfile,
     logical: &FrameBuffer,
+    brightness: u8,
 ) -> Result<Frame, AppError> {
-    let logical = direction
+    let mut logical = direction
         .oriented_frame(physical, logical)
         .map_err(AppError::from)?;
+    apply_brightness(&mut logical, brightness);
     let pixels = rgba_to_rgb565le(logical.pixels(), logical.width(), logical.height())
         .map_err(|e| AppError::State(e.to_string()))?;
     Frame::new(
@@ -645,6 +745,19 @@ fn finish_frame(
         Some(8192),
     )
     .map_err(|e| AppError::State(e.to_string()))
+}
+
+/// 按百分比调暗 RGB（保留 alpha）；100 表示原样。
+fn apply_brightness(frame: &mut FrameBuffer, brightness: u8) {
+    let level = brightness.min(100) as u32;
+    if level >= 100 {
+        return;
+    }
+    for px in frame.pixels_mut().chunks_exact_mut(4) {
+        px[0] = (px[0] as u32 * level / 100) as u8;
+        px[1] = (px[1] as u32 * level / 100) as u8;
+        px[2] = (px[2] as u32 * level / 100) as u8;
+    }
 }
 
 /// 从快照提取旧版版式所需的数据（缺失一律留 None）。
@@ -669,6 +782,8 @@ fn legacy_data(snapshot: &Snapshot) -> LegacyData {
         pc_mem: snapshot.pc.mem_pct,
         pc_gpu: snapshot.pc.gpu_pct,
         pc_gpu_temp: snapshot.pc.gpu_temp,
+        pc_rx: snapshot.pc.net_rx,
+        pc_tx: snapshot.pc.net_tx,
     }
 }
 
@@ -696,13 +811,31 @@ fn theme_weight(theme: &ThemeConfig) -> u16 {
         .clamp(100, 900)
 }
 
+/// 按方向 + 品牌选背景图：优先 `{orientation}-{cpu}-{gpu}`，再 `{cpu}-{gpu}`，最后 `image`。
+fn pick_background_file<'a>(
+    theme: &'a ThemeConfig,
+    orientation: &str,
+    brand_key: &str,
+) -> Option<&'a str> {
+    let oriented = format!("{orientation}-{brand_key}");
+    theme
+        .background
+        .variants
+        .get(&oriented)
+        .or_else(|| theme.background.variants.get(brand_key))
+        .map(String::as_str)
+        .or(theme.background.image.as_deref())
+}
+
 /// 加载主题背景图。内置主题不携带图片资源；用户主题从 `<config 目录>/themes/` 读取 PNG。
 fn load_background_image(
     theme: &ThemeConfig,
     config_path: Option<&Path>,
     is_builtin: bool,
+    orientation: &str,
+    brand_key: &str,
 ) -> Option<BackgroundImage> {
-    let rel = theme.background.image.as_deref()?;
+    let rel = pick_background_file(theme, orientation, brand_key)?;
     if is_builtin {
         eprintln!("内置主题不支持图片背景，已忽略：{rel}");
         return None;
@@ -742,7 +875,7 @@ pub fn default_config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::session::test_support::{MockAdapter, MockCounters};
-    use screen_core::{CpuMetrics, Orientation, ScreenProfile, Snapshot};
+    use screen_core::{CpuMetrics, GpuMetrics, Orientation, ScreenProfile, Snapshot};
     use screen_protocol::frame_header;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -777,6 +910,108 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("themes")).expect("mkdir themes");
         dir
+    }
+
+    #[test]
+    fn background_variant_matches_brand_and_falls_back() {
+        let json = r##"{
+          "schema": "hetao.theme/1",
+          "id": "variant-test",
+          "name": "变体测试",
+          "version": "1.0.0",
+          "palette": {
+            "bg": "#000000", "card": "#000000", "text": "#FFFFFF",
+            "dim": "#888888", "accent": "#00FF00", "warn": "#FFAA00", "danger": "#FF0000"
+          },
+          "typography": { "family": "Microsoft YaHei", "base_px": 18, "scale": 1.0, "weights": {} },
+          "background": {
+            "image": "base.png",
+            "variants": { "amd-nvidia": "amd-nvidia.png" },
+            "fit": "cover", "anchor": "center", "dim": 0.0
+          },
+          "resources": [
+            { "path": "base.png", "kind": "image", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            { "path": "amd-nvidia.png", "kind": "image", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+          ],
+          "components": { "visible": ["cpu"], "styles": {} },
+          "layout": { "template": "auto" }
+        }"##;
+        let theme = screen_theme::load_str(json).expect("主题应通过校验");
+        assert_eq!(
+            pick_background_file(&theme, "landscape", "amd-nvidia"),
+            Some("amd-nvidia.png"),
+            "命中的品牌变体应优先"
+        );
+        assert_eq!(
+            pick_background_file(&theme, "portrait", "intel-intel"),
+            Some("base.png"),
+            "未命中时应回退到 background.image"
+        );
+    }
+
+    #[test]
+    fn theme_without_variants_keeps_single_image() {
+        let json = r##"{
+          "schema": "hetao.theme/1",
+          "id": "plain",
+          "name": "无变体",
+          "version": "1.0.0",
+          "palette": {
+            "bg": "#000000", "card": "#000000", "text": "#FFFFFF",
+            "dim": "#888888", "accent": "#00FF00", "warn": "#FFAA00", "danger": "#FF0000"
+          },
+          "typography": { "family": "Microsoft YaHei", "base_px": 18, "scale": 1.0, "weights": {} },
+          "background": { "image": "base.png", "fit": "cover", "anchor": "center", "dim": 0.0 },
+          "resources": [{ "path": "base.png", "kind": "image", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }],
+          "components": { "visible": ["cpu"], "styles": {} },
+          "layout": { "template": "auto" }
+        }"##;
+        let theme = screen_theme::load_str(json).expect("主题应通过校验");
+        assert_eq!(
+            pick_background_file(&theme, "amd-amd", "amd-amd"),
+            Some("base.png")
+        );
+    }
+
+    #[test]
+    fn orientation_specific_variant_wins_over_brand_only() {
+        let json = r##"{
+          "schema": "hetao.theme/1",
+          "id": "orient",
+          "name": "方向变体",
+          "version": "1.0.0",
+          "palette": {
+            "bg": "#000000", "card": "#000000", "text": "#FFFFFF",
+            "dim": "#888888", "accent": "#00FF00", "warn": "#FFAA00", "danger": "#FF0000"
+          },
+          "typography": { "family": "Microsoft YaHei", "base_px": 18, "scale": 1.0, "weights": {} },
+          "background": {
+            "image": "fallback.png",
+            "variants": {
+              "landscape-amd-amd": "land.png",
+              "amd-amd": "any.png"
+            },
+            "fit": "cover", "anchor": "center", "dim": 0.0
+          },
+          "resources": [
+            { "path": "fallback.png", "kind": "image", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            { "path": "land.png", "kind": "image", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+            { "path": "any.png", "kind": "image", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+          ],
+          "components": { "visible": ["cpu"], "styles": {} },
+          "layout": { "template": "auto" }
+        }"##;
+        let theme = screen_theme::load_str(json).expect("主题应通过校验");
+        assert_eq!(
+            pick_background_file(&theme, "landscape", "amd-amd"),
+            Some("land.png"),
+            "带方向前缀的变体优先"
+        );
+        assert_eq!(
+            pick_background_file(&theme, "portrait", "amd-amd"),
+            Some("any.png"),
+            "方向未命中时退到品牌变体"
+        );
     }
 
     #[test]
@@ -858,6 +1093,30 @@ mod tests {
         assert_eq!(app.receive_snapshot(&snap, 10_000), Ok(DataState::Ready));
         assert_eq!(app.ipc_state(), ConnectionState::Connected);
         assert_eq!(app.tick(20_000), DataState::Stale);
+    }
+
+    #[test]
+    fn reload_display_options_applies_brightness_and_refresh_without_restart() {
+        let path = temp_config("hot-reload");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = Config::default();
+        cfg.display.brightness = 40;
+        cfg.display.refresh_secs = 5;
+        cfg.save(&path).expect("save");
+        let mut app = ScreenApp::init(Some(&path)).expect("app");
+        assert_eq!(app.reload_display_options(), None, "未变化时不应返回新节拍");
+
+        cfg.display.brightness = 80;
+        cfg.display.refresh_secs = 3;
+        cfg.save(&path).expect("save");
+        assert_eq!(app.reload_display_options(), Some(3_000));
+        assert_eq!(app.config().display.brightness, 80);
+        assert_eq!(app.config().display.refresh_secs, 3);
+        // 刷新周期变了，过期阈值跟着重算（max(3s, 3×3s)）
+        assert_eq!(app.gate.threshold_ms(), 9_000);
+        // 同一份配置只上报一次变化
+        assert_eq!(app.reload_display_options(), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1032,6 +1291,31 @@ mod tests {
             bg_565(),
             "只开 CPU 时右侧不应出现空白卡片"
         );
+    }
+
+    #[test]
+    fn nas_vendor_drives_brand_key() {
+        let path = missing_config();
+        let mut app = ScreenApp::init(Some(&path)).expect("app");
+        // 初始是本机硬件探测结果（具体值随机器，只断言非空）
+        assert!(!app.brand_key().is_empty());
+
+        let mut snap = Snapshot::new(1, 10_000);
+        snap.metrics.cpu = Some(CpuMetrics {
+            vendor: Some("intel".into()),
+            ..CpuMetrics::default()
+        });
+        snap.metrics.gpu = Some(GpuMetrics {
+            vendor: Some("nvidia".into()),
+            ..GpuMetrics::default()
+        });
+        app.receive_snapshot(&snap, 10_000).expect("accept");
+        assert_eq!(app.brand_key(), "intel-nvidia", "应按 NAS 厂商选底图");
+
+        // 老服务端不带厂商字段：保持上一次结果，不退回本机硬件
+        app.receive_snapshot(&Snapshot::new(2, 12_000), 12_000)
+            .expect("accept");
+        assert_eq!(app.brand_key(), "intel-nvidia");
     }
 
     #[test]
@@ -1316,5 +1600,15 @@ mod tests {
         };
         assert!(matches!(err, AppError::Config(_)));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn brightness_scales_rgb_and_keeps_full_at_100() {
+        let mut frame =
+            FrameBuffer::new(1, 2, vec![200, 100, 50, 255, 200, 100, 50, 255]).expect("frame");
+        apply_brightness(&mut frame, 50);
+        assert_eq!(&frame.pixels()[0..4], &[100, 50, 25, 255]);
+        apply_brightness(&mut frame, 100);
+        assert_eq!(&frame.pixels()[4..8], &[100, 50, 25, 255], "100 应保持原样");
     }
 }

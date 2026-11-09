@@ -3,13 +3,16 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use screen_core::{ResourceKind, ThemeConfig};
+use screen_core::{OverlaySlot, ResourceKind, ThemeConfig};
 
 use crate::error::ThemeError;
 
 pub const MAX_THEME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TEXT_FIELD: usize = 64;
 const MAX_PATH_LEN: usize = 200;
+/// 背景图最多几个品牌变体：cpu（amd/intel/unknown）× gpu（nvidia/amd/intel/unknown）
+/// = 12 种组合，每种再分横竖两套图，共 24 个。
+const MAX_BG_VARIANTS: usize = 24;
 
 const PALETTE_KEYS: [&str; 7] = ["bg", "card", "text", "dim", "accent", "warn", "danger"];
 const TEMPLATE_NAMES: [&str; 5] = [
@@ -118,6 +121,24 @@ pub fn validate(theme: &ThemeConfig) -> Result<(), ThemeError> {
             return Err(ThemeError::MissingResource(path.clone()));
         }
     }
+    if bg.variants.len() > MAX_BG_VARIANTS {
+        return Err(ThemeError::InvalidField("background.variants".to_string()));
+    }
+    for (key, path) in &bg.variants {
+        if !valid_variant_key(key) {
+            return Err(ThemeError::InvalidField(format!(
+                "background.variants 键名：{key}"
+            )));
+        }
+        validate_path(path)?;
+        let found = theme
+            .resources
+            .iter()
+            .any(|r| r.kind == ResourceKind::Image && r.path == *path);
+        if !found {
+            return Err(ThemeError::MissingResource(path.clone()));
+        }
+    }
 
     let mut seen = HashSet::new();
     for kind in &theme.components.visible {
@@ -167,8 +188,22 @@ pub fn validate(theme: &ThemeConfig) -> Result<(), ThemeError> {
         return Err(ThemeError::InvalidField("layout.template".to_string()));
     }
     if let Some(render) = &theme.render {
-        if !["legacy-single", "legacy-dual"].contains(&render.as_str()) {
+        if !["legacy-single", "legacy-dual", "legacy-overlay"].contains(&render.as_str()) {
             return Err(ThemeError::InvalidField("render".to_string()));
+        }
+    }
+    if let Some(overlay) = &theme.overlay {
+        validate_slots(&overlay.slots, "overlay.slots")?;
+        for (orientation, slots) in &overlay.variants {
+            if !matches!(orientation.as_str(), "landscape" | "portrait") {
+                return Err(ThemeError::InvalidField(format!(
+                    "overlay.variants 键名：{orientation}"
+                )));
+            }
+            validate_slots(slots, "overlay.variants")?;
+        }
+        if overlay.slots.is_empty() && overlay.variants.is_empty() {
+            return Err(ThemeError::InvalidField("overlay".to_string()));
         }
     }
     for (profile, template) in &theme.layout.overrides {
@@ -191,6 +226,38 @@ fn valid_semver(version: &str) -> bool {
         && parts
             .iter()
             .all(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+}
+
+/// 数值槽位校验：数量、坐标与字号。
+fn validate_slots(slots: &[OverlaySlot], field: &str) -> Result<(), ThemeError> {
+    if slots.len() > 64 {
+        return Err(ThemeError::InvalidField(format!("{field} 数量")));
+    }
+    for slot in slots {
+        let inside = (0.0..=1024.0).contains(&slot.x)
+            && (0.0..=1024.0).contains(&slot.y)
+            && (0.0..=1024.0).contains(&slot.w)
+            && slot.x + slot.w <= 1024.0;
+        if !inside || !(6.0..=96.0).contains(&slot.size) {
+            return Err(ThemeError::InvalidField(format!(
+                "{field}[{:?}]",
+                slot.metric
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 背景变体键名：`{cpu}-{gpu}`，或带方向前缀的 `landscape-{cpu}-{gpu}` / `portrait-{cpu}-{gpu}`。
+fn valid_variant_key(key: &str) -> bool {
+    let parts: Vec<&str> = key.split('-').collect();
+    let (cpu, gpu) = match parts.as_slice() {
+        [cpu, gpu] => (*cpu, *gpu),
+        ["landscape" | "portrait", cpu, gpu] => (*cpu, *gpu),
+        _ => return false,
+    };
+    matches!(cpu, "amd" | "intel" | "unknown")
+        && matches!(gpu, "nvidia" | "amd" | "intel" | "unknown")
 }
 
 pub fn is_sha256(hash: &str) -> bool {
@@ -275,6 +342,93 @@ mod tests {
                 "resources":[{{"path":"{path}","kind":"{kind}"{hash_field}}}]
             }}"##
         )
+    }
+
+    fn with_variants(key: &str, path: &str, include_resource: bool) -> String {
+        let extra = if include_resource {
+            format!(r#",{{"path":"{path}","kind":"image","sha256":"{HASH}"}}"#)
+        } else {
+            String::new()
+        };
+        format!(
+            r##"{{
+                "schema":"hetao.theme/1","id":"var","name":"变体主题","version":"1.0.0",
+                "palette":{{"bg":"#101418","card":"#1B2028","text":"#E8EDF2","dim":"#8A94A6","accent":"#37D67A","warn":"#FFB020","danger":"#FF5A5F"}},
+                "background":{{"image":"base.png","variants":{{"{key}":"{path}"}}}},
+                "resources":[{{"path":"base.png","kind":"image","sha256":"{HASH}"}}{extra}]
+            }}"##
+        )
+    }
+
+    #[test]
+    fn brand_variant_is_accepted() {
+        let theme = load_str(&with_variants("intel-nvidia", "pc-intel-nvidia.png", true))
+            .expect("合法变体应通过校验");
+        assert_eq!(
+            theme
+                .background
+                .variants
+                .get("intel-nvidia")
+                .map(String::as_str),
+            Some("pc-intel-nvidia.png")
+        );
+    }
+
+    #[test]
+    fn variant_key_must_be_lowercase_pair() {
+        for key in ["Intel-NVIDIA", "amd", "amd-nvidia-intel", "amd-gpu", ""] {
+            let bad = with_variants(key, "pc.png", true);
+            assert!(
+                matches!(load_str(&bad), Err(ThemeError::InvalidField(_))),
+                "非法键名应被拒绝：{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn variant_image_must_be_declared_in_resources() {
+        let bad = with_variants("amd-amd", "missing.png", false);
+        assert!(matches!(
+            load_str(&bad),
+            Err(ThemeError::MissingResource(_))
+        ));
+    }
+
+    #[test]
+    fn orientation_specific_brand_matrix_is_accepted() {
+        // 官方皮肤：5 种品牌组合 × 横竖两套底图 = 10 个变体，不能被数量上限误判
+        let combos = [
+            "amd-amd",
+            "amd-nvidia",
+            "intel-amd",
+            "intel-nvidia",
+            "intel-intel",
+        ];
+        let mut variants = Vec::new();
+        let mut resources = vec![format!(
+            r#"{{"path":"base.png","kind":"image","sha256":"{HASH}"}}"#
+        )];
+        for combo in combos {
+            for (orientation, tag) in [("landscape", "l"), ("portrait", "p")] {
+                let path = format!("pc-{tag}-{combo}.png");
+                variants.push(format!(r#""{orientation}-{combo}":"{path}""#));
+                resources.push(format!(
+                    r#"{{"path":"{path}","kind":"image","sha256":"{HASH}"}}"#
+                ));
+            }
+        }
+        let json = format!(
+            r##"{{
+                "schema":"hetao.theme/1","id":"matrix","name":"品牌矩阵","version":"1.0.0",
+                "palette":{{"bg":"#101418","card":"#1B2028","text":"#E8EDF2","dim":"#8A94A6","accent":"#37D67A","warn":"#FFB020","danger":"#FF5A5F"}},
+                "background":{{"image":"base.png","variants":{{{}}}}},
+                "resources":[{}]
+            }}"##,
+            variants.join(","),
+            resources.join(",")
+        );
+        let theme = load_str(&json).expect("10 个品牌变体应通过校验");
+        assert_eq!(theme.background.variants.len(), 10);
     }
 
     #[test]

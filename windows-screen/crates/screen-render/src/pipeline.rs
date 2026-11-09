@@ -206,7 +206,7 @@ pub fn render_notice_bg(
 }
 
 /// 背景：无图时用 fallback_color；有图时按 fit/anchor 缩放，再按主题 dim 压暗。
-fn paint_background(
+pub(crate) fn paint_background(
     profile: &ScreenProfile,
     theme: &ThemeConfig,
     background: Option<&BackgroundImage>,
@@ -293,6 +293,7 @@ mod tests {
             components: Default::default(),
             layout: Default::default(),
             render: None,
+            overlay: None,
             resources: Vec::new(),
         }
     }

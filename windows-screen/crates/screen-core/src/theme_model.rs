@@ -26,22 +26,19 @@ impl Color {
 
     pub fn from_hex(text: &str) -> Result<Self, &'static str> {
         let s = text.strip_prefix('#').ok_or("颜色必须以 # 开头")?;
-        let (r, g, b, a) = match s.len() {
-            6 => (
-                u8::from_str_radix(&s[0..2], 16).map_err(|_| "颜色格式错误")?,
-                u8::from_str_radix(&s[2..4], 16).map_err(|_| "颜色格式错误")?,
-                u8::from_str_radix(&s[4..6], 16).map_err(|_| "颜色格式错误")?,
-                255,
-            ),
-            8 => (
-                u8::from_str_radix(&s[0..2], 16).map_err(|_| "颜色格式错误")?,
-                u8::from_str_radix(&s[2..4], 16).map_err(|_| "颜色格式错误")?,
-                u8::from_str_radix(&s[4..6], 16).map_err(|_| "颜色格式错误")?,
-                u8::from_str_radix(&s[6..8], 16).map_err(|_| "颜色格式错误")?,
-            ),
-            _ => return Err("颜色长度必须为 6 或 8 位十六进制"),
-        };
-        Ok(Self::new(r, g, b, a))
+        let bytes = s.as_bytes();
+        // 按字节解析：先校验长度，再逐字节取十六进制位。
+        // 不能用 &s[0..2] 切片，非 ASCII 输入会在非字符边界上 panic。
+        if bytes.len() != 6 && bytes.len() != 8 {
+            return Err("颜色长度必须为 6 或 8 位十六进制");
+        }
+        let mut c = [255u8; 4];
+        for (i, slot) in c.iter_mut().take(bytes.len() / 2).enumerate() {
+            let hi = hex_nibble(bytes[i * 2]).ok_or("颜色格式错误")?;
+            let lo = hex_nibble(bytes[i * 2 + 1]).ok_or("颜色格式错误")?;
+            *slot = hi * 16 + lo;
+        }
+        Ok(Self::new(c[0], c[1], c[2], c[3]))
     }
 
     pub fn to_hex(self) -> String {
@@ -55,6 +52,16 @@ impl Color {
     /// 0..=1 的 alpha。
     pub fn alpha_f32(self) -> f32 {
         self.a as f32 / 255.0
+    }
+}
+
+/// 单个十六进制字符 → 0..=15；非 ASCII 十六进制位返回 None。
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -140,6 +147,10 @@ pub enum ImageAnchor {
 pub struct Background {
     #[serde(default)]
     pub image: Option<String>,
+    /// 按硬件品牌选图：键为 `{cpu}-{gpu}`（amd/intel/unknown × nvidia/amd/intel/unknown），
+    /// 值为图片文件名。命中时优先于 `image`，用于官方皮肤的两处品牌 logo。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, String>,
     #[serde(default)]
     pub fit: ImageFit,
     #[serde(default)]
@@ -158,6 +169,7 @@ impl Default for Background {
     fn default() -> Self {
         Self {
             image: None,
+            variants: BTreeMap::new(),
             fit: ImageFit::Cover,
             anchor: ImageAnchor::Center,
             dim: 0.0,
@@ -271,6 +283,96 @@ pub struct ResourceRef {
     pub sha256: Option<String>,
 }
 
+/// 数值槽的取值来源。只允许已采集的指标，缺失时整槽留空（不填 0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayMetric {
+    Cpu,
+    CpuTemp,
+    Gpu,
+    GpuTemp,
+    Memory,
+    MemoryUsed,
+    MemoryTotal,
+    NetworkDown,
+    NetworkUp,
+    DiskRead,
+    DiskWrite,
+    Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotAlign {
+    #[default]
+    Left,
+    Right,
+    Center,
+}
+
+/// 底图上的一个数值槽：绝对像素矩形 + 字号 + 对齐。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlaySlot {
+    pub metric: OverlayMetric,
+    pub x: f32,
+    pub y: f32,
+    #[serde(default)]
+    pub w: f32,
+    #[serde(default = "default_slot_size")]
+    pub size: f32,
+    #[serde(default)]
+    pub align: SlotAlign,
+    /// 未填时用主题 `palette.text`。
+    #[serde(default)]
+    pub color: Option<Color>,
+    /// 数值后缀（底图没画单位时用）。
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// 小数位；百分比类固定 0 位，容量/速率类用 1 位。
+    #[serde(default = "default_slot_decimals")]
+    pub decimals: u8,
+    /// 速率单位：`auto`（B/s、KB/s、MB/s 自动，默认）或 `mb`（统一换算成 MB/s，
+    /// 用于底图把单位固定印成 `MB/s` 的官方皮肤）。
+    #[serde(default)]
+    pub rate_unit: RateUnit,
+}
+
+/// 速率类指标的单位口径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateUnit {
+    /// 自动选择 B/s、KB/s、MB/s。
+    #[default]
+    Auto,
+    /// 一律按 MB/s 输出纯数字（单位由底图提供），小数位固定为 `decimals`。
+    Mb,
+    /// 一律按 MB/s 输出，小数位按量级自适应，使字符串长度稳定在 5 个字符左右：
+    /// `<10` 三位、`10–99` 两位、`100–999` 一位、`≥1000` 整数；
+    /// 非零但不足 0.001 时显示 `0.001`。
+    MbFit,
+}
+
+fn default_slot_size() -> f32 {
+    24.0
+}
+
+fn default_slot_decimals() -> u8 {
+    0
+}
+
+/// 「图片 + 数值」主题：底图已画好卡片/图标/单位，这里只声明数值贴在哪。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Overlay {
+    #[serde(default)]
+    pub slots: Vec<OverlaySlot>,
+    /// 按屏幕方向覆盖槽位：键为 `landscape` / `portrait`，命中时优先于 `slots`。
+    /// 官方皮肤横竖两套版式的数值位置不同，用这个字段在同一个主题里分别声明。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, Vec<OverlaySlot>>,
+}
+
 /// `theme.json` 的根结构。Schema v1 草案（见 `05`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -293,6 +395,9 @@ pub struct ThemeConfig {
     /// 版式风格：`legacy-single`（单列卡片+圆环）| `legacy-dual`（左 NAS / 右电脑）。
     #[serde(default)]
     pub render: Option<String>,
+    /// 「图片 + 数值」：底图 + 数值槽；存在时只贴数值，不画任何图形。
+    #[serde(default)]
+    pub overlay: Option<Overlay>,
     #[serde(default)]
     pub resources: Vec<ResourceRef>,
 }
@@ -321,5 +426,12 @@ mod tests {
         assert!(Color::from_hex("102030").is_err());
         assert!(Color::from_hex("#12345").is_err());
         assert!(Color::from_hex("#GGGGGG").is_err());
+    }
+
+    #[test]
+    fn non_ascii_color_is_rejected_without_panic() {
+        // 6 字节但不是 6 个 ASCII 字符：旧实现会在 &s[0..2] 处按非字符边界切片而 panic
+        assert!(Color::from_hex("#aééB").is_err());
+        assert!(Color::from_hex("#内存").is_err());
     }
 }

@@ -3,9 +3,11 @@
 //! 小屏独立进程的装配层：配置加载、模块初始化、生命周期、退出释放。
 
 pub mod app;
+pub mod brand;
 pub mod cli;
 pub mod config;
 pub mod device_cmd;
+pub mod dirty;
 pub mod logging;
 pub mod orientation;
 pub mod pattern;

@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use screen_adapter_api::{AdapterError, DeviceAdapter, DeviceInfo};
+use screen_adapter_api::{AdapterError, DeviceAdapter, DeviceInfo, Region};
 use screen_core::Frame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +82,24 @@ impl<A: DeviceAdapter + ?Sized> DeviceSession<A> {
         }
         match self.adapter.send_frame(frame) {
             Ok(()) => Ok(()),
+            Err(err) => {
+                self.state = SessionState::Faulted;
+                Err(SessionError::Send(err))
+            }
+        }
+    }
+
+    /// 只刷新帧内一个子矩形；不初始化、不重试。
+    ///
+    /// `Unsupported` 表示适配器不具备子矩形能力，属于能力缺失而非通信故障：
+    /// 返回错误但**不**把 Session 标记为 Faulted，调用方回退到 [`Self::send_frame`]。
+    pub fn send_frame_region(&mut self, frame: &Frame, region: Region) -> Result<(), SessionError> {
+        if self.state != SessionState::Ready {
+            return Err(SessionError::NotReady);
+        }
+        match self.adapter.send_frame_region(frame, region) {
+            Ok(()) => Ok(()),
+            Err(err @ AdapterError::Unsupported(_)) => Err(SessionError::Send(err)),
             Err(err) => {
                 self.state = SessionState::Faulted;
                 Err(SessionError::Send(err))
@@ -232,7 +250,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{MockAdapter, MockCounters};
     use super::*;
-    use screen_adapter_api::DeviceInfo;
+    use screen_adapter_api::{DeviceInfo, Region};
     use screen_core::{Frame, PixelFormat, TransportKind};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -349,6 +367,33 @@ mod tests {
         assert!(matches!(err, SessionError::Init(_)));
         assert_eq!(counts.open_calls.load(Ordering::SeqCst), 1);
         assert_eq!(counts.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unsupported_region_keeps_session_ready() {
+        let adapter = MockAdapter::new(); // Mock 默认不支持子矩形
+        let mut session = DeviceSession::connect(Box::new(adapter), &info()).expect("connect");
+        let err = match session.send_frame_region(&frame(), Region::new(0, 100, 320, 40)) {
+            Ok(()) => panic!("mock 不支持子矩形"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            SessionError::Send(AdapterError::Unsupported(_))
+        ));
+        assert_eq!(session.state(), SessionState::Ready, "能力缺失不得判故障");
+        session.send_frame(&frame()).expect("随后仍可发整帧");
+    }
+
+    #[test]
+    fn region_send_after_close_is_rejected() {
+        let mut session =
+            DeviceSession::connect(Box::new(MockAdapter::new()), &info()).expect("connect");
+        session.close();
+        assert_eq!(
+            session.send_frame_region(&frame(), Region::new(0, 0, 10, 10)),
+            Err(SessionError::NotReady)
+        );
     }
 
     #[test]

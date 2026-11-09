@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub struct CpuMetrics {
     pub usage_pct: Option<f32>,
     pub temp_c: Option<f32>,
+    /// NAS 的 CPU 厂商（amd / intel）；官方皮肤据此选品牌底图。
+    /// 旧版客户端不推送时为空。
+    #[serde(default)]
+    pub vendor: Option<String>,
     pub load_1m: Option<f32>,
     pub load_5m: Option<f32>,
     pub load_15m: Option<f32>,
@@ -24,6 +28,9 @@ pub struct MemoryMetrics {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GpuMetrics {
     pub name: Option<String>,
+    /// NAS 的显卡厂商（nvidia / amd / intel）；空表示未被 NAS 采集到。
+    #[serde(default)]
+    pub vendor: Option<String>,
     pub usage_pct: Option<f32>,
     pub temp_c: Option<f32>,
     pub vram_used_bytes: Option<u64>,
@@ -68,6 +75,9 @@ pub struct PcMetrics {
     /// 显卡使用率 / 温度（NVIDIA 经 `nvidia-smi`，其他显卡为空）
     pub gpu_pct: Option<f32>,
     pub gpu_temp: Option<f32>,
+    /// 本机网络：收 / 发速率（字节每秒）
+    pub net_rx: Option<u64>,
+    pub net_tx: Option<u64>,
 }
 
 /// 指标集合：`None` 表示该项缺失，渲染层必须整项隐藏（见 `06`/`09`）。

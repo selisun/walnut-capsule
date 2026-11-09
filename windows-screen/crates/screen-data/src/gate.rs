@@ -80,6 +80,20 @@ impl SnapshotGate {
         Ok(())
     }
 
+    /// 运行期刷新周期变化：只重算过期阈值，保留序列号/最后时间戳与当前状态。
+    /// 不清空快照，避免热更新瞬间额外渲染一帧「等待客户端」占位画面。
+    pub fn update_threshold(
+        &mut self,
+        config_stale_ms: i64,
+        period_ms: i64,
+    ) -> Result<(), DataError> {
+        if config_stale_ms < 0 || period_ms <= 0 {
+            return Err(DataError::InvalidThreshold("stale/period"));
+        }
+        self.threshold_ms = effective_threshold_ms(config_stale_ms, period_ms);
+        Ok(())
+    }
+
     /// 定时检查（无新数据时由调度器调用）。
     pub fn tick(&mut self, now_ms: i64) -> DataState {
         if self.state == DataState::VersionMismatch {
@@ -143,6 +157,22 @@ mod tests {
         gate.accept(&snap(1, 10_000), 10_000).expect("accept");
         assert_eq!(gate.tick(13_001), DataState::Stale);
         assert_eq!(gate.tick(12_999), DataState::Ready);
+    }
+
+    #[test]
+    fn update_threshold_keeps_sequence_and_state() {
+        let mut gate = SnapshotGate::new(3_000, 1_000).expect("gate");
+        gate.accept(&snap(7, 10_000), 10_000).expect("accept");
+        assert_eq!(gate.state(), DataState::Ready);
+
+        gate.update_threshold(3_000, 5_000).expect("update");
+        assert_eq!(gate.threshold_ms(), 15_000);
+        assert_eq!(gate.status().last_seq, Some(7));
+        assert_eq!(gate.tick(20_000), DataState::Ready);
+        assert_eq!(gate.tick(25_001), DataState::Stale);
+
+        assert!(gate.update_threshold(3_000, 0).is_err());
+        assert!(gate.update_threshold(-1, 1_000).is_err());
     }
 
     #[test]

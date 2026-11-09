@@ -26,6 +26,33 @@ pub fn frame_header(width: u32, height: u32) -> Result<[u8; HEADER_LEN], Protoco
     ])
 }
 
+/// 子矩形帧头（197 号命令 0xC5），坐标均为**闭区间**、上限 1023。
+///
+/// 与官方反编译公式一致：`x>>2`、`((x&3)<<6)|(y>>4)`、`((y&0xF)<<4)|(right>>6)`、
+/// `((right&0x3F)<<2)|(bottom>>8)`、`bottom&0xFF`、`0xC5`。全帧
+/// `(0, 0, 319, 479)` 得到的字节与 [`frame_header`] 完全相同。
+pub fn frame_region_header(
+    x: u32,
+    y: u32,
+    right: u32,
+    bottom: u32,
+) -> Result<[u8; HEADER_LEN], ProtocolError> {
+    if x > right || y > bottom || right > 1_023 || bottom > 1_023 {
+        return Err(ProtocolError::InvalidDimensions {
+            width: right.saturating_add(1),
+            height: bottom.saturating_add(1),
+        });
+    }
+    Ok([
+        (x >> 2) as u8,
+        (((x & 3) << 6) | (y >> 4)) as u8,
+        (((y & 0x0F) << 4) | (right >> 6)) as u8,
+        (((right & 0x3F) << 2) | (bottom >> 8)) as u8,
+        (bottom & 0xFF) as u8,
+        END_MARKER,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +76,35 @@ mod tests {
         assert!(frame_header(480, 0).is_err());
         assert!(frame_header(16_385, 320).is_err());
         assert!(frame_header(480, 1_025).is_err());
+    }
+
+    #[test]
+    fn full_frame_region_header_matches_full_frame_header() {
+        assert_eq!(
+            frame_region_header(0, 0, 319, 479).unwrap(),
+            frame_header(320, 480).unwrap()
+        );
+    }
+
+    #[test]
+    fn region_header_packs_closed_interval_coordinates() {
+        // 官方公式：红条 (0,100)-(319,139)
+        assert_eq!(
+            frame_region_header(0, 100, 319, 139).unwrap(),
+            [0x00, 0x06, 0x44, 0xFC, 0x8B, 0xC5]
+        );
+        // 蓝块 (200,300)-(247,365)
+        assert_eq!(
+            frame_region_header(200, 300, 247, 365).unwrap(),
+            [0x32, 0x12, 0xC3, 0xDD, 0x6D, 0xC5]
+        );
+    }
+
+    #[test]
+    fn invalid_regions_are_rejected() {
+        assert!(frame_region_header(10, 0, 9, 10).is_err());
+        assert!(frame_region_header(0, 10, 10, 9).is_err());
+        assert!(frame_region_header(0, 0, 1_024, 479).is_err());
+        assert!(frame_region_header(0, 0, 319, 1_024).is_err());
     }
 }

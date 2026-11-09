@@ -37,6 +37,8 @@ use crate::text::{FontSpec, TextRenderer};
 pub struct GdiTextRenderer {
     hdc: HDC,
     hfont: HFONT,
+    /// 建字体前的原字体：析构时必须还原，否则 DeleteObject 会因字体仍被选中而失败（句柄泄漏）。
+    old_font: HGDIOBJ,
     size_px: f32,
     cache: GlyphCache,
     last_advance: f32,
@@ -83,6 +85,7 @@ impl GdiTextRenderer {
         Ok(Self {
             hdc,
             hfont,
+            old_font: old,
             size_px: spec.size_px,
             cache: GlyphCache::default(),
             last_advance: 0.0,
@@ -236,13 +239,24 @@ impl TextRenderer for GdiTextRenderer {
         self.last_advance = pen - x;
         Ok(())
     }
+
+    fn measure_text(&mut self, text: &str, size: f32) -> Option<f32> {
+        let size = if size.is_finite() && size > 0.0 {
+            size
+        } else {
+            self.size_px
+        };
+        self.text_extent(text)
+            .map(|w| w as f32 * (size / self.size_px))
+    }
 }
 
 #[cfg(windows)]
 impl Drop for GdiTextRenderer {
     fn drop(&mut self) {
         unsafe {
-            let _ = SelectObject(self.hdc, HGDIOBJ::default());
+            // 先还原原字体，字体不再被 DC 选中，DeleteObject 才能成功释放句柄
+            let _ = SelectObject(self.hdc, self.old_font);
             let _ = DeleteObject(self.hfont);
             let _ = DeleteDC(self.hdc);
         }
@@ -347,6 +361,27 @@ mod tests {
         let (pixels, advance) = draw(&mut renderer, 32, 16, "CPU", 0.0, 14.0);
         assert_eq!(advance, 0.0);
         assert_eq!(non_black_pixels(&pixels), 0);
+    }
+
+    #[test]
+    fn font_handle_is_released_on_drop() {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS,
+        };
+        let before = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+        if before == 0 {
+            // 非交互会话拿不到计数，跳过而不是误报
+            return;
+        }
+        for _ in 0..100 {
+            drop(renderer(14.0, "Microsoft YaHei"));
+        }
+        let after = unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+        // 其他测试可能并发建渲染器，留出余量；若真泄漏，100 次会明显超过阈值
+        assert!(
+            after <= before + 30,
+            "HFONT 未释放：GDI 句柄 {before} -> {after}"
+        );
     }
 
     #[test]

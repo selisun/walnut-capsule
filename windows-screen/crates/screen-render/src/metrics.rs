@@ -455,6 +455,7 @@ mod tests {
         let metrics = Metrics {
             gpu: Some(GpuMetrics {
                 name: Some("GPU".into()),
+                vendor: None,
                 usage_pct: Some(30.0),
                 temp_c: Some(60.0),
                 vram_used_bytes: Some(2 * 1024 * 1024 * 1024),
